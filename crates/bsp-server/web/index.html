@@ -103,13 +103,19 @@
 
   /* Dashboard */
   .tiles { display: flex; flex-wrap: wrap; gap: 1em; margin-bottom: 1em; }
-  .tile, .card { background: var(--surface); border: 1px solid var(--hairline); border-radius: 6px; }
-  .tile { padding: 10px 14px; min-width: 10em; }
+  /* Boxes look like table cells: square, with the tables' 1px borders. */
+  .tile, .card { border: 1px solid var(--cell-border); }
+  .tile { padding: 6px 10px; min-width: 10em; }
   .tile .label { color: var(--ink-2); font-size: 12px; }
   .tile .value { font-size: 24px; font-weight: 600; margin: 2px 0; }
   .tile .sub { color: var(--ink-2); font-size: 12px; }
-  .card { padding: 10px 14px; margin-bottom: 1em; }
-  .card h3 { margin: 0 0 6px 0; font-size: 15px; }
+  .card { margin-bottom: 1em; }
+  .card > h3 { margin: 0; padding: 2px 6px; font-size: 14px; background: var(--th); border-bottom: 1px solid var(--cell-border); }
+  .card > .body { padding: 6px 10px; }
+  .tables { display: flex; flex-wrap: wrap; gap: 0 2em; align-items: flex-start; }
+  .tables > div { flex: 1 1 26em; }
+  .tables table { width: 100%; }
+  .tables h3 { font-size: 15px; margin: 0.5em 0; }
   .legend { color: var(--ink-2); font-size: 12px; display: flex; gap: 1.5em; margin-bottom: 4px; }
   .legend .key { display: inline-block; width: 4px; height: 12px; border-radius: 1px; vertical-align: -1px; margin-right: 6px; }
   #timeline { width: 100%; }
@@ -142,8 +148,15 @@
     <input type="date" id="day" onchange="setDay(this.value)">
     <button type="button" onclick="shiftDay(1)" title="Next day">&#9654;</button>
     <button type="button" onclick="setDay(dateKey(new Date()))">Today</button>
+    <label>Show
+      <select id="lane-filter" onchange="saveDashPrefs(); renderDashboard()">
+        <option value="expected">expected species</option>
+        <option value="known">expected and unexpected species</option>
+        <option value="all">all species and sounds</option>
+      </select>
+    </label>
     <label>Order species by
-      <select id="lane-order" onchange="renderDashboard()">
+      <select id="lane-order" onchange="saveDashPrefs(); renderDashboard()">
         <option value="first">first heard</option>
         <option value="count">most detections</option>
         <option value="name">name</option>
@@ -160,22 +173,31 @@
 
   <div class="card">
     <h3>Timeline</h3>
-    <div class="legend">
-      <span><span class="key" style="background: var(--tick)"></span>expected species</span>
-      <span><span class="key" style="background: var(--tick-unexpected)"></span>unexpected species</span>
+    <div class="body">
+      <div class="legend" id="timeline-legend"></div>
+      <div id="timeline"></div>
+      <p class="empty" id="timeline-empty" hidden></p>
+      <p class="hint" id="timeline-hidden"></p>
+      <p class="hint">Each mark is one detection. Hover for details; click a mark or species name to see its detections.
+        Scroll over the chart or drag the bar below it to zoom in on part of the day.</p>
     </div>
-    <div id="timeline"></div>
-    <p class="empty" id="timeline-empty" hidden>No birds detected on this day.</p>
-    <p class="hint">Each mark is one detection. Hover for details; click a mark or species name to see its detections.
-      Scroll over the chart or drag the bar below it to zoom in on part of the day.</p>
   </div>
 
-  <div class="card">
-    <h3>Species this day</h3>
-    <table id="day-species">
-      <thead><tr><th>Species</th><th>Detections</th><th>First heard</th><th>Last heard</th><th>Heard by</th></tr></thead>
-      <tbody></tbody>
-    </table>
+  <div class="tables">
+    <div>
+      <h3 id="day-species-title">Species of the day</h3>
+      <table id="day-species">
+        <thead><tr><th>Species</th><th>Detections</th><th>First heard</th><th>Last heard</th><th>Heard by</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div>
+      <h3>Unexpected species of the day</h3>
+      <table id="day-unexpected">
+        <thead><tr><th>Species</th><th>Detections</th><th>First heard</th><th>Last heard</th><th>Heard by</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </section>
 
@@ -435,11 +457,10 @@ function speciesLanes() {
   for (const d of timeline.detections) {
     let l = lanes.get(d.scientific);
     if (!l) {
-      l = { scientific: d.scientific, common: d.common, unexpected: false, items: [], clients: new Set() };
+      l = { scientific: d.scientific, common: d.common, occurrence: d.occurrence, items: [], clients: new Set() };
       lanes.set(d.scientific, l);
     }
     l.items.push(d);
-    l.unexpected ||= d.unexpected;
     d.clients.forEach(c => l.clients.add(c));
   }
   const list = [...lanes.values()];
@@ -460,15 +481,57 @@ function detectionsLink(scientific) {
   return "#/detections?" + q;
 }
 
+const FILTER_LABELS = { expected: "expected species", known: "expected and unexpected species", all: "species and sounds" };
+
+/// The dashboard's "Show" choice; without a site location nothing can be classified, so show all.
+function laneFilter() {
+  return timeline.site_set === false ? "all" : document.getElementById("lane-filter").value;
+}
+function laneShown(l, mode) {
+  return mode === "all" || l.occurrence === "expected" || (mode === "known" && l.occurrence === "unexpected");
+}
+
+function saveDashPrefs() {
+  try {
+    localStorage.setItem("bsp.dash", JSON.stringify({
+      filter: document.getElementById("lane-filter").value,
+      order: document.getElementById("lane-order").value,
+    }));
+  } catch (e) { /* storage unavailable: preferences just aren't remembered */ }
+}
+function loadDashPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem("bsp.dash") || "{}");
+    if (p.filter) document.getElementById("lane-filter").value = p.filter;
+    if (p.order) document.getElementById("lane-order").value = p.order;
+  } catch (e) { /* ignore */ }
+}
+
+function speciesRows(lanes, tagUnexpected) {
+  const nameCell = l => `<a href="${detectionsLink(l.scientific)}">${esc(l.common)}</a>` +
+    (tagUnexpected && l.occurrence === "unexpected" ? ` <span class="tag">unexpected</span>` : "") +
+    `<br><i class="muted">${esc(l.scientific)}</i>`;
+  return lanes.map(l => `<tr>
+      <td>${nameCell(l)}</td>
+      <td class="num">${l.items.length}</td>
+      <td>${fmtClock(l.first / 1e6)}</td>
+      <td>${fmtClock(l.last / 1e6)}</td>
+      <td>${[...l.clients].map(c => esc(clientName(c))).join(", ")}</td>
+    </tr>`).join("");
+}
+
 function renderDashboard() {
   document.getElementById("day").value = dashDay;
-  const lanes = speciesLanes();
-  const ds = timeline.detections;
+  const mode = laneFilter();
+  const all = speciesLanes();
+  const lanes = all.filter(l => laneShown(l, mode));
+  const ds = lanes.flatMap(l => l.items);
+  const unexpected = all.filter(l => l.occurrence === "unexpected");
 
-  // Stat tiles.
-  const unexpectedSpecies = lanes.filter(l => l.unexpected).length;
+  // Stat tiles follow the "Show" filter.
   document.getElementById("t-species").textContent = lanes.length;
-  document.getElementById("t-species-sub").textContent = unexpectedSpecies ? `${unexpectedSpecies} unexpected` : "";
+  document.getElementById("t-species-sub").textContent =
+    mode === "expected" && unexpected.length ? `plus ${unexpected.length} unexpected` : FILTER_LABELS[mode];
   document.getElementById("t-detections").textContent = ds.length;
   document.getElementById("t-detections-sub").textContent = timeline.truncated ? "showing the most recent" : "";
   const top = [...lanes].sort((a, b) => b.items.length - a.items.length)[0];
@@ -478,17 +541,43 @@ function renderDashboard() {
   document.getElementById("t-last").textContent = last ? last.common : "-";
   document.getElementById("t-last-sub").textContent = last ? fmtAgo(last.time) : "";
 
-  // Species table (also the accessible, non-chart view of the timeline).
-  const nameCell = l => `<a href="${detectionsLink(l.scientific)}">${esc(l.common)}</a>` +
-    (l.unexpected ? ` <span class="tag">unexpected</span>` : "") + `<br><i class="muted">${esc(l.scientific)}</i>`;
-  document.querySelector("#day-species tbody").innerHTML = lanes.map(l => `<tr>
-      <td>${nameCell(l)}</td>
-      <td class="num">${l.items.length}</td>
-      <td>${fmtClock(l.first / 1e6)}</td>
-      <td>${fmtClock(l.last / 1e6)}</td>
-      <td>${[...l.clients].map(c => esc(clientName(c))).join(", ")}</td>
-    </tr>`).join("");
+  // Tables (also the accessible, non-chart view of the timeline): the main one follows the
+  // chart's filter; unexpected species always get their own table.
+  document.getElementById("day-species-title").textContent =
+    mode === "expected" ? "Species of the day" : "Species of the day (" + FILTER_LABELS[mode] + ")";
+  document.querySelector("#day-species tbody").innerHTML =
+    speciesRows(lanes, true) || `<tr><td colspan="5" class="muted">None</td></tr>`;
+  document.querySelector("#day-unexpected tbody").innerHTML =
+    speciesRows(unexpected, false) || `<tr><td colspan="5" class="muted">None</td></tr>`;
 
+  // Say what the filter is hiding, and why everything is shown without a site location.
+  const hidden = all.filter(l => !laneShown(l, mode));
+  const hiddenUnexpected = hidden.filter(l => l.occurrence === "unexpected").length;
+  const hiddenUnknown = hidden.filter(l => l.occurrence === "unknown");
+  const notes = [];
+  if (timeline.site_set === false) {
+    notes.push("The site location isn't set, so species can't be sorted into expected and unexpected; " +
+      "showing everything. Set it on the Config page.");
+  } else if (hidden.length) {
+    const parts = [];
+    if (hiddenUnexpected) parts.push(`${hiddenUnexpected} unexpected species`);
+    if (hiddenUnknown.length) {
+      const eg = hiddenUnknown.slice(0, 3).map(l => l.common).join(", ");
+      parts.push(`${hiddenUnknown.length} other sound${hiddenUnknown.length === 1 ? "" : "s"} without range data (${eg}${hiddenUnknown.length > 3 ? ", \u2026" : ""})`);
+    }
+    notes.push(`Not shown: ${parts.join(" and ")}. Change "Show" above to include them.`);
+  }
+  document.getElementById("timeline-hidden").textContent = notes.join(" ");
+
+  // Legend: only the kinds of mark on screen.
+  const kinds = new Set(lanes.map(l => l.occurrence));
+  const key = (v, text) => `<span><span class="key" style="background: var(${v})"></span>${text}</span>`;
+  document.getElementById("timeline-legend").innerHTML =
+    (kinds.has("expected") || kinds.has("unknown") ? key("--tick", kinds.has("unknown") ? "expected or unclassified" : "expected species") : "") +
+    (kinds.has("unexpected") ? key("--tick-unexpected", "unexpected species") : "");
+
+  const empty = document.getElementById("timeline-empty");
+  empty.textContent = all.length ? "Nothing to show with this filter." : "No birds detected on this day.";
   renderTimeline(lanes);
 }
 
@@ -504,7 +593,7 @@ function renderTimeline(lanes) {
     return;
   }
 
-  el.style.height = (lanes.length * LANE_HEIGHT + 90) + "px";
+  el.style.height = (lanes.length * LANE_HEIGHT + 104) + "px";
   if (!chart) {
     chart = echarts.init(el);
     chart.on("click", "series", p => { location.hash = detectionsLink(p.data.entry.scientific); });
@@ -527,13 +616,13 @@ function renderTimeline(lanes) {
     entry: d,
   }));
   const dayStart = dayStartMs(dashDay), dayEnd = dayEndMs(dashDay), now = Date.now();
-  const longest = Math.max(...lanes.map(l => l.common.length + (l.unexpected ? 12 : 0)));
+  const longest = Math.max(...lanes.map(l => l.common.length + (l.occurrence === "unexpected" ? 12 : 0)));
   const shorten = s => (s.length > 28 ? s.slice(0, 27) + "…" : s);
 
   chart.setOption({
     animation: false,
     textStyle: { fontFamily: getComputedStyle(document.body).fontFamily },
-    grid: { left: Math.min(280, 16 + Math.min(longest, 40) * 7), right: 24, top: 10, bottom: 64 },
+    grid: { left: Math.min(280, 16 + Math.min(longest, 40) * 7), right: 24, top: 24, bottom: 64 },
     tooltip: {
       trigger: "item",
       confine: true,
@@ -545,7 +634,7 @@ function renderTimeline(lanes) {
         const heard = d.clients.map(clientName).map(esc).join(", ");
         return `<b>${fmtClock(d.time / 1e6, true)}</b> &middot; confidence <b>${d.confidence.toFixed(2)}</b><br>` +
           `${esc(d.common)} <i>${esc(d.scientific)}</i>` +
-          (d.unexpected ? ` <span style="color:${c.tag};font-weight:bold">unexpected</span>` : "") +
+          (d.occurrence === "unexpected" ? ` <span style="color:${c.tag};font-weight:bold">unexpected</span>` : "") +
           `<br>Heard by: ${heard}` + (d.cardinal ? `<br>Direction: ${d.cardinal}` : "") +
           `<br><span style="color:${c.ink2};font-size:12px">Click for all ${esc(d.common)} detections</span>`;
       },
@@ -567,9 +656,10 @@ function renderTimeline(lanes) {
       splitLine: { show: true, interval: 0, lineStyle: { color: c.grid } },
       axisLabel: {
         color: c.ink,
+        // Plain text (not HTML): only ECharts' rich-text markers need removing.
         formatter: sci => {
           const l = lanes[laneIndex.get(sci)];
-          return esc(shorten(l.common)).replace(/[{}|]/g, "") + (l.unexpected ? " {u|unexpected}" : "");
+          return shorten(l.common).replace(/[{}|]/g, "") + (l.occurrence === "unexpected" ? " {u|unexpected}" : "");
         },
         rich: { u: { color: c.tag, fontWeight: "bold", fontSize: 11 } },
       },
@@ -590,7 +680,7 @@ function renderTimeline(lanes) {
         const laneH = api.size([0, 1])[1];
         const h = laneH * 0.6;
         const w = Math.max(3, end[0] - start[0]);
-        const color = data[params.dataIndex].entry.unexpected ? c.tickU : c.tick;
+        const color = data[params.dataIndex].entry.occurrence === "unexpected" ? c.tickU : c.tick;
         return {
           type: "group",
           children: [
@@ -606,7 +696,7 @@ function renderTimeline(lanes) {
       markLine: dashDay === dateKey(new Date()) && now >= dayStart && now < dayEnd ? {
         silent: true, symbol: "none", animation: false,
         lineStyle: { color: c.ink2, type: "dashed", width: 1 },
-        label: { formatter: "now", color: c.ink2, position: "insideEndTop" },
+        label: { formatter: "now", color: c.ink2, position: "start" },
         data: [{ xAxis: now }],
       } : { data: [] },
     }],
@@ -997,6 +1087,7 @@ for (const k of ["name", "x", "y", "z"]) {
   document.getElementById("cfg-" + k).addEventListener("input", () => { configDirty = true; });
 }
 window.addEventListener("hashchange", showPage);
+loadDashPrefs();
 showPage();
 setInterval(refresh, 2000);
 </script>

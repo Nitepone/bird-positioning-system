@@ -212,13 +212,29 @@ struct TimelineEntry {
     scientific: String,
     common: String,
     confidence: f32,
+    /// Flagged unexpected when detected (with the site settings of the time).
     unexpected: bool,
+    /// Classification against the current site's range data.
+    occurrence: Occurrence,
     clients: Vec<ClientId>,
     cardinal: Option<bsp_core::locator::Cardinal>,
 }
 
+/// Whether a species is expected at the site.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Occurrence {
+    Expected,
+    Unexpected,
+    /// No site location set, or the range data doesn't cover the species
+    /// (non-birds, the mock identifier's "Unknown bird", some renamed species).
+    Unknown,
+}
+
 #[derive(Serialize)]
 struct Timeline {
+    /// Whether a site location is set, so `occurrence` can be other than unknown.
+    site_set: bool,
     detections: Vec<TimelineEntry>,
     /// More than `TIMELINE_LIMIT` detections fell in the range; the oldest were left out.
     truncated: bool,
@@ -242,6 +258,11 @@ async fn timeline(
         .into_iter()
         .take(TIMELINE_LIMIT as usize)
         .map(|d| TimelineEntry {
+            occurrence: match state.species_filter.is_expected(&d.species) {
+                Some(true) => Occurrence::Expected,
+                Some(false) => Occurrence::Unexpected,
+                None => Occurrence::Unknown,
+            },
             id: d.id,
             time: d.time,
             end: d.calls.iter().map(|c| c.end).max().unwrap_or(d.time),
@@ -253,7 +274,9 @@ async fn timeline(
             unexpected: d.unexpected,
         })
         .collect();
+    let site_set = state.settings.lock().await.site.is_some();
     Ok(Json(Timeline {
+        site_set,
         detections,
         truncated,
     }))

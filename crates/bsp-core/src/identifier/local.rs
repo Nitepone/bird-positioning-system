@@ -105,6 +105,17 @@ impl LocalSpeciesFilter {
         self.state.write().unwrap().local = local;
     }
 
+    /// Whether `species` is expected at the site per the current range data:
+    /// `None` when there is no site location or the data doesn't cover it.
+    pub fn is_expected(&self, species: &Species) -> Option<bool> {
+        self.state
+            .read()
+            .unwrap()
+            .local
+            .as_ref()
+            .and_then(|l| l.is_expected(species))
+    }
+
     /// Applies the thresholds and sets [`Call::unexpected`].
     pub fn filter(&self, calls: Vec<Call>) -> Vec<Call> {
         let state = self.state.read().unwrap();

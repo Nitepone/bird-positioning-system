@@ -75,10 +75,16 @@ The **Dashboard** shows one day at a time (today by default; use the arrows or d
 
 - totals for the day: species heard, detections, the most active species and the last one heard;
 - a **timeline** with one row per species and a mark for each detection, from midnight to
-  midnight. Unexpected species are orange and labelled. Hover a mark for details; click a mark
-  or a species name to open that species' detections for the day. Scroll over the chart or drag
-  the bar under it to zoom in;
-- a table of the day's species with first and last times heard.
+  midnight. Hover a mark for details; click a mark or a species name to open that species'
+  detections for the day. Scroll over the chart or drag the bar under it to zoom in;
+- tables of the day's species and, beside it, the day's **unexpected** species, with first and
+  last times heard.
+
+By default the dashboard shows only **expected** species: those the geo model expects at the
+site. **Show** can add unexpected species (orange), or everything, including sounds the range
+data doesn't cover (non-bird classes, "Unknown bird" from the mock identifier). A note under
+the timeline says what is hidden. Without a site location nothing can be classified, so
+everything is shown.
 
 The **Detections** page lists individual detections, newest first, with a waveform image, the
 species, confidence and which monitors heard it. Click the waveform to play the clearest
