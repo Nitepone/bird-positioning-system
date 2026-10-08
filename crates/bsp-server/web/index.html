@@ -148,7 +148,7 @@
     <button type="button" onclick="shiftDay(-1)" title="Previous day">&#9664;</button>
     <input type="date" id="day" onchange="setDay(this.value)">
     <button type="button" onclick="shiftDay(1)" title="Next day">&#9654;</button>
-    <button type="button" onclick="setDay(dateKey(new Date()))">Today</button>
+    <button type="button" onclick="setDay(currentDay())">Today</button>
     <label>Show
       <select id="lane-filter" onchange="saveDashPrefs(); renderDashboard()">
         <option value="expected">expected species</option>
@@ -420,7 +420,17 @@ async function refreshClients() {
 let clientNamesKey = "";
 
 // ---- dashboard ----
-let dashDay = dateKey(new Date());
+// The dashboard's "today" turns over at 3am rather than midnight: birds are
+// quiet in the small hours, and the evening's detections stay up for review.
+const DAY_ROLLOVER_HOUR = 3;
+function currentDay() {
+  const d = new Date();
+  if (d.getHours() < DAY_ROLLOVER_HOUR) d.setDate(d.getDate() - 1);
+  return dateKey(d);
+}
+let dashDay = currentDay();
+// Whether to move on to the new day at rollover (false once another day is picked).
+let dashFollowsToday = true;
 let timeline = { detections: [], truncated: false };  // for dashDay
 let timelineFetchedAt = 0;
 let chart = null;
@@ -430,10 +440,11 @@ const LANE_HEIGHT = 26;
 function setDay(key) {
   if (!key) return;
   dashDay = key;
+  dashFollowsToday = key === currentDay();
   document.getElementById("day").value = key;
   timeline = { detections: [], truncated: false };
   timelineFetchedAt = 0;
-  refreshTimeline();
+  return refreshTimeline();
 }
 function shiftDay(delta) {
   const [y, m, d] = dashDay.split("-").map(Number);
@@ -441,7 +452,9 @@ function shiftDay(delta) {
 }
 
 async function refreshTimeline() {
-  const isToday = dashDay === dateKey(new Date());
+  const today = currentDay();
+  if (dashFollowsToday && dashDay !== today) return setDay(today);
+  const isToday = dashDay === today;
   // Past days don't change; today is refetched periodically.
   if (timelineFetchedAt && (!isToday || Date.now() - timelineFetchedAt < TIMELINE_REFRESH_MS)) return;
   const day = dashDay;
