@@ -118,7 +118,8 @@ everything is shown.
 The **Detections** page lists individual detections, newest first, with a waveform image, the
 species, confidence and which monitors heard it. Click the waveform to play the clearest
 recording, or a monitor's button to hear its recording; the shaded band is the identified call.
-Filter by species name, monitor, date range, expected or unexpected species, minimum confidence,
+Click a scientific name (dashboard tables, Detections, Config's expected-species list) to open the
+species on Wikipedia in a new tab. Filter by species name, monitor, date range, expected or unexpected species, minimum confidence,
 or detections with a direction. The filters are part of the page address, so a filtered view can
 be bookmarked or shared.
 

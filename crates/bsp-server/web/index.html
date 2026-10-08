@@ -93,6 +93,9 @@
   #banner { background: var(--row-requesting); border: 2px solid #c90; padding: 6px; margin-bottom: 1em; display: none; }
   .mono { font-family: monospace; font-size: 12px; }
   .muted { color: var(--ink-2); }
+  /* Links that look like the surrounding text until hovered. */
+  a.quiet { color: inherit; text-decoration: none; }
+  a.quiet:hover, a.quiet:focus-visible { text-decoration: underline; }
   img.wave { display: block; cursor: pointer; }
   button.play.playing { background: var(--playing); }
 
@@ -328,6 +331,13 @@ function fmtAgo(ns) {
   if (s < 86400) return Math.round(s / 3600) + "h ago";
   return fmtTime(ns);
 }
+/// A species' scientific name, linked (unobtrusively) to Wikipedia. "Go" jumps straight to a
+/// matching article or redirect, and falls back to search results for names without one.
+function wikiName(scientific) {
+  const url = "https://en.wikipedia.org/wiki/Special:Search?go=Go&search=" + encodeURIComponent(scientific);
+  return `<a class="quiet" href="${esc(url)}" target="_blank" rel="noopener noreferrer" ` +
+    `title="Open on Wikipedia">${esc(scientific)}</a>`;
+}
 function fmtPos(p, dims) { return p ? (dims || ["x", "y", "z"]).map(k => p[k].toFixed(1)).join(", ") : "not set"; }
 /// The name set here, else the one the client suggested for itself ("" if neither).
 function displayName(c) { return c.name || c.suggested_name || ""; }
@@ -527,7 +537,7 @@ function loadDashPrefs() {
 function speciesRows(lanes, tagUnexpected) {
   const nameCell = l => `<a href="${detectionsLink(l.scientific)}">${esc(l.common)}</a>` +
     (tagUnexpected && l.occurrence === "unexpected" ? ` <span class="tag">unexpected</span>` : "") +
-    `<br><i class="muted">${esc(l.scientific)}</i>`;
+    `<br><i class="muted">${wikiName(l.scientific)}</i>`;
   return lanes.map(l => `<tr>
       <td>${nameCell(l)}</td>
       <td class="num">${l.items.length}</td>
@@ -867,7 +877,7 @@ function renderDetections() {
     return `<tr class="${d.unexpected ? "unexpected" : ""}">
       <td>${fmtTime(d.time)}</td>
       <td>${wave}</td>
-      <td>${esc(d.species.common)}${tag}<br><i>${esc(d.species.scientific)}</i></td>
+      <td>${esc(d.species.common)}${tag}<br><i>${wikiName(d.species.scientific)}</i></td>
       <td>${d.confidence.toFixed(2)}</td>
       <td>${heard}</td>
       <td>${dir}</td>
@@ -974,7 +984,7 @@ async function loadSpeciesList() {
   const ls = await api("/local-species");
   const rows = ls.status === "ready" ? ls.species : [];
   document.querySelector("#species-list tbody").innerHTML = rows.map(s => `<tr>
-      <td>${esc(s.species.common)}</td><td><i>${esc(s.species.scientific)}</i></td>
+      <td>${esc(s.species.common)}</td><td><i>${wikiName(s.species.scientific)}</i></td>
       <td>${Math.round(s.probability * 100)}%</td></tr>`).join("");
 }
 
