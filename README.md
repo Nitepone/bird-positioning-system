@@ -69,14 +69,26 @@ so it stays the same across restarts.
 
 You can also click **Edit** on any row in the Clients table.
 
-### 5. Watch detections
+### 5. Watch the birds
 
-The **Bird Positioning System** page lists each identified call with a waveform image, its
-species, confidence and which clients heard it. Click the waveform to play the clearest
-recording, or a client's button to hear that client's recording. The shaded band in the
-waveform is the identified call. Species not expected at the site are highlighted and tagged
-**unexpected**. It shows a direction (e.g. `NE (47°)`) only when **at least 3** clients
-heard the call and each of them:
+The **Dashboard** shows one day at a time (today by default; use the arrows or date picker):
+
+- totals for the day: species heard, detections, the most active species and the last one heard;
+- a **timeline** with one row per species and a mark for each detection, from midnight to
+  midnight. Unexpected species are orange and labelled. Hover a mark for details; click a mark
+  or a species name to open that species' detections for the day. Scroll over the chart or drag
+  the bar under it to zoom in;
+- a table of the day's species with first and last times heard.
+
+The **Detections** page lists individual detections, newest first, with a waveform image, the
+species, confidence and which monitors heard it. Click the waveform to play the clearest
+recording, or a monitor's button to hear its recording; the shaded band is the identified call.
+Filter by species name, monitor, date range, expected or unexpected species, minimum confidence,
+or detections with a direction. The filters are part of the page address, so a filtered view can
+be bookmarked or shared.
+
+A detection shows a direction (e.g. `NE (47°)`) only when **at least 3** clients heard the call
+and each of them:
 
 - has a position set,
 - is **active** (sent a heartbeat in the last 15 s), and
@@ -156,6 +168,9 @@ V3.0. Model releases: [V3.0 preview](https://zenodo.org/records/20703646),
 [v2.4](https://zenodo.org/records/15050749),
 [geo model](https://github.com/birdnet-team/geomodel/releases/tag/v3.0.4).
 
+The web UI embeds [Apache ECharts](https://echarts.apache.org/) 6.1.0 (Apache 2.0), vendored with
+its license and notice in `crates/bsp-server/web/vendor/` so the UI works without internet access.
+
 ## Testing without hardware
 
 ```sh
@@ -198,7 +213,10 @@ so run the server with `kind = "mock"` for this test.
   - `GET /local-species`: species expected at the site
   - `GET /clients`
   - `GET|PUT|DELETE /clients/{id}`
-  - `GET /detections`
+  - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
+    `client`, `from` / `to` (ns), `unexpected`, `located`, `min_confidence`, `before`, `limit`
+  - `GET /timeline?from=&to=`: compact detections for the dashboard
+  - `GET /species`: every species detected so far
   - `GET /detections/{id}/audio/{client_id}`: that client's clip as WAV
   - `GET /detections/{id}/waveform[?client=]`: SVG waveform of the best (or given) clip
   - `GET /events`

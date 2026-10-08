@@ -28,6 +28,35 @@ pub struct ClientRecord {
     pub clock: Option<ClockStatus>,
 }
 
+/// Detection search criteria; every field is optional.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct DetectionFilter {
+    /// Only detections older than this (pagination cursor).
+    pub before: Option<Timestamp>,
+    /// Time range `[from, to)`.
+    pub from: Option<Timestamp>,
+    pub to: Option<Timestamp>,
+    /// Exact scientific name (case-insensitive).
+    pub species: Option<String>,
+    /// Text contained in the common or scientific name (case-insensitive).
+    pub q: Option<String>,
+    /// Heard by this client.
+    pub client: Option<ClientId>,
+    pub unexpected: Option<bool>,
+    /// Has a direction estimate.
+    pub located: Option<bool>,
+    pub min_confidence: Option<f32>,
+}
+
+/// A species seen at least once, for search suggestions.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeciesSeen {
+    pub scientific: String,
+    pub common: String,
+    pub count: i64,
+    pub last_seen: Timestamp,
+}
+
 /// Audio of one client around a detection.
 pub struct Clip {
     /// Timestamp of the first sample.
@@ -293,6 +322,25 @@ impl Db {
         Ok(())
     }
 
+    /// Every species with at least one detection, by common name.
+    pub fn species_seen(&self) -> rusqlite::Result<Vec<SpeciesSeen>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT json_extract(body, '$.species.scientific') AS sci,
+                    max(json_extract(body, '$.species.common')), count(*), max(time)
+             FROM detections GROUP BY sci ORDER BY 2 COLLATE NOCASE",
+        )?;
+        stmt.query_map([], |r| {
+            Ok(SpeciesSeen {
+                scientific: r.get(0)?,
+                common: r.get(1)?,
+                count: r.get(2)?,
+                last_seen: r.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
     pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
@@ -361,15 +409,50 @@ impl Db {
     }
 
     /// Newest-first detections, optionally older than `before`.
+    /// Newest-first detections matching `f`.
     pub fn list_detections(
         &self,
-        before: Option<Timestamp>,
+        f: &DetectionFilter,
         limit: u32,
     ) -> rusqlite::Result<Vec<Detection>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT body FROM detections WHERE (?1 IS NULL OR time < ?1) ORDER BY time DESC LIMIT ?2")?;
-        let rows = stmt.query_map(params![before, limit], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT body FROM detections
+             WHERE (?1 IS NULL OR time < ?1)
+               AND (?2 IS NULL OR time >= ?2)
+               AND (?3 IS NULL OR time < ?3)
+               AND (?4 IS NULL OR lower(json_extract(body, '$.species.scientific')) = lower(?4))
+               AND (?5 IS NULL
+                    OR instr(lower(json_extract(body, '$.species.common')), lower(?5)) > 0
+                    OR instr(lower(json_extract(body, '$.species.scientific')), lower(?5)) > 0)
+               AND (?6 IS NULL OR EXISTS (
+                    SELECT 1 FROM json_each(body, '$.calls') WHERE json_extract(value, '$.client_id') = ?6))
+               AND (?7 IS NULL OR coalesce(json_extract(body, '$.unexpected'), 0) = ?7)
+               AND (?8 IS NULL OR coalesce(json_type(body, '$.location') = 'object', 0) = ?8)
+               AND (?9 IS NULL OR json_extract(body, '$.confidence') >= ?9)
+             ORDER BY time DESC LIMIT ?10",
+        )?;
+        let nonempty = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let rows = stmt.query_map(
+            params![
+                f.before,
+                f.from,
+                f.to,
+                nonempty(&f.species),
+                nonempty(&f.q),
+                f.client.map(|c| c.to_string()),
+                f.unexpected,
+                f.located,
+                f.min_confidence,
+                limit
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
         let mut out = Vec::new();
         for body in rows {
             match serde_json::from_str(&body?) {
@@ -378,5 +461,181 @@ impl Db {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsp_core::identifier::{Call, Species};
+
+    fn detection(
+        time: i64,
+        sci: &str,
+        common: &str,
+        clients: &[u128],
+        confidence: f32,
+        unexpected: bool,
+    ) -> Detection {
+        let species = Species {
+            scientific: sci.into(),
+            common: common.into(),
+        };
+        Detection {
+            id: Uuid::new_v4(),
+            time,
+            species: species.clone(),
+            confidence,
+            calls: clients
+                .iter()
+                .map(|&c| Call {
+                    client_id: Uuid::from_u128(c),
+                    species: species.clone(),
+                    confidence,
+                    start: time,
+                    end: time + 1,
+                    unexpected,
+                })
+                .collect(),
+            unexpected,
+            location: None,
+            created_at: time,
+        }
+    }
+
+    #[test]
+    fn filters_detections() {
+        let db = Db::in_memory().unwrap();
+        for d in [
+            detection(
+                100,
+                "Corvus brachyrhynchos",
+                "American Crow",
+                &[1, 2],
+                0.95,
+                false,
+            ),
+            detection(200, "Corvus corax", "Common Raven", &[2], 0.92, true),
+            detection(
+                300,
+                "Turdus migratorius",
+                "American Robin",
+                &[3],
+                0.81,
+                false,
+            ),
+            detection(
+                400,
+                "Corvus brachyrhynchos",
+                "American Crow",
+                &[3],
+                0.85,
+                false,
+            ),
+        ] {
+            db.insert_detection(&d).unwrap();
+        }
+        let times = |f: DetectionFilter| -> Vec<i64> {
+            db.list_detections(&f, 100)
+                .unwrap()
+                .iter()
+                .map(|d| d.time)
+                .collect()
+        };
+        assert_eq!(times(DetectionFilter::default()), vec![400, 300, 200, 100]);
+        assert_eq!(
+            times(DetectionFilter {
+                species: Some("corvus BRACHYRHYNCHOS".into()),
+                ..Default::default()
+            }),
+            vec![400, 100]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                q: Some("corvus".into()),
+                ..Default::default()
+            }),
+            vec![400, 200, 100]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                q: Some("american".into()),
+                ..Default::default()
+            }),
+            vec![400, 300, 100]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                q: Some("  ".into()),
+                ..Default::default()
+            })
+            .len(),
+            4
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                client: Some(Uuid::from_u128(2)),
+                ..Default::default()
+            }),
+            vec![200, 100]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                unexpected: Some(true),
+                ..Default::default()
+            }),
+            vec![200]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                located: Some(true),
+                ..Default::default()
+            }),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                located: Some(false),
+                ..Default::default()
+            })
+            .len(),
+            4
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                min_confidence: Some(0.9),
+                ..Default::default()
+            }),
+            vec![200, 100]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                from: Some(200),
+                to: Some(400),
+                ..Default::default()
+            }),
+            vec![300, 200]
+        );
+        assert_eq!(
+            times(DetectionFilter {
+                before: Some(300),
+                ..Default::default()
+            }),
+            vec![200, 100]
+        );
+
+        let seen = db.species_seen().unwrap();
+        let summary: Vec<_> = seen
+            .iter()
+            .map(|s| (s.common.as_str(), s.count, s.last_seen))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("American Crow", 2, 400),
+                ("American Robin", 1, 300),
+                ("Common Raven", 1, 200)
+            ]
+        );
     }
 }

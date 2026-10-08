@@ -31,6 +31,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+/// Charting library for the web UI, embedded so the UI works offline.
+const ECHARTS_JS: &str = include_str!("../web/vendor/echarts-6.1.0/echarts.min.js");
 
 pub fn build_identifier(cfg: &ServerConfig) -> anyhow::Result<Arc<dyn Identifier>> {
     Ok(match cfg.identifier.kind {
@@ -93,6 +95,25 @@ pub fn client_router(state: SharedState) -> Router {
 pub fn web_router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route(
+            "/static/echarts-6.1.0.min.js",
+            get(|| async {
+                (
+                    [
+                        (
+                            axum::http::header::CONTENT_TYPE,
+                            "text/javascript; charset=utf-8",
+                        ),
+                        // Versioned path: the content never changes.
+                        (
+                            axum::http::header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable",
+                        ),
+                    ],
+                    ECHARTS_JS,
+                )
+            }),
+        )
         .nest("/api/v1/control", api::control::router())
         .with_state(state)
 }

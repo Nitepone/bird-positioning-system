@@ -1,7 +1,7 @@
 //! Configuration and monitoring endpoints used by the web UI.
 
 use super::{ApiError, ApiResult};
-use crate::db::{ClientRecord, Event};
+use crate::db::{ClientRecord, DetectionFilter, Event, SpeciesSeen};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
 use crate::state::{PositioningRequest, SharedState};
 use crate::waveform;
@@ -29,6 +29,8 @@ pub fn router() -> Router<SharedState> {
             get(get_client).put(configure_client).delete(delete_client),
         )
         .route("/detections", get(list_detections))
+        .route("/timeline", get(timeline))
+        .route("/species", get(species_seen))
         .route("/detections/{id}/audio/{client_id}", get(detection_audio))
         .route("/detections/{id}/waveform", get(detection_waveform))
         .route("/events", get(list_events))
@@ -145,8 +147,7 @@ async fn delete_client(
 }
 
 #[derive(Deserialize)]
-struct DetectionQuery {
-    before: Option<Timestamp>,
+struct Limit {
     limit: Option<u32>,
 }
 
@@ -176,11 +177,12 @@ fn clip_order(d: &Detection, mut available: Vec<ClientId>) -> Vec<ClientId> {
 
 async fn list_detections(
     State(state): State<SharedState>,
-    Query(q): Query<DetectionQuery>,
+    Query(filter): Query<DetectionFilter>,
+    Query(q): Query<Limit>,
 ) -> ApiResult<Json<Vec<DetectionView>>> {
     let detections = state
         .db
-        .list_detections(q.before, q.limit.unwrap_or(100).min(1000))?;
+        .list_detections(&filter, q.limit.unwrap_or(100).min(1000))?;
     let mut out = Vec::with_capacity(detections.len());
     for d in detections {
         let clips = clip_order(&d, state.db.clip_clients(d.id)?);
@@ -190,6 +192,75 @@ async fn list_detections(
         });
     }
     Ok(Json(out))
+}
+
+/// Most detections the timeline returns at once.
+const TIMELINE_LIMIT: u32 = 20_000;
+
+#[derive(Deserialize)]
+struct TimelineQuery {
+    from: Timestamp,
+    to: Timestamp,
+}
+
+/// One detection, reduced to what the dashboard timeline draws.
+#[derive(Serialize)]
+struct TimelineEntry {
+    id: Uuid,
+    time: Timestamp,
+    end: Timestamp,
+    scientific: String,
+    common: String,
+    confidence: f32,
+    unexpected: bool,
+    clients: Vec<ClientId>,
+    cardinal: Option<bsp_core::locator::Cardinal>,
+}
+
+#[derive(Serialize)]
+struct Timeline {
+    detections: Vec<TimelineEntry>,
+    /// More than `TIMELINE_LIMIT` detections fell in the range; the oldest were left out.
+    truncated: bool,
+}
+
+async fn timeline(
+    State(state): State<SharedState>,
+    Query(q): Query<TimelineQuery>,
+) -> ApiResult<Json<Timeline>> {
+    if q.to <= q.from {
+        return Err(ApiError::bad_request("`to` must be after `from`"));
+    }
+    let filter = DetectionFilter {
+        from: Some(q.from),
+        to: Some(q.to),
+        ..Default::default()
+    };
+    let found = state.db.list_detections(&filter, TIMELINE_LIMIT + 1)?;
+    let truncated = found.len() > TIMELINE_LIMIT as usize;
+    let detections = found
+        .into_iter()
+        .take(TIMELINE_LIMIT as usize)
+        .map(|d| TimelineEntry {
+            id: d.id,
+            time: d.time,
+            end: d.calls.iter().map(|c| c.end).max().unwrap_or(d.time),
+            clients: d.calls.iter().map(|c| c.client_id).collect(),
+            cardinal: d.location.as_ref().map(|l| l.cardinal),
+            scientific: d.species.scientific,
+            common: d.species.common,
+            confidence: d.confidence,
+            unexpected: d.unexpected,
+        })
+        .collect();
+    Ok(Json(Timeline {
+        detections,
+        truncated,
+    }))
+}
+
+async fn species_seen(State(state): State<SharedState>) -> ApiResult<Json<Vec<SpeciesSeen>>> {
+    Ok(Json(state.db.species_seen()?))
 }
 
 /// Stored clips never change, so browsers may cache them indefinitely.

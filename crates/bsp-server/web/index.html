@@ -2,37 +2,133 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>bsp</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bird Positioning System</title>
 <style>
-  body { font-family: sans-serif; font-size: 14px; margin: 0; }
-  #titlebar { background: #246; color: #fff; padding: 6px 1em; }
-  #titlebar a { color: #fff; margin-right: 1.5em; text-decoration: none; }
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --hairline: rgba(11, 11, 11, 0.10);
+    --cell-border: #999;
+    --th: #e6e5e0;
+    --titlebar: #224466;
+    --link: #1c5cab;
+    --tag: #a34000;
+    --row-unexpected: #fde8d8;
+    --row-requesting: #ffffd6;
+    --row-inactive: #898781;
+    --playing: #b5dc8f;
+    /* Timeline ticks; validated as a pair for colour-vision deficiency and contrast. */
+    --tick: #2a78d6;
+    --tick-unexpected: #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --hairline: rgba(255, 255, 255, 0.10);
+      --cell-border: #4a4a47;
+      --th: #2c2c2a;
+      --titlebar: #16263a;
+      --link: #86b6ef;
+      --tag: #f2a57a;
+      --row-unexpected: #3a2418;
+      --row-requesting: #3a3510;
+      --playing: #3d5a22;
+      --tick: #3987e5;
+      --tick-unexpected: #d95926;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --hairline: rgba(255, 255, 255, 0.10);
+    --cell-border: #4a4a47;
+    --th: #2c2c2a;
+    --titlebar: #16263a;
+    --link: #86b6ef;
+    --tag: #f2a57a;
+    --row-unexpected: #3a2418;
+    --row-requesting: #3a3510;
+    --playing: #3d5a22;
+    --tick: #3987e5;
+    --tick-unexpected: #d95926;
+  }
+
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; margin: 0;
+         background: var(--page); color: var(--ink); }
+  a { color: var(--link); }
+  #titlebar { background: var(--titlebar); color: #fff; padding: 6px 1em; display: flex; flex-wrap: wrap;
+              align-items: baseline; gap: 0 1.5em; }
+  #titlebar .brand { font-weight: bold; margin-right: 1em; }
+  #titlebar a { color: #fff; text-decoration: none; }
   #titlebar a.current { font-weight: bold; text-decoration: underline; }
+  #titlebar #status { margin-left: auto; opacity: 0.85; }
   main { margin: 1em; }
   table { border-collapse: collapse; margin-bottom: 1em; }
-  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; vertical-align: middle; }
-  th { background: #ddd; }
-  tr.inactive { color: #888; }
-  tr.requesting { background: #ffd; }
-  tr.unexpected { background: #fde8d8; }
-  .tag { color: #a40; font-weight: bold; font-size: 12px; }
-  fieldset { margin-bottom: 0.8em; max-width: 50em; }
-  #banner { background: #ffd; border: 2px solid #c90; padding: 6px; margin-bottom: 1em; display: none; }
+  th, td { border: 1px solid var(--cell-border); padding: 2px 6px; text-align: left; vertical-align: middle; }
+  th { background: var(--th); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.inactive { color: var(--row-inactive); }
+  tr.requesting { background: var(--row-requesting); }
+  tr.unexpected { background: var(--row-unexpected); }
+  .tag { color: var(--tag); font-weight: bold; font-size: 12px; }
+  fieldset { margin-bottom: 0.8em; max-width: 50em; border: 1px solid var(--cell-border); }
+  #banner { background: var(--row-requesting); border: 2px solid #c90; padding: 6px; margin-bottom: 1em; display: none; }
   .mono { font-family: monospace; font-size: 12px; }
+  .muted { color: var(--ink-2); }
   img.wave { display: block; cursor: pointer; }
-  button.play.playing { background: #9c6; }
+  button.play.playing { background: var(--playing); }
+
+  /* Filter rows: one left-aligned row above the content they scope. */
+  .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em 1em; margin-bottom: 1em; }
+  .filters label { white-space: nowrap; }
+  .chip { border: 1px solid var(--cell-border); border-radius: 1em; padding: 1px 4px 1px 10px; white-space: nowrap; }
+
+  /* Dashboard */
+  .tiles { display: flex; flex-wrap: wrap; gap: 1em; margin-bottom: 1em; }
+  .tile, .card { background: var(--surface); border: 1px solid var(--hairline); border-radius: 6px; }
+  .tile { padding: 10px 14px; min-width: 10em; }
+  .tile .label { color: var(--ink-2); font-size: 12px; }
+  .tile .value { font-size: 24px; font-weight: 600; margin: 2px 0; }
+  .tile .sub { color: var(--ink-2); font-size: 12px; }
+  .card { padding: 10px 14px; margin-bottom: 1em; }
+  .card h3 { margin: 0 0 6px 0; font-size: 15px; }
+  .legend { color: var(--ink-2); font-size: 12px; display: flex; gap: 1.5em; margin-bottom: 4px; }
+  .legend .key { display: inline-block; width: 4px; height: 12px; border-radius: 1px; vertical-align: -1px; margin-right: 6px; }
+  #timeline { width: 100%; }
+  .hint { color: var(--ink-2); font-size: 12px; margin: 4px 0 0 0; }
+  .empty { color: var(--ink-2); padding: 2em 0; }
 </style>
 </head>
 <body>
 <div id="titlebar">
-  <a href="#/" data-page="home">Bird Positioning System</a>
+  <span class="brand">Bird Positioning System</span>
+  <a href="#/" data-page="home">Dashboard</a>
+  <a href="#/detections" data-page="detections">Detections</a>
   <a href="#/config" data-page="config">Config</a>
   <a href="#/logs" data-page="logs">Logs</a>
   <span id="status" class="mono"></span>
 </div>
 
 <main>
-<p id="error" style="color: red"></p>
+<p id="error" style="color: #d03b3b"></p>
 
 <div id="banner">
   <b>Positioning request:</b> <span id="banner-text"></span>
@@ -41,13 +137,85 @@
 </div>
 
 <section id="page-home">
+  <div class="filters">
+    <button type="button" onclick="shiftDay(-1)" title="Previous day">&#9664;</button>
+    <input type="date" id="day" onchange="setDay(this.value)">
+    <button type="button" onclick="shiftDay(1)" title="Next day">&#9654;</button>
+    <button type="button" onclick="setDay(dateKey(new Date()))">Today</button>
+    <label>Order species by
+      <select id="lane-order" onchange="renderDashboard()">
+        <option value="first">first heard</option>
+        <option value="count">most detections</option>
+        <option value="name">name</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Species heard</div><div class="value" id="t-species">-</div><div class="sub" id="t-species-sub"></div></div>
+    <div class="tile"><div class="label">Detections</div><div class="value" id="t-detections">-</div><div class="sub" id="t-detections-sub"></div></div>
+    <div class="tile"><div class="label">Most active</div><div class="value" id="t-top">-</div><div class="sub" id="t-top-sub"></div></div>
+    <div class="tile"><div class="label">Last heard</div><div class="value" id="t-last">-</div><div class="sub" id="t-last-sub"></div></div>
+  </div>
+
+  <div class="card">
+    <h3>Timeline</h3>
+    <div class="legend">
+      <span><span class="key" style="background: var(--tick)"></span>expected species</span>
+      <span><span class="key" style="background: var(--tick-unexpected)"></span>unexpected species</span>
+    </div>
+    <div id="timeline"></div>
+    <p class="empty" id="timeline-empty" hidden>No birds detected on this day.</p>
+    <p class="hint">Each mark is one detection. Hover for details; click a mark or species name to see its detections.
+      Scroll over the chart or drag the bar below it to zoom in on part of the day.</p>
+  </div>
+
+  <div class="card">
+    <h3>Species this day</h3>
+    <table id="day-species">
+      <thead><tr><th>Species</th><th>Detections</th><th>First heard</th><th>Last heard</th><th>Heard by</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section id="page-detections">
   <h2>Detections</h2>
-  <p><small>Click a waveform to play the clearest recording, or a client name to hear that client's recording.
+  <form id="det-filters" class="filters" onsubmit="event.preventDefault(); applyFilters()">
+    <label>Search <input id="f-q" list="species-names" size="22" placeholder="species name"></label>
+    <datalist id="species-names"></datalist>
+    <span id="f-species-chip" class="chip" hidden>Species: <b></b>
+      <button type="button" onclick="clearSpeciesFilter()" title="Remove">&#10005;</button></span>
+    <label>Monitor <select id="f-client"><option value="">any</option></select></label>
+    <label>From <input type="date" id="f-from"></label>
+    <label>To <input type="date" id="f-to"></label>
+    <label>Show
+      <select id="f-unexpected">
+        <option value="">all species</option>
+        <option value="false">expected species</option>
+        <option value="true">unexpected species</option>
+      </select>
+    </label>
+    <label>Min. confidence
+      <select id="f-conf">
+        <option value="">any</option>
+        <option value="0.7">70%</option>
+        <option value="0.8">80%</option>
+        <option value="0.9">90%</option>
+        <option value="0.95">95%</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="f-located"> with direction only</label>
+    <button type="button" onclick="clearFilters()">Clear filters</button>
+  </form>
+  <p class="muted" id="det-summary"></p>
+  <p><small class="muted">Click a waveform to play the clearest recording, or a monitor's button to hear its recording.
     The highlighted band is the identified call.</small></p>
   <table id="detections">
     <thead><tr><th>Time</th><th>Waveform</th><th>Species</th><th>Confidence</th><th>Heard by</th><th>Direction</th><th>Position (E, N) m</th></tr></thead>
     <tbody></tbody>
   </table>
+  <button type="button" id="det-more" onclick="loadOlder()" hidden>Load older detections</button>
 </section>
 
 <section id="page-config">
@@ -113,23 +281,27 @@
 </section>
 </main>
 
+<script src="/static/echarts-6.1.0.min.js"></script>
 <script>
 const API = "/api/v1/control";
-const PAGES = ["home", "config", "logs"];
+const PAGES = ["home", "detections", "config", "logs"];
 let clients = [];
 let positioning = null;
 let configDirty = false;
-let detectionsKey = "";
 
 // ---- helpers ----
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 function fmtTime(ns) { return ns ? new Date(ns / 1e6).toLocaleString() : ""; }
+function fmtClock(ms, seconds) {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds ? "2-digit" : undefined });
+}
 function fmtAgo(ns) {
   const s = Math.round((Date.now() * 1e6 - ns) / 1e9);
   if (s < 60) return s + "s ago";
   if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
   return fmtTime(ns);
 }
 function fmtPos(p, dims) { return p ? (dims || ["x", "y", "z"]).map(k => p[k].toFixed(1)).join(", ") : "not set"; }
@@ -142,17 +314,30 @@ async function api(path, opts) {
   if (!r.ok) throw new Error(path + ": " + r.status + " " + await r.text());
   return r.status === 204 ? null : r.json();
 }
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
-// ---- pages ----
-function currentPage() {
-  const p = location.hash.replace(/^#\/?/, "");
-  return PAGES.includes(p) ? p : "home";
+// Dates are handled as local calendar days ("YYYY-MM-DD"); the API takes nanoseconds.
+function dateKey(d) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+function dayStartMs(key) { const [y, m, d] = key.split("-").map(Number); return new Date(y, m - 1, d).getTime(); }
+function dayEndMs(key) { const [y, m, d] = key.split("-").map(Number); return new Date(y, m - 1, d + 1).getTime(); }
+const msToNs = ms => Math.round(ms) * 1e6;
+
+// ---- pages (#/page?param=value) ----
+function route() {
+  const [path, query] = location.hash.replace(/^#\/?/, "").split("?");
+  return { page: PAGES.includes(path) ? path : "home", params: new URLSearchParams(query || "") };
+}
+function currentPage() { return route().page; }
 function showPage() {
-  const page = currentPage();
+  const { page, params } = route();
   for (const p of PAGES) document.getElementById("page-" + p).style.display = p === page ? "" : "none";
   for (const a of document.querySelectorAll("#titlebar a")) a.classList.toggle("current", a.dataset.page === page);
   if (page === "config" && !settingsDirty) loadSettings();
+  if (page === "home") { renderDashboard(); timelineFetchedAt = 0; }
+  if (page === "detections") enterDetections(params);
   refresh();
 }
 
@@ -180,7 +365,7 @@ player.addEventListener("ended", () => setPlaying(null));
 async function refreshStatus() {
   const s = await api("/status");
   document.getElementById("status").textContent =
-    `identifier: ${s.identifier} | clients: ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} known`;
+    `${s.identifier} | ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} monitors`;
 }
 
 async function refreshClients() {
@@ -197,17 +382,367 @@ async function refreshClients() {
   } else {
     banner.style.display = "none";
   }
-  if (currentPage() === "config") renderConfigPage();
+  const page = currentPage();
+  if (page === "config") renderConfigPage();
+  // Monitor names appear in the other pages; redraw them when names change.
+  const key = clients.map(c => c.id + c.name).join();
+  const namesChanged = key !== clientNamesKey;
+  clientNamesKey = key;
+  if (page === "detections") {
+    renderClientFilter();
+    if (namesChanged) renderDetections();
+  }
+  if (page === "home" && namesChanged) renderDashboard();
+}
+let clientNamesKey = "";
+
+// ---- dashboard ----
+let dashDay = dateKey(new Date());
+let timeline = { detections: [], truncated: false };  // for dashDay
+let timelineFetchedAt = 0;
+let chart = null;
+const TIMELINE_REFRESH_MS = 10000;
+const LANE_HEIGHT = 26;
+
+function setDay(key) {
+  if (!key) return;
+  dashDay = key;
+  document.getElementById("day").value = key;
+  timeline = { detections: [], truncated: false };
+  timelineFetchedAt = 0;
+  refreshTimeline();
+}
+function shiftDay(delta) {
+  const [y, m, d] = dashDay.split("-").map(Number);
+  setDay(dateKey(new Date(y, m - 1, d + delta)));
 }
 
-// ---- home page ----
+async function refreshTimeline() {
+  const isToday = dashDay === dateKey(new Date());
+  // Past days don't change; today is refetched periodically.
+  if (timelineFetchedAt && (!isToday || Date.now() - timelineFetchedAt < TIMELINE_REFRESH_MS)) return;
+  const day = dashDay;
+  const data = await api(`/timeline?from=${msToNs(dayStartMs(day))}&to=${msToNs(dayEndMs(day))}`);
+  if (day !== dashDay) return;  // the day changed while loading
+  timeline = data;
+  timelineFetchedAt = Date.now();
+  renderDashboard();
+}
+
+/// Groups the day's detections by species, in the selected lane order.
+function speciesLanes() {
+  const lanes = new Map();
+  for (const d of timeline.detections) {
+    let l = lanes.get(d.scientific);
+    if (!l) {
+      l = { scientific: d.scientific, common: d.common, unexpected: false, items: [], clients: new Set() };
+      lanes.set(d.scientific, l);
+    }
+    l.items.push(d);
+    l.unexpected ||= d.unexpected;
+    d.clients.forEach(c => l.clients.add(c));
+  }
+  const list = [...lanes.values()];
+  for (const l of list) {
+    l.first = Math.min(...l.items.map(d => d.time));
+    l.last = Math.max(...l.items.map(d => d.time));
+  }
+  const order = document.getElementById("lane-order").value;
+  const byName = (a, b) => a.common.localeCompare(b.common);
+  list.sort(order === "count" ? (a, b) => b.items.length - a.items.length || byName(a, b)
+          : order === "name" ? byName
+          : (a, b) => a.first - b.first);
+  return list;
+}
+
+function detectionsLink(scientific) {
+  const q = new URLSearchParams({ species: scientific, from: dashDay, to: dashDay });
+  return "#/detections?" + q;
+}
+
+function renderDashboard() {
+  document.getElementById("day").value = dashDay;
+  const lanes = speciesLanes();
+  const ds = timeline.detections;
+
+  // Stat tiles.
+  const unexpectedSpecies = lanes.filter(l => l.unexpected).length;
+  document.getElementById("t-species").textContent = lanes.length;
+  document.getElementById("t-species-sub").textContent = unexpectedSpecies ? `${unexpectedSpecies} unexpected` : "";
+  document.getElementById("t-detections").textContent = ds.length;
+  document.getElementById("t-detections-sub").textContent = timeline.truncated ? "showing the most recent" : "";
+  const top = [...lanes].sort((a, b) => b.items.length - a.items.length)[0];
+  document.getElementById("t-top").textContent = top ? top.common : "-";
+  document.getElementById("t-top-sub").textContent = top ? `${top.items.length} detections` : "";
+  const last = ds.length ? ds.reduce((a, b) => (a.time > b.time ? a : b)) : null;
+  document.getElementById("t-last").textContent = last ? last.common : "-";
+  document.getElementById("t-last-sub").textContent = last ? fmtAgo(last.time) : "";
+
+  // Species table (also the accessible, non-chart view of the timeline).
+  const nameCell = l => `<a href="${detectionsLink(l.scientific)}">${esc(l.common)}</a>` +
+    (l.unexpected ? ` <span class="tag">unexpected</span>` : "") + `<br><i class="muted">${esc(l.scientific)}</i>`;
+  document.querySelector("#day-species tbody").innerHTML = lanes.map(l => `<tr>
+      <td>${nameCell(l)}</td>
+      <td class="num">${l.items.length}</td>
+      <td>${fmtClock(l.first / 1e6)}</td>
+      <td>${fmtClock(l.last / 1e6)}</td>
+      <td>${[...l.clients].map(c => esc(clientName(c))).join(", ")}</td>
+    </tr>`).join("");
+
+  renderTimeline(lanes);
+}
+
+function renderTimeline(lanes) {
+  const el = document.getElementById("timeline");
+  const empty = document.getElementById("timeline-empty");
+  empty.hidden = lanes.length > 0;
+  el.hidden = lanes.length === 0;
+  if (!lanes.length || currentPage() !== "home") return;
+  if (typeof echarts === "undefined") {
+    empty.hidden = false;
+    empty.textContent = "The charting library failed to load.";
+    return;
+  }
+
+  el.style.height = (lanes.length * LANE_HEIGHT + 90) + "px";
+  if (!chart) {
+    chart = echarts.init(el);
+    chart.on("click", "series", p => { location.hash = detectionsLink(p.data.entry.scientific); });
+    chart.on("click", "yAxis", p => {
+      const lane = chart.__lanes.find(l => l.scientific === p.value);
+      if (lane) location.hash = detectionsLink(lane.scientific);
+    });
+  }
+  chart.__lanes = lanes;
+  chart.resize();
+
+  const c = {
+    surface: cssVar("--surface"), ink: cssVar("--ink"), ink2: cssVar("--ink-2"), muted: cssVar("--muted"),
+    grid: cssVar("--grid"), axis: cssVar("--axis"), tick: cssVar("--tick"), tickU: cssVar("--tick-unexpected"),
+    tag: cssVar("--tag"),
+  };
+  const laneIndex = new Map(lanes.map((l, i) => [l.scientific, i]));
+  const data = timeline.detections.map(d => ({
+    value: [d.time / 1e6, Math.max(d.end, d.time) / 1e6, laneIndex.get(d.scientific)],
+    entry: d,
+  }));
+  const dayStart = dayStartMs(dashDay), dayEnd = dayEndMs(dashDay), now = Date.now();
+  const longest = Math.max(...lanes.map(l => l.common.length + (l.unexpected ? 12 : 0)));
+  const shorten = s => (s.length > 28 ? s.slice(0, 27) + "…" : s);
+
+  chart.setOption({
+    animation: false,
+    textStyle: { fontFamily: getComputedStyle(document.body).fontFamily },
+    grid: { left: Math.min(280, 16 + Math.min(longest, 40) * 7), right: 24, top: 10, bottom: 64 },
+    tooltip: {
+      trigger: "item",
+      confine: true,
+      backgroundColor: c.surface,
+      borderColor: c.axis,
+      textStyle: { color: c.ink },
+      formatter: p => {
+        const d = p.data.entry;
+        const heard = d.clients.map(clientName).map(esc).join(", ");
+        return `<b>${fmtClock(d.time / 1e6, true)}</b> &middot; confidence <b>${d.confidence.toFixed(2)}</b><br>` +
+          `${esc(d.common)} <i>${esc(d.scientific)}</i>` +
+          (d.unexpected ? ` <span style="color:${c.tag};font-weight:bold">unexpected</span>` : "") +
+          `<br>Heard by: ${heard}` + (d.cardinal ? `<br>Direction: ${d.cardinal}` : "") +
+          `<br><span style="color:${c.ink2};font-size:12px">Click for all ${esc(d.common)} detections</span>`;
+      },
+    },
+    xAxis: {
+      type: "time", min: dayStart, max: dayEnd,
+      axisLabel: { color: c.ink2, formatter: "{HH}:{mm}", hideOverlap: true },
+      axisLine: { lineStyle: { color: c.axis } },
+      axisTick: { lineStyle: { color: c.axis } },
+      splitLine: { show: true, lineStyle: { color: c.grid } },
+    },
+    yAxis: {
+      type: "category",
+      inverse: true,
+      data: lanes.map(l => l.scientific),
+      triggerEvent: true,
+      axisTick: { show: false },
+      axisLine: { lineStyle: { color: c.axis } },
+      splitLine: { show: true, interval: 0, lineStyle: { color: c.grid } },
+      axisLabel: {
+        color: c.ink,
+        formatter: sci => {
+          const l = lanes[laneIndex.get(sci)];
+          return esc(shorten(l.common)).replace(/[{}|]/g, "") + (l.unexpected ? " {u|unexpected}" : "");
+        },
+        rich: { u: { color: c.tag, fontWeight: "bold", fontSize: 11 } },
+      },
+    },
+    dataZoom: [
+      { type: "inside", xAxisIndex: 0, filterMode: "none", minValueSpan: 5 * 60 * 1000 },
+      { type: "slider", xAxisIndex: 0, filterMode: "none", height: 18, bottom: 10,
+        borderColor: c.axis, textStyle: { color: c.ink2 }, labelFormatter: v => fmtClock(v) },
+    ],
+    series: [{
+      type: "custom",
+      encode: { x: [0, 1], y: 2 },
+      data,
+      clip: true,
+      renderItem: (params, api) => {
+        const start = api.coord([api.value(0), api.value(2)]);
+        const end = api.coord([api.value(1), api.value(2)]);
+        const laneH = api.size([0, 1])[1];
+        const h = laneH * 0.6;
+        const w = Math.max(3, end[0] - start[0]);
+        const color = data[params.dataIndex].entry.unexpected ? c.tickU : c.tick;
+        return {
+          type: "group",
+          children: [
+            // Generous invisible hit area, so a 3px mark is easy to hover and click.
+            { type: "rect", shape: { x: start[0] - 6, y: start[1] - laneH / 2, width: w + 12, height: laneH },
+              style: { fill: "rgba(0,0,0,0)" } },
+            { type: "rect", shape: { x: start[0], y: start[1] - h / 2, width: w, height: h, r: 1 },
+              style: { fill: color },
+              emphasis: { style: { fill: color, stroke: c.ink, lineWidth: 1 } } },
+          ],
+        };
+      },
+      markLine: dashDay === dateKey(new Date()) && now >= dayStart && now < dayEnd ? {
+        silent: true, symbol: "none", animation: false,
+        lineStyle: { color: c.ink2, type: "dashed", width: 1 },
+        label: { formatter: "now", color: c.ink2, position: "insideEndTop" },
+        data: [{ xAxis: now }],
+      } : { data: [] },
+    }],
+  }, { replaceMerge: ["series", "yAxis"] });
+}
+
+window.addEventListener("resize", () => chart && chart.resize());
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderDashboard());
+
+// ---- detections page ----
+const DET_PAGE = 50;
+let detFilters = new URLSearchParams();
+let detRows = [];
+let detMore = false;
+let speciesSeen = [];
+let detLoadedAt = 0;
+
+/// Turns the page's URL parameters into API query parameters.
+function detApiQuery(limit, before) {
+  const q = new URLSearchParams();
+  for (const k of ["q", "species", "client", "unexpected", "min_confidence"]) {
+    if (detFilters.get(k)) q.set(k, detFilters.get(k));
+  }
+  if (detFilters.get("located")) q.set("located", "true");
+  if (detFilters.get("from")) q.set("from", msToNs(dayStartMs(detFilters.get("from"))));
+  if (detFilters.get("to")) q.set("to", msToNs(dayEndMs(detFilters.get("to"))));
+  if (before) q.set("before", before);
+  q.set("limit", limit);
+  return q;
+}
+
+function enterDetections(params) {
+  detFilters = params;
+  document.getElementById("f-q").value = params.get("q") || "";
+  document.getElementById("f-from").value = params.get("from") || "";
+  document.getElementById("f-to").value = params.get("to") || "";
+  document.getElementById("f-unexpected").value = params.get("unexpected") || "";
+  document.getElementById("f-conf").value = params.get("min_confidence") || "";
+  document.getElementById("f-located").checked = !!params.get("located");
+  renderClientFilter();
+  renderSpeciesChip();
+  detRows = [];
+  loadDetections();
+  api("/species").then(s => {
+    speciesSeen = s;
+    document.getElementById("species-names").innerHTML =
+      s.map(x => `<option value="${esc(x.common)}">${esc(x.scientific)}</option>`).join("");
+    renderSpeciesChip();
+  }).catch(() => {});
+}
+
+function renderSpeciesChip() {
+  const sci = detFilters.get("species");
+  const chip = document.getElementById("f-species-chip");
+  chip.hidden = !sci;
+  if (sci) {
+    const known = speciesSeen.find(s => s.scientific.toLowerCase() === sci.toLowerCase());
+    chip.querySelector("b").textContent = known ? `${known.common} (${known.scientific})` : sci;
+  }
+}
+
+function renderClientFilter() {
+  const sel = document.getElementById("f-client");
+  const want = detFilters.get("client") || "";
+  const opts = `<option value="">any</option>` +
+    clients.map(c => `<option value="${c.id}">${esc(c.name || c.id.slice(0, 8))}</option>`).join("");
+  if (sel.innerHTML !== opts) sel.innerHTML = opts;
+  sel.value = want;
+}
+
+/// Writes the form into the URL; the hashchange handler reloads the list.
+function applyFilters() {
+  const q = new URLSearchParams();
+  const set = (k, v) => { if (v) q.set(k, v); };
+  set("q", document.getElementById("f-q").value.trim());
+  set("species", detFilters.get("species"));
+  set("client", document.getElementById("f-client").value);
+  set("from", document.getElementById("f-from").value);
+  set("to", document.getElementById("f-to").value);
+  set("unexpected", document.getElementById("f-unexpected").value);
+  set("min_confidence", document.getElementById("f-conf").value);
+  if (document.getElementById("f-located").checked) q.set("located", "1");
+  const hash = "#/detections" + (q.toString() ? "?" + q : "");
+  if (location.hash !== hash) location.hash = hash;
+}
+function clearSpeciesFilter() { detFilters.delete("species"); applyFilters(); }
+function clearFilters() { location.hash = "#/detections"; }
+
+async function loadDetections() {
+  const filters = detFilters;
+  const limit = Math.min(1000, Math.max(DET_PAGE, detRows.length));
+  const rows = await api("/detections?" + detApiQuery(limit));
+  if (filters !== detFilters) return;
+  detRows = rows;
+  detMore = rows.length >= limit;
+  detLoadedAt = Date.now();
+  renderDetections();
+}
+
+async function loadOlder() {
+  if (!detRows.length) return;
+  const filters = detFilters;
+  // Times above 2^53 lose precision in JavaScript; step back slightly and drop repeats by id.
+  const before = detRows[detRows.length - 1].time + 1000;
+  const rows = await api("/detections?" + detApiQuery(DET_PAGE, before));
+  if (filters !== detFilters) return;
+  const seen = new Set(detRows.map(d => d.id));
+  detRows = detRows.concat(rows.filter(d => !seen.has(d.id)));
+  detMore = rows.length >= DET_PAGE;
+  renderDetections();
+}
+
+/// Picks up new detections at the top while keeping what is loaded.
 async function refreshDetections() {
-  const ds = await api("/detections?limit=100");
+  if (Date.now() - detLoadedAt < 5000) return;
+  const filters = detFilters;
+  const top = await api("/detections?" + detApiQuery(1));
+  if (filters !== detFilters) return;
+  detLoadedAt = Date.now();
+  if ((top[0] && top[0].id) !== (detRows[0] && detRows[0].id)) await loadDetections();
+}
+
+let detectionsKey = "";
+function renderDetections() {
+  const n = detRows.length;
+  const active = [...detFilters.keys()].length > 0;
+  document.getElementById("det-summary").textContent =
+    n ? `Showing ${n} ${active ? "matching " : ""}detection${n === 1 ? "" : "s"}, newest first.`
+      : (active ? "No detections match these filters." : "No detections yet.");
+  document.getElementById("det-more").hidden = !detMore;
+
   // Only re-render when something changed, so playback buttons and images stay put.
-  const key = ds.map(d => d.id).join() + "|" + clients.map(c => c.id + c.name).join();
+  const key = detRows.map(d => d.id).join() + "|" + clients.map(c => c.id + c.name).join();
   if (key === detectionsKey) return;
   detectionsKey = key;
-  document.querySelector("#detections tbody").innerHTML = ds.map(d => {
+  document.querySelector("#detections tbody").innerHTML = detRows.map(d => {
     const loc = d.location;
     const dir = loc ? `${loc.cardinal} (${loc.bearing_deg.toFixed(0)}&deg;)` : "-";
     const wave = d.clips.length
@@ -234,6 +769,14 @@ async function refreshDetections() {
   }).join("");
   setPlaying(player.paused ? null : playingUrl);
 }
+
+// Filters apply as soon as they change; typing in the search box waits for a pause.
+document.getElementById("det-filters").addEventListener("change", e => { if (e.target.id !== "f-q") applyFilters(); });
+let searchTimer = null;
+document.getElementById("f-q").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(applyFilters, 400);
+});
 
 // ---- config page: server settings ----
 let settingsDirty = false;
@@ -426,6 +969,7 @@ async function refreshEvents() {
     </tr>`).join("");
 }
 
+
 // ---- polling ----
 let refreshing = false;
 async function refresh() {
@@ -436,7 +980,8 @@ async function refresh() {
     const page = currentPage();
     await Promise.all([
       refreshStatus(),
-      page === "home" ? refreshDetections() : null,
+      page === "home" ? refreshTimeline() : null,
+      page === "detections" ? refreshDetections() : null,
       page === "logs" ? refreshEvents() : null,
     ]);
     document.getElementById("error").textContent = "";
