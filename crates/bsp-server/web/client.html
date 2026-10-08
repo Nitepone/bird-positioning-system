@@ -196,8 +196,10 @@
 //  3. Local clock -> server clock: the local clock is performance.timeOrigin +
 //     performance.now() (monotonic and high resolution; Date.now() is neither).
 //     Browsers cannot discipline the OS clock, so the client measures its
-//     offset to the server over a WebSocket (NTP-style, lowest-RTT sample
-//     wins) and adds it to every chunk's start time itself.
+//     offset to the server over a WebSocket (NTP-style), fits offset and
+//     drift through the fastest round trips (same method as bsp_proto's
+//     timesync::Estimator), and adds the fitted offset at each chunk's
+//     midpoint to the chunk's start time itself.
 
 const CLIENT_API = "/api/v1/client";
 const CONTROL_API = "/api/v1/control";
@@ -213,7 +215,8 @@ const RAW_AUDIO = {
 };
 const PROCESSING_KEYS = ["echoCancellation", "noiseSuppression", "autoGainControl", "voiceIsolation"];
 const SYNC_INTERVAL_MS = 250;
-const SYNC_HISTORY = 20;
+const SYNC_WINDOW_MS = 64000; // measurements older than this are forgotten
+const SYNC_BINS = 16;         // each bin of the window keeps its fastest measurement
 const SYNC_STALE_MS = 10000;
 const UPLOAD_QUEUE_MAX = 50;
 
@@ -329,8 +332,78 @@ async function loadServerLimits() {
   } catch {}
 }
 
+// ---- clock estimate (port of bsp_proto::timesync::Estimator) ----
+// Uneven delay makes a measurement wrong by up to half its round trip, and the
+// fastest round trips carry the least of it: each bin of the window keeps its
+// fastest measurement and a line through those (weighted 1/rtt^2) gives offset
+// and drift. Measurements that keep disagreeing with the line mean a clock
+// stepped; what came before is then dropped. Times are local ms, offsets ns.
+const STEP_RUN = 3, STEP_MARGIN_NS = 100000, MIN_DRIFT_SPAN = 0.25;
+/** Server minus local clock (ns) at local time `atMs`, from fit `f`. */
+const offsetAt = (f, atMs) => f.offsetNs + f.rate * (atMs - f.atMs) * 1e6;
+
+class ClockEstimator {
+  constructor(windowMs, bins) {
+    this.windowMs = windowMs; this.bins = bins; this.samples = []; this.fit = null;
+    this.disagreeingSince = null; this.disagreements = 0;
+  }
+  /** Adds a measurement `{ atMs, offsetNs, rttNs }`; returns the updated fit. */
+  push(s) {
+    const f = this.fit;
+    if (f) {
+      if (Math.abs(s.offsetNs - offsetAt(f, s.atMs)) > s.rttNs / 2 + f.errorNs + STEP_MARGIN_NS) {
+        this.disagreeingSince ??= s.atMs;
+        if (++this.disagreements >= STEP_RUN) {
+          const since = this.disagreeingSince;
+          this.samples = this.samples.filter(p => p.atMs >= since);
+          this.disagreeingSince = null;
+          this.disagreements = 0;
+        }
+      } else {
+        this.disagreeingSince = null;
+        this.disagreements = 0;
+      }
+    }
+    while (this.samples.length && this.samples.at(-1).atMs > s.atMs) this.samples.pop();
+    this.samples.push(s);
+    while (this.samples.length > 4096 || s.atMs - this.samples[0].atMs > this.windowMs) this.samples.shift();
+    if (this.disagreements === 0 || !this.fit) this.fit = this.refit();
+    return this.fit;
+  }
+  refit() {
+    const newest = this.samples.at(-1).atMs, binMs = this.windowMs / this.bins;
+    const bin = s => Math.floor((newest - s.atMs) / binMs);
+    const best = [];
+    for (const s of this.samples) {
+      const b = best.at(-1);
+      if (b && bin(b) === bin(s)) { if (s.rttNs < b.rttNs) best[best.length - 1] = s; } else best.push(s);
+    }
+    const rttNs = Math.min(...best.map(s => s.rttNs));
+    const w = s => 1 / (s.rttNs + 10000) ** 2; // 10 us floor, so near-zero round trips do not dominate
+    const x = s => (s.atMs - newest) * 1e6;
+    let sw = 0, mx = 0, my = 0;
+    for (const s of best) { sw += w(s); mx += w(s) * x(s); my += w(s) * s.offsetNs; }
+    mx /= sw; my /= sw;
+    let sxx = 0, sxy = 0;
+    for (const s of best) { sxx += w(s) * (x(s) - mx) ** 2; sxy += w(s) * (x(s) - mx) * (s.offsetNs - my); }
+    const span = newest - best[0].atMs;
+    const rate = best.length >= 3 && span >= MIN_DRIFT_SPAN * this.windowMs ? sxy / sxx : 0;
+    const offsetNs = my - rate * mx;
+    let scatter = 0;
+    for (const s of best) scatter += w(s) * (s.offsetNs - offsetNs - rate * x(s)) ** 2;
+    return { atMs: newest, offsetNs, rate, rttNs, errorNs: rttNs / 2 + Math.sqrt(scatter / sw), points: best.length };
+  }
+}
+
 // ---- clock measurement (bsp_proto::timesync packets over a WebSocket) ----
-const sync = { ws: null, connected: false, seq: 0, history: [], best: null, lastReply: 0, appliedNs: 0n };
+const sync = {
+  ws: null, connected: false, seq: 0, lastReply: 0,
+  est: new ClockEstimator(SYNC_WINDOW_MS, SYNC_BINS),
+  applied: null,          // { midMs, corrNs, halfMs } of the latest chunk
+  pending: new Map(),     // seq -> local send time (ms) of unanswered requests
+  lost: 0, rtts: [],      // since the previous heartbeat
+};
+const SYNC_TIMEOUT_MS = 2000; // a request unanswered this long is lost
 const idBytes = Uint8Array.from(clientId.replace(/-/g, "").match(/../g), h => parseInt(h, 16));
 
 function syncConnect() {
@@ -340,6 +413,8 @@ function syncConnect() {
   ws.onmessage = ev => onSyncReply(ev.data, localMs());
   ws.onclose = () => {
     if (sync.connected) log("timesync", "clock measurement disconnected");
+    sync.lost += sync.pending.size;
+    sync.pending.clear();
     sync.connected = false;
     setTimeout(syncConnect, 2000);
   };
@@ -354,43 +429,91 @@ function sendSyncRequest() {
   idBytes.forEach((x, i) => b.setUint8(12 + i, x));
   b.setBigInt64(28, msToNs(localMs()));
   sync.ws.send(b.buffer);
+  sync.pending.set(sync.seq >>> 0, localMs());
 }
 
 function onSyncReply(buf, receivedMs) {
   if (buf.byteLength !== 36) return; // RESPONSE_LEN
   const b = new DataView(buf);
   if (b.getUint8(0) !== 0x42 || b.getUint8(1) !== 0x53 || b.getUint8(2) !== 0x50 || b.getUint8(4) !== 2) return;
+  // Only replies to requests still waiting (not ones already counted as lost).
+  if (!sync.pending.delete(b.getUint32(8))) return;
   const [t1, t2, t3, t4] = [b.getBigInt64(12), b.getBigInt64(20), b.getBigInt64(28), msToNs(receivedMs)];
   const offsetNs = ((t2 - t1) + (t3 - t4)) / 2n; // server minus local
   const rttNs = (t4 - t1) - (t3 - t2);
-  sync.history.push({ offsetNs, rttNs });
-  if (sync.history.length > SYNC_HISTORY) sync.history.shift();
-  sync.best = sync.history.reduce((a, s) => s.rttNs < a.rttNs ? s : a);
+  // A server clock step between receive and send makes the reply meaningless.
+  if (rttNs < 0n || t3 < t2 || t3 - t2 >= 1000000000n) return;
+  const sentMs = Number(t1) / 1e6;
+  sync.est.push({ atMs: (sentMs + receivedMs) / 2, offsetNs: Number(offsetNs), rttNs: Number(rttNs) });
+  sync.rtts.push(Number(rttNs));
   sync.lastReply = receivedMs;
 }
 
-/** Correction to add to local timestamps to get server time, if known. */
-function clockCorrectionNs() {
-  return sync.best && localMs() - sync.lastReply < SYNC_STALE_MS ? sync.best.offsetNs : null;
+/** The fit, unless measurement has stopped. */
+function freshFit() {
+  return sync.est.fit && localMs() - sync.lastReply < SYNC_STALE_MS ? sync.est.fit : null;
 }
 
 /**
- * What the heartbeat reports. This client corrects its own timestamps, so the
- * "offset" is the worst-case error left in them: the change in the measured
- * offset since the last chunk boundary, plus half the round trip (the
- * measurement cannot tell how the delay splits between the two directions).
- * The server's usual |offset| limit then means what it says.
+ * Server-clock timestamp (ns) of a chunk starting at local `startMs` and
+ * lasting `lenMs`: the fitted offset at its midpoint (none until measured).
+ */
+function correctChunk(startMs, lenMs) {
+  const midMs = startMs + lenMs / 2;
+  const f = sync.est.fit;
+  const corrNs = f ? Math.round(offsetAt(f, midMs)) : 0;
+  sync.applied = { midMs, corrNs, halfMs: lenMs / 2 };
+  return msToNs(startMs) + BigInt(corrNs);
+}
+
+/**
+ * What the heartbeat reports. This client corrects its own timestamps, so
+ * `offset_ns` is what is left in them: how far the current estimate has moved
+ * from the correction applied to the latest chunk. `error_ns` adds the
+ * estimate's own uncertainty (half the fastest round trip, the measurement
+ * cannot tell how the delay splits between directions, plus scatter) and the
+ * drift within half a chunk. The server's limit then means what it says.
  */
 function clockStatus() {
-  const corr = clockCorrectionNs();
-  if (corr === null) return null;
-  const residual = corr - sync.appliedNs;
-  const bound = (residual < 0n ? -residual : residual) + sync.best.rttNs / 2n;
+  const f = freshFit();
+  if (!f) return null;
+  const a = sync.applied;
+  const offset = a ? Math.round(offsetAt(f, a.midMs)) - a.corrNs : 0;
+  const drift = a ? Math.abs(f.rate * a.halfMs * 1e6) : 0;
   return {
-    offset_ns: Number(residual < 0n ? -bound : bound),
-    rtt_ns: Number(sync.best.rttNs),
-    measured_at: Number(msToNs(sync.lastReply) + corr),
+    offset_ns: offset,
+    rtt_ns: f.rttNs,
+    measured_at: Number(msToNs(sync.lastReply) + BigInt(Math.round(offsetAt(f, sync.lastReply)))),
+    error_ns: Math.round(Math.abs(offset) + f.errorNs + drift),
   };
+}
+
+/**
+ * Monitoring detail for the heartbeat; starts a new interval for the counts.
+ * A request is counted once answered or lost, so it falls in the same
+ * interval as its reply.
+ */
+function takeSyncDetail() {
+  const now = localMs();
+  for (const [seq, sentMs] of sync.pending) {
+    if (now - sentMs > SYNC_TIMEOUT_MS) { sync.pending.delete(seq); sync.lost++; }
+  }
+  const f = freshFit();
+  const rtts = sync.rtts.sort((a, b) => a - b);
+  const detail = f && {
+    corrects_timestamps: true,
+    clock_offset_ns: Math.round(offsetAt(f, localMs())),
+    drift_ppm: f.rate * 1e6,
+    fit_points: f.points,
+    requests: rtts.length + sync.lost,
+    replies: rtts.length,
+    rtt_min_ns: rtts.length ? rtts[0] : null,
+    rtt_median_ns: rtts.length ? rtts[rtts.length >> 1] : null,
+    rtt_max_ns: rtts.length ? rtts.at(-1) : null,
+  };
+  sync.lost = 0;
+  sync.rtts = [];
+  return detail;
 }
 
 // ---- capture timeline (port of bsp-client's Timestamper / Chunker) ----
@@ -572,7 +695,6 @@ async function start() {
       // Capture-to-callback delay, when the browser reports it (seconds).
       inputLatencyMs: typeof settings.latency === "number" ? settings.latency * 1000 : 0,
     };
-    sync.appliedNs = clockCorrectionNs() ?? 0n;
     node.port.onmessage = ev => onAudio(ev.data, localMs());
     track.onended = () => { log("capture", "microphone disconnected"); stop(); };
     ctx.onstatechange = () => {
@@ -638,17 +760,19 @@ function onAudio({ frame, pcm }, receivedMs) {
 }
 
 function onChunk(c, { start, pcm }) {
-  const corr = clockCorrectionNs() ?? 0n;
-  sync.appliedNs = corr;
+  // Corrected before gating, so the reported clock status always describes the latest chunk.
+  const startNs = correctChunk(start, pcm.length * 1000 / c.ctx.sampleRate);
   const g = c.gate.check(pcm);
   stats.lastChunk = { at: Date.now(), ...g };
   if (!$("no-gate").checked && !g.pass) { stats.chunksGated++; return; }
-  enqueue(msToNs(start) + corr, encodeWav(c.ctx.sampleRate, pcm));
+  enqueue(startNs, encodeWav(c.ctx.sampleRate, pcm));
 }
 
 async function sendHeartbeat() {
+  const clock = clockStatus();
+  const detail = takeSyncDetail();
   const hb = {
-    clock: clockStatus(),
+    clock: clock && { ...clock, detail },
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
     chunks_sent: stats.chunksSent,
     chunks_gated: stats.chunksGated,
@@ -874,10 +998,12 @@ function syncSummary() {
   const st = clockStatus();
   if (!sync.connected) return { cls: "bad", text: "clock measurement not connected" };
   if (!st) return { cls: "warn", text: "measuring..." };
-  const ok = BigInt(Math.abs(st.offset_ns)) <= maxClockOffsetNs;
+  const ok = BigInt(st.error_ns) <= maxClockOffsetNs;
+  const f = sync.est.fit;
   return {
     cls: ok ? "ok" : "bad",
-    text: `${ok ? "synced" : "NOT synced"}: error up to ${fmtMs(Math.abs(st.offset_ns))} (RTT ${fmtMs(st.rtt_ns)}, limit ${fmtMs(maxClockOffsetNs)})`,
+    text: `${ok ? "synced" : "NOT synced"}: timestamps within ±${fmtMs(st.error_ns)} ` +
+      `(RTT ${fmtMs(st.rtt_ns)}, drift ${(f.rate * 1e6).toFixed(2)} ppm, limit ${fmtMs(maxClockOffsetNs)})`,
   };
 }
 

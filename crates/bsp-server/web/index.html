@@ -27,6 +27,9 @@
     /* Timeline ticks; validated as a pair for colour-vision deficiency and contrast. */
     --tick: #2a78d6;
     --tick-unexpected: #eb6834;
+    /* Status text; >= 5:1 contrast on --page in both themes (as on the client page). */
+    --ok: #1e7b34;
+    --bad: #c62828;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -48,6 +51,8 @@
       --playing: #3d5a22;
       --tick: #3987e5;
       --tick-unexpected: #d95926;
+      --ok: #6cc785;
+      --bad: #f28b82;
     }
   }
   :root[data-theme="dark"] {
@@ -69,6 +74,8 @@
     --playing: #3d5a22;
     --tick: #3987e5;
     --tick-unexpected: #d95926;
+    --ok: #6cc785;
+    --bad: #f28b82;
   }
 
   body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; margin: 0;
@@ -143,6 +150,16 @@
   #timeline { width: 100%; }
   .hint { color: var(--ink-2); font-size: 12px; margin: 4px 0 0 0; }
   .empty { color: var(--ink-2); padding: 2em 0; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); font-weight: bold; }
+
+  /* Clocks page */
+  .scroll-x { overflow-x: auto; max-width: 100%; }
+  #clock-clients tr.selected td:first-child { font-weight: bold; }
+  #clock-detail { max-width: 980px; }
+  #clock-detail .tile { min-width: 9em; }
+  #clock-detail .tile .value { font-size: 20px; font-variant-numeric: tabular-nums; }
+  #clock-chart { width: 100%; height: 540px; }
 </style>
 </head>
 <body>
@@ -151,6 +168,7 @@
   <a href="#/" data-page="home">Dashboard</a>
   <a href="#/detections" data-page="detections">Detections</a>
   <a href="#/config" data-page="config">Config</a>
+  <a href="#/clock" data-page="clock">Clocks</a>
   <a href="#/logs" data-page="logs">Logs</a>
   <span id="status" class="mono"></span>
   <a href="/client">[Web client]</a>
@@ -294,7 +312,7 @@
 
   <h2>Clients</h2>
   <table id="clients">
-    <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Position (E, N, Up) m</th><th>Clock offset / RTT</th><th>Address</th><th>Last seen</th><th></th></tr></thead>
+    <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Position (E, N, Up) m</th><th>Timestamp error / RTT</th><th>Address</th><th>Last seen</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
 
@@ -325,6 +343,35 @@
   </div>
 </section>
 
+<section id="page-clock">
+  <h2>Clock sync</h2>
+  <p class="hint" id="clock-intro"></p>
+  <div class="scroll-x">
+  <table id="clock-clients">
+    <thead><tr><th>Client</th><th>Status</th><th>Timestamp error</th><th>Clock offset</th><th>Drift</th>
+      <th>Best RTT</th><th>Replies</th><th>Corrects timestamps</th><th>Last measured</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <p class="empty" id="clock-none" hidden>No clients yet.</p>
+  <div class="card" id="clock-detail" hidden>
+    <h3 id="clock-title"></h3>
+    <div class="body">
+      <div class="filters">
+        <label>Range <select id="clock-range" onchange="refreshClock()">
+          <option value="15">last 15 min</option>
+          <option value="30" selected>last 30 min</option>
+          <option value="60">last hour</option>
+        </select></label>
+        <span class="hint" id="clock-meta"></span>
+      </div>
+      <div class="tiles" id="clock-tiles"></div>
+      <div id="clock-chart"></div>
+      <p class="hint" id="clock-foot"></p>
+    </div>
+  </div>
+</section>
+
 <section id="page-logs">
   <h2>Client events</h2>
   <p>
@@ -341,7 +388,7 @@
 <script src="/static/echarts-6.1.0.min.js"></script>
 <script>
 const API = "/api/v1/control";
-const PAGES = ["home", "detections", "config", "logs"];
+const PAGES = ["home", "detections", "config", "clock", "logs"];
 let clients = [];
 let positioning = null;
 let configDirty = false;
@@ -368,6 +415,8 @@ function wikiName(scientific) {
   return `<a class="quiet" href="${esc(url)}" target="_blank" rel="noopener noreferrer" ` +
     `title="Open on Wikipedia">${esc(scientific)}</a>`;
 }
+/// Nanoseconds as milliseconds ("-" when unknown).
+function fmtNsMs(ns, digits = 3) { return ns == null ? "-" : (ns / 1e6).toFixed(digits) + " ms"; }
 function fmtPos(p, dims) { return p ? (dims || ["x", "y", "z"]).map(k => p[k].toFixed(1)).join(", ") : "not set"; }
 /// The name set here, else the one the client suggested for itself ("" if neither).
 function displayName(c) { return c.name || c.suggested_name || ""; }
@@ -404,6 +453,7 @@ function showPage() {
   if (page === "config" && !settingsDirty) loadSettings();
   if (page === "home") { renderDashboard(); timelineFetchedAt = 0; }
   if (page === "detections") enterDetections(params);
+  if (page === "clock" && params.get("client")) clockClient = params.get("client");
   refresh();
 }
 
@@ -760,8 +810,8 @@ function renderTimeline(lanes) {
   }, { replaceMerge: ["series", "yAxis"] });
 }
 
-window.addEventListener("resize", () => chart && chart.resize());
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderDashboard());
+window.addEventListener("resize", () => { chart?.resize(); clockChart?.resize(); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { renderDashboard(); renderClockDetail(); });
 
 // ---- detections page ----
 const DET_PAGE = 50;
@@ -1022,7 +1072,9 @@ async function loadSpeciesList() {
 function renderConfigPage() {
   document.querySelector("#clients tbody").innerHTML = clients.map(c => {
     const cls = (c.active ? "" : "inactive") + (c.positioning_requested ? " requesting" : "");
-    const clock = c.clock ? `${(c.clock.offset_ns / 1e6).toFixed(3)} ms / ${(c.clock.rtt_ns / 1e6).toFixed(2)} ms` : "-";
+    const clock = c.clock
+      ? `<a href="#/clock?client=${c.id}" title="Clock details">&plusmn;${fmtNsMs(c.clock_error_ns)} / ${fmtNsMs(c.clock.rtt_ns, 2)}</a>`
+      : "-";
     const status = (c.active ? "active" : "inactive") + (c.synced ? ", synced" : (c.active ? ", NOT synced" : ""))
       + (c.positioning_requested ? ", <b>requesting position</b>" : "");
     return `<tr class="${cls}">
@@ -1190,6 +1242,199 @@ async function refreshEvents() {
     </tr>`).join("");
 }
 
+// ---- clocks page ----
+// Positioning needs every client's audio timestamps on the server's clock.
+// Clients report the worst-case error left in their timestamps with every
+// heartbeat; the server keeps the last hour of reports (in memory) for this page.
+let clockClient = null;  // selected client id
+let clockData = null;    // latest /clients/{id}/clock response
+let clockChart = null;
+
+function clockLimitNs() { return (clockData?.max_clock_offset_us ?? 2000) * 1000; }
+
+function clockState(c) {
+  if (!c.active) return { cls: "muted", text: "inactive" };
+  return c.synced ? { cls: "ok", text: "synced" } : { cls: "bad", text: "NOT synced" };
+}
+
+function correctsText(d) {
+  if (!d) return "unknown (older client)";
+  return d.corrects_timestamps ? "yes" : "no (trusts OS clock)";
+}
+
+async function refreshClock() {
+  if (!clients.some(c => c.id === clockClient)) clockClient = (clients.find(c => c.active) || clients[0])?.id ?? null;
+  renderClockTable();
+  if (!clockClient) { clockData = null; renderClockDetail(); return; }
+  const minutes = document.getElementById("clock-range").value;
+  clockData = await api(`/clients/${clockClient}/clock?minutes=${minutes}`);
+  renderClockDetail();
+}
+
+function renderClockTable() {
+  document.getElementById("clock-none").hidden = clients.length > 0;
+  document.getElementById("clock-intro").textContent =
+    "Direction finding needs every client's audio timestamps on the server's clock. Timestamp error is the worst " +
+    `case left in them; clients over the limit (±${fmtNsMs(clockLimitNs(), 1)}) are left out of positioning. ` +
+    "Replies, drift and round trips are from each client's latest heartbeat.";
+  document.querySelector("#clock-clients tbody").innerHTML = clients.map(c => {
+    const k = c.clock, d = k?.detail, st = clockState(c);
+    return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
+      <td><a href="#/clock?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
+      <td class="${st.cls}">${st.text}</td>
+      <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}</td>
+      <td class="num">${fmtNsMs(d?.clock_offset_ns)}</td>
+      <td class="num">${d ? d.drift_ppm.toFixed(2) + " ppm" : "-"}</td>
+      <td class="num">${fmtNsMs(k?.rtt_ns)}</td>
+      <td class="num">${d ? `${d.replies}/${d.requests}` : "-"}</td>
+      <td>${k ? correctsText(d) : "-"}</td>
+      <td>${k ? fmtAgo(k.measured_at) : "never"}</td>
+    </tr>`;
+  }).join("");
+}
+
+/// The reports as chart rows, with a gap row wherever heartbeats stopped.
+function clockRows(data) {
+  const gapNs = 3 * data.heartbeat_interval_s * 1e9;
+  const rows = [];
+  let prev = null;
+  for (const r of data.reports) {
+    if (prev !== null && r.at - prev > gapNs) rows.push({ at: (prev + r.at) / 2, gap: true });
+    rows.push(r);
+    prev = r.at;
+  }
+  return rows;
+}
+
+function percentile(sorted, p) { return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : null; }
+
+function renderClockDetail() {
+  const box = document.getElementById("clock-detail");
+  const data = clockData;
+  box.hidden = !data;
+  if (!data || currentPage() !== "clock") return;
+  const c = data.client, k = c.clock, d = k?.detail, st = clockState(c), limit = clockLimitNs();
+  const minutes = Math.round((data.server_time - data.from) / 60e9);
+  document.getElementById("clock-title").innerHTML =
+    `Clock: ${esc(displayName(c) || "unnamed")} <span class="mono">${esc(c.id)}</span> &middot; <span class="${st.cls}">${st.text}</span>`;
+  document.getElementById("clock-meta").textContent =
+    `${c.hostname} · ${c.version} · clock source: ${c.capabilities?.clock_source || "unknown"} · ` +
+    `limit ±${fmtNsMs(limit, 1)} · heartbeat every ${data.heartbeat_interval_s} s`;
+
+  const reports = data.reports.filter(r => r.clock);
+  const errors = reports.map(r => r.error_ns).sort((a, b) => a - b);
+  const within = errors.filter(e => e <= limit).length;
+  const dets = reports.map(r => r.clock.detail).filter(Boolean);
+  const requests = dets.reduce((n, x) => n + x.requests, 0), replies = dets.reduce((n, x) => n + x.replies, 0);
+  const medians = dets.map(x => x.rtt_median_ns).filter(v => v != null).sort((a, b) => a - b);
+  const tile = (label, value, sub, cls) =>
+    `<div class="tile"><div class="label">${label}</div><div class="value ${cls || ""}">${value}</div><div class="sub">${sub}</div></div>`;
+  document.getElementById("clock-tiles").innerHTML = [
+    tile("Timestamp error now", k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-",
+      k ? `<span class="${st.cls}">${st.text}</span> (limit &plusmn;${fmtNsMs(limit, 1)})` : "no measurement"),
+    tile(`Within limit, last ${minutes} min`, errors.length ? (100 * within / errors.length).toFixed(1) + "%" : "-",
+      errors.length ? `p95 &plusmn;${fmtNsMs(percentile(errors, 0.95))}, worst &plusmn;${fmtNsMs(errors.at(-1))}` : "no reports"),
+    tile("Clock offset (server &minus; client)", fmtNsMs(d?.clock_offset_ns),
+      d ? (d.corrects_timestamps ? "corrected in the timestamps" : "not corrected (trusts OS clock)") : "older client: not reported"),
+    tile("Drift", d ? d.drift_ppm.toFixed(2) + " ppm" : "-",
+      d ? `${(Math.abs(d.drift_ppm) * 60).toFixed(0)} µs per minute; fit through ${d.fit_points} measurements` : "-"),
+    tile("Round trip", k ? "best " + fmtNsMs(k.rtt_ns) : "-",
+      medians.length ? `median ${fmtNsMs(percentile(medians, 0.5))} over the range` : "-"),
+    tile("Replies", requests ? (100 * replies / requests).toFixed(1) + "%" : "-",
+      requests ? `${replies} of ${requests} measurements answered` : "-"),
+  ].join("");
+  document.getElementById("clock-foot").textContent =
+    `${reports.length} reports from ${fmtTime(data.from)} to ${fmtTime(data.server_time)}. ` +
+    "Timestamp error: what is left after the client's correction, plus half the fastest round trip (a measurement " +
+    "cannot tell how delay splits between directions) and drift within half a chunk.";
+  renderClockChart(data);
+}
+
+function renderClockChart(data) {
+  const el = document.getElementById("clock-chart");
+  if (typeof echarts === "undefined") { el.textContent = "The charting library failed to load."; return; }
+  if (!clockChart) clockChart = echarts.init(el);
+  clockChart.resize();
+  const c = {
+    surface: cssVar("--surface"), ink: cssVar("--ink"), ink2: cssVar("--ink-2"),
+    grid: cssVar("--grid"), axis: cssVar("--axis"), s1: cssVar("--tick"),
+  };
+  const rows = clockRows(data);
+  const ms = ns => (ns == null ? null : ns / 1e6);
+  const val = (r, f) => [r.at / 1e6, r.gap || !r.clock ? null : f(r.clock)];
+  const det = (r, f) => val(r, k => (k.detail ? f(k.detail) : null));
+  const limitMs = clockLimitNs() / 1e6;
+  const from = data.from / 1e6, to = data.server_time / 1e6;
+
+  const H = 118, TITLE = 26, GAP = 56;
+  const tops = [0, 1, 2].map(i => TITLE + i * (H + TITLE + GAP));
+  const titles = ["Timestamp error bound (ms)", "Round trip (ms)", "Clock offset, server − client (ms)"];
+  const axis = i => ({
+    gridIndex: i, type: "time", min: from, max: to,
+    axisLabel: { show: i === 2, color: c.ink2, formatter: "{HH}:{mm}", hideOverlap: true },
+    axisLine: { lineStyle: { color: c.axis } }, axisTick: { show: i === 2, lineStyle: { color: c.axis } },
+    splitLine: { show: true, lineStyle: { color: c.grid } },
+  });
+  const yAxis = (i, extra) => ({
+    gridIndex: i, type: "value", scale: i === 2,
+    axisLabel: { color: c.ink2 }, splitLine: { lineStyle: { color: c.grid } }, ...extra,
+  });
+  const line = (name, i, values, extra) => ({
+    name, type: "line", xAxisIndex: i, yAxisIndex: i, data: values, showSymbol: false, connectNulls: false,
+    lineStyle: { width: 2, color: c.s1 }, itemStyle: { color: c.s1 }, ...extra,
+  });
+
+  const tooltipRow = (label, v) => `<br>${label}: <b>${v}</b>`;
+  clockChart.setOption({
+    animation: false,
+    textStyle: { fontFamily: getComputedStyle(document.body).fontFamily },
+    title: titles.map((text, i) => ({ text, top: tops[i] - TITLE + 2, left: 0, textStyle: { fontSize: 13, fontWeight: 600, color: c.ink } })),
+    legend: { top: tops[1] - TITLE + 2, right: 24, data: [{ name: "median", icon: "roundRect" }, { name: "min–max", icon: "rect" }], textStyle: { color: c.ink2 },
+              itemStyle: { color: c.s1 } },
+    grid: tops.map(top => ({ left: 56, right: 24, top, height: H })),
+    xAxis: [0, 1, 2].map(axis),
+    yAxis: [yAxis(0, { min: 0, max: v => Math.max(v.max * 1.1, limitMs * 1.2) }), yAxis(1, { min: 0 }), yAxis(2)],
+    axisPointer: { link: [{ xAxisIndex: "all" }], lineStyle: { color: c.axis } },
+    tooltip: {
+      trigger: "axis", confine: true, backgroundColor: c.surface, borderColor: c.axis, textStyle: { color: c.ink },
+      formatter: ps => {
+        const r = rows[ps[0]?.dataIndex];
+        if (!r) return "";
+        let html = `<b>${fmtClock(r.at / 1e6, true)}</b>`;
+        if (r.gap) return html + "<br>no heartbeats";
+        const k = r.clock, d = k?.detail;
+        if (!k) return html + "<br>no measurement reported";
+        html += tooltipRow("Timestamp error", "±" + fmtNsMs(r.error_ns));
+        html += tooltipRow("Best RTT (fit)", fmtNsMs(k.rtt_ns));
+        if (d) {
+          html += tooltipRow("RTT min / median / max", `${fmtNsMs(d.rtt_min_ns, 2)} / ${fmtNsMs(d.rtt_median_ns, 2)} / ${fmtNsMs(d.rtt_max_ns, 2)}`);
+          html += tooltipRow("Clock offset", fmtNsMs(d.clock_offset_ns));
+          html += tooltipRow("Drift", d.drift_ppm.toFixed(2) + " ppm");
+          html += tooltipRow("Replies", `${d.replies}/${d.requests}`);
+        }
+        return html;
+      },
+    },
+    series: [
+      line("Timestamp error", 0, rows.map(r => [r.at / 1e6, r.gap ? null : ms(r.error_ns)]), {
+        markLine: {
+          silent: true, symbol: "none", animation: false,
+          lineStyle: { color: c.ink2, type: "dashed", width: 1 },
+          label: { formatter: `limit ${limitMs} ms`, color: c.ink2, position: "insideEndTop" },
+          data: [{ yAxis: limitMs }],
+        },
+      }),
+      // Min-max band: an invisible base at the minimum with the range stacked on it.
+      line("min", 1, rows.map(r => det(r, x => ms(x.rtt_min_ns))), { stack: "rtt", lineStyle: { opacity: 0 }, tooltip: { show: false } }),
+      line("min–max", 1, rows.map(r => det(r, x => (x.rtt_max_ns == null ? null : ms(x.rtt_max_ns - x.rtt_min_ns)))), {
+        stack: "rtt", lineStyle: { opacity: 0 }, areaStyle: { color: c.s1, opacity: 0.15 }, itemStyle: { color: c.s1, opacity: 0.3 },
+      }),
+      line("median", 1, rows.map(r => det(r, x => ms(x.rtt_median_ns)))),
+      line("Clock offset", 2, rows.map(r => det(r, x => ms(x.clock_offset_ns)))),
+    ],
+  }, { replaceMerge: ["series"] });
+}
+
 
 // ---- polling ----
 let refreshing = false;
@@ -1204,6 +1449,7 @@ async function refresh() {
       page === "home" ? refreshTimeline() : null,
       page === "detections" ? refreshDetections() : null,
       page === "logs" ? refreshEvents() : null,
+      page === "clock" ? refreshClock() : null,
     ]);
     document.getElementById("error").textContent = "";
   } catch (e) {

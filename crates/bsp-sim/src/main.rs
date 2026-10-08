@@ -173,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
                     offset_ns: 0,
                     rtt_ns: 200_000,
                     measured_at: now_ns(),
+                    error_ns: Some(100_000),
+                    detail: None,
                 }),
                 uptime_s: 0,
                 chunks_sent: round as u64,

@@ -161,7 +161,7 @@ pub async fn heartbeat_loop(
     loop {
         tick.tick().await;
         let hb = Heartbeat {
-            clock: *clock.lock().unwrap(),
+            clock: clock.status(),
             uptime_s: started.elapsed().as_secs(),
             chunks_sent: stats.chunks_sent.load(Ordering::Relaxed),
             chunks_gated: stats.chunks_gated.load(Ordering::Relaxed),

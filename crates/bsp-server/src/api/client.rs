@@ -1,6 +1,7 @@
 //! Endpoints used by client devices.
 
 use super::{ApiError, ApiResult};
+use crate::clock_history::ClockReport;
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
 use axum::Router;
@@ -82,6 +83,13 @@ async fn heartbeat(
         .db
         .touch_client(id, &addr.to_string(), hb.clock.as_ref(), now)?;
     state.event(Some(id), "heartbeat", serde_json::to_value(&hb)?);
+    state.clock_history.push(
+        id,
+        ClockReport {
+            at: now,
+            clock: hb.clock,
+        },
+    );
 
     let after = state
         .db

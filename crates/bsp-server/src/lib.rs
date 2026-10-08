@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod audio_buffer;
+pub mod clock_history;
 pub mod config;
 pub mod db;
 pub mod pipeline;
@@ -199,6 +200,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
 
     let state: SharedState = Arc::new(AppState {
         audio: audio_buffer::AudioBuffers::new(cfg.audio_retention_s),
+        clock_history: Default::default(),
         udp_port: udp.local_addr()?.port(),
         started_at: now_ns(),
         positioning: Default::default(),

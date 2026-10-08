@@ -42,6 +42,11 @@ struct Args {
     /// How the OS clock is disciplined (reported to the server).
     #[arg(long, default_value = "unknown")]
     clock_source: String,
+    /// Send audio timestamps from the OS clock as they are, instead of
+    /// correcting them by the offset measured against the server. Only for
+    /// clients and server both disciplined by PTP or GPS.
+    #[arg(long)]
+    trust_os_clock: bool,
     /// Upload every chunk, bypassing the noise gate.
     #[arg(long)]
     no_gate: bool,
@@ -153,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
         .to_socket_addrs()?
         .next()
         .context("cannot resolve server host")?;
-    let clock = timesync::SharedClock::default();
+    let clock = Arc::new(timesync::Clock::new(!args.trust_os_clock));
     {
         let clock = clock.clone();
         tokio::spawn(async move {
@@ -165,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(uplink::heartbeat_loop(
         session.clone(),
         Duration::from_secs(reg.heartbeat_interval_s.max(1) as u64),
-        clock,
+        clock.clone(),
         stats.clone(),
     ));
     let queue = Arc::new(UploadQueue::new(50));
@@ -191,6 +196,11 @@ async fn main() -> anyhow::Result<()> {
             },
         };
         for (start, pcm) in chunks {
+            // Corrected before gating, so the reported clock status always
+            // describes the latest chunk.
+            let len_ns =
+                (pcm.len() as i128 * NANOS_PER_SEC as i128 / source.sample_rate as i128) as i64;
+            let start = clock.correct(start, len_ns);
             let g = gate.check(&pcm);
             if !args.no_gate && !g.pass {
                 stats.chunks_gated.fetch_add(1, Ordering::Relaxed);

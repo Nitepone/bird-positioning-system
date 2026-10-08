@@ -85,14 +85,52 @@ pub struct RegisterResponse {
     pub gate: GateConfig,
 }
 
-/// Result of the client's most recent clock measurement against the server.
+/// Result of the client's clock measurement against the server.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ClockStatus {
-    /// Server clock minus client clock (ns).
+    /// Server clock minus the client's audio timestamps (ns): what is left
+    /// after any correction the client applies itself.
     pub offset_ns: i64,
+    /// Lowest round trip behind the estimate (ns).
     pub rtt_ns: i64,
-    /// When this measurement was taken (client clock).
+    /// When the latest measurement was taken (server clock; older clients
+    /// sent their own clock).
     pub measured_at: Timestamp,
+    /// Worst-case error of the client's audio timestamps (ns). Older clients
+    /// leave it out; see [`ClockStatus::error_bound_ns`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<SyncDetail>,
+}
+
+impl ClockStatus {
+    /// Worst-case error of the client's audio timestamps: as reported, else
+    /// the offset plus half the round trip (the measurement cannot tell how
+    /// delay splits between the two directions).
+    pub fn error_bound_ns(&self) -> i64 {
+        self.error_ns
+            .unwrap_or(self.offset_ns.abs() + self.rtt_ns / 2)
+    }
+}
+
+/// How clock measurement went, for monitoring. Counts and round trips cover
+/// the time since the previous heartbeat.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SyncDetail {
+    /// Whether the client corrects its audio timestamps by the measured offset.
+    pub corrects_timestamps: bool,
+    /// Measured server clock minus client clock, now (ns).
+    pub clock_offset_ns: i64,
+    /// Client clock rate relative to the server's, parts per million.
+    pub drift_ppm: f64,
+    /// Measurements the estimate is fitted through.
+    pub fit_points: u32,
+    pub requests: u32,
+    pub replies: u32,
+    pub rtt_min_ns: Option<i64>,
+    pub rtt_median_ns: Option<i64>,
+    pub rtt_max_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

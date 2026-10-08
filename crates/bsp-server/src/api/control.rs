@@ -1,6 +1,7 @@
 //! Configuration and monitoring endpoints used by the web UI.
 
 use super::{ApiError, ApiResult};
+use crate::clock_history::{self, ClockReport};
 use crate::db::{ClientRecord, DetectionFilter, Event, SpeciesSeen};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
 use crate::state::{PositioningRequest, SharedState};
@@ -28,6 +29,7 @@ pub fn router() -> Router<SharedState> {
             "/clients/{id}",
             get(get_client).put(configure_client).delete(delete_client),
         )
+        .route("/clients/{id}/clock", get(client_clock))
         .route("/detections", get(list_detections))
         .route("/timeline", get(timeline))
         .route("/species", get(species_seen))
@@ -46,6 +48,8 @@ struct ClientView {
     record: ClientRecord,
     active: bool,
     synced: bool,
+    /// Worst-case error of the client's audio timestamps (ns).
+    clock_error_ns: Option<i64>,
     positioning_requested: bool,
 }
 
@@ -54,6 +58,7 @@ fn view(state: &SharedState, record: ClientRecord, now: Timestamp) -> ClientView
     ClientView {
         active: state.is_active(&record, now),
         synced: state.is_synced(&record, now),
+        clock_error_ns: record.clock.map(|k| k.error_bound_ns()),
         positioning_requested: req.is_some_and(|r| r.client_id == record.id),
         record,
     }
@@ -143,7 +148,54 @@ async fn delete_client(
         return Err(ApiError::not_found("client"));
     }
     state.event(Some(id), "deleted", json!({}));
+    state.clock_history.forget(id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ClockQuery {
+    minutes: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ClockReportView {
+    #[serde(flatten)]
+    report: ClockReport,
+    /// Worst-case timestamp error, filled in for clients that do not report it.
+    error_ns: Option<i64>,
+}
+
+/// `GET /clients/{id}/clock?minutes=`: the client's clock reports over the
+/// last `minutes` (default 30, at most the retained hour), oldest first.
+async fn client_clock(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+    Query(q): Query<ClockQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let c = state
+        .db
+        .get_client(id)?
+        .ok_or_else(|| ApiError::not_found("client"))?;
+    let now = now_ns();
+    let span_ns =
+        (q.minutes.unwrap_or(30) as i64 * 60 * NANOS_PER_SEC).min(clock_history::RETENTION_NS);
+    let reports: Vec<ClockReportView> = state
+        .clock_history
+        .since(id, now - span_ns)
+        .into_iter()
+        .map(|report| ClockReportView {
+            error_ns: report.clock.map(|k| k.error_bound_ns()),
+            report,
+        })
+        .collect();
+    Ok(Json(json!({
+        "client": view(&state, c, now),
+        "server_time": now,
+        "from": now - span_ns,
+        "max_clock_offset_us": state.cfg.max_clock_offset_us,
+        "heartbeat_interval_s": state.cfg.clients.heartbeat_interval_s,
+        "reports": reports,
+    })))
 }
 
 #[derive(Deserialize)]

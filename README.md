@@ -14,9 +14,9 @@ sudo setcap cap_net_bind_service=+ep target/release/bsp-server   # allow ports 8
 ./target/release/bsp-server -c bsp-server.toml
 ```
 
-Open the web UI at `https://SERVER/` (plain `http://` redirects there). It has three pages:
-**Bird Positioning System** (detections), **Config** (clients and settings) and **Logs** (raw
-events).
+Open the web UI at `https://SERVER/` (plain `http://` redirects there). Its pages are
+**Dashboard** and **Detections** (what was heard), **Config** (clients and settings), **Clocks**
+(each client's clock synchronisation) and **Logs** (raw events).
 
 On first start the server creates a self-signed certificate in `tls/`, so your browser warns
 once; accept it to continue. To use a real certificate, put it at `tls/cert.pem` and its key at
@@ -80,9 +80,9 @@ Browser clients are less precise than `bsp-client` for positioning:
   requests (it band-limits and alters the signal), so use iOS devices for identification only, not
   positioning.
 - Browsers cannot discipline the system clock or send UDP, so the page measures its offset to the
-  server over a WebSocket and corrects its own timestamps. It reports the worst error left in them
-  (including half the round-trip time) as its clock offset. A slow or busy network therefore shows
-  up as **NOT synced**, not as wrong directions.
+  server over a WebSocket and corrects its own timestamps, like `bsp-client` (see
+  [Keep client clocks accurate](#keep-client-clocks-accurate)). A slow or busy network therefore
+  shows up as **NOT synced**, not as wrong directions.
 - Some input latency is invisible to a web page. Chrome reports it and the page compensates. Other
   browsers may leave a constant offset of a few milliseconds per device.
 
@@ -132,22 +132,43 @@ and each of them:
 
 - has a position set,
 - is **active** (sent a heartbeat in the last 15 s), and
-- is **synced** (clock within 2 ms of the server).
+- is **synced** (its audio timestamps are within 2 ms of the server's clock, worst case).
 
 The **Logs** page shows the raw activity log, which is useful when something isn't working.
 
 ### Keep client clocks accurate
 
-Direction finding needs every client's clock to be accurate to well under 1 ms. Run chrony
-(with a good NTP server), PTP or GPS on each client. If the Clients table shows
-**NOT synced**, that client's clock is too far off.
+Direction finding needs every client's audio timestamps on the server's clock, to well under 1 ms
+(sound travels 34 cm per millisecond). Clients measure their clock against the server several
+times a second (`bsp-client` over UDP, the browser client over its WebSocket) and add the measured offset
+to their audio timestamps, so they end up on the server's clock even if their own is off. The
+offset comes from a line fitted through the fastest round trips of the last minute or so, which
+also tracks a clock that runs fast or slow (drift).
+
+With every heartbeat a client reports the **timestamp error**: the worst case left in its
+timestamps. That is how far the estimate has moved since the last chunk was corrected, plus half
+the fastest round trip (a measurement cannot tell how delay splits between the two directions),
+plus drift within half a chunk. A client whose timestamp error is over `max_clock_offset_us`
+(2 ms by default) is **NOT synced** and left out of positioning. On a wired network the error is
+typically well under 0.5 ms; on Wi-Fi it depends on how fast its best round trips are.
+
+Still keep each client's OS clock steady with chrony or similar, so the clock doesn't drift fast
+or jump. Pointing the clients' chrony at the server (run chronyd on the server with an `allow`
+line for your network) works well. If clients and server are all disciplined by PTP or GPS, which
+beats measuring over the network, run `bsp-client --trust-os-clock`: it then sends its OS clock's
+timestamps unchanged and only reports how far off they are.
+
+The **Clocks** page shows every client's timestamp error, clock offset, drift, round trips and
+answered measurements, and for one client at a time, charts of the last 15 minutes to an hour
+(kept in the server's memory, so they start afresh when it restarts). Use it to compare networks
+or placements, or to screenshot a client's sync for a bug report.
 
 ### Troubleshooting
 
 | Symptom | Check |
 |---|---|
 | Client never appears | Client's `-s` URL uses port 2473 (not the web port); TCP 2473 reachable |
-| Client never becomes synced | UDP 2473 reachable; client clock disciplined (`chronyc tracking`) |
+| Client never becomes synced | UDP 2473 reachable; **Clocks** page: low *Replies* means lost packets, a large *Best RTT* a slow or busy network |
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
@@ -254,6 +275,8 @@ so run the server with `kind = "mock"` for this test.
   - `GET /local-species`: species expected at the site
   - `GET /clients`
   - `GET|PUT|DELETE /clients/{id}`
+  - `GET /clients/{id}/clock?minutes=`: the client's clock reports (one per heartbeat) over the
+    last `minutes` (default 30, at most 60)
   - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
     `client`, `from` / `to` (ns), `unexpected`, `located`, `min_confidence`, `before`, `limit`
   - `GET /timeline?from=&to=`: compact detections for the dashboard

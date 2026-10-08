@@ -1,4 +1,5 @@
 use crate::audio_buffer::AudioBuffers;
+use crate::clock_history::ClockHistory;
 use crate::config::ServerConfig;
 use crate::db::{ClientRecord, Db};
 use crate::settings::{LocalSpeciesStatus, Settings};
@@ -21,6 +22,7 @@ pub struct AppState {
     pub settings: tokio::sync::Mutex<Settings>,
     pub local_species: RwLock<LocalSpeciesStatus>,
     pub audio: AudioBuffers,
+    pub clock_history: ClockHistory,
     pub calls_tx: mpsc::UnboundedSender<Vec<Call>>,
     pub positioning: Mutex<Option<PositioningRequest>>,
     pub udp_port: u16,
@@ -51,11 +53,12 @@ impl AppState {
         now - c.last_seen <= self.cfg.active_timeout_s as i64 * NANOS_PER_SEC
     }
 
-    /// Whether the client's clock is trustworthy enough for positioning.
+    /// Whether the client's audio timestamps are trustworthy enough for
+    /// positioning: their worst-case error is within the limit.
     pub fn is_synced(&self, c: &ClientRecord, now: Timestamp) -> bool {
         self.is_active(c, now)
             && c.clock.is_some_and(|k| {
-                k.offset_ns.abs() <= self.cfg.max_clock_offset_us * 1000
+                k.error_bound_ns() <= self.cfg.max_clock_offset_us * 1000
                     && now - k.measured_at <= 60 * NANOS_PER_SEC
             })
     }
