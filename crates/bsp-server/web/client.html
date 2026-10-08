@@ -107,7 +107,7 @@
   #controls button { font-size: 15px; padding: 6px 12px; }
   #controls label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; margin-left: 4px; }
   #start.running { background: var(--playing); }
-  #wave { width: 100%; height: 80px; background: var(--surface); border: 1px solid var(--cell-border); display: block; }
+  #spectrogram { width: 100%; height: 160px; background: var(--surface); border: 1px solid var(--cell-border); display: block; }
   #events { list-style: none; padding: 0; margin: 0; max-height: 18em; overflow-y: auto;
             background: var(--surface); border: 1px solid var(--cell-border); }
   #events li { padding: 2px 6px; border-bottom: 1px solid var(--grid); }
@@ -157,8 +157,8 @@
 </section>
 
 <section>
-  <h2>Waveform <small id="level"></small></h2>
-  <canvas id="wave" width="600" height="80"></canvas>
+  <h2>Spectrogram <small id="level"></small></h2>
+  <canvas id="spectrogram" width="600" height="160"></canvas>
 </section>
 
 <section>
@@ -633,7 +633,7 @@ function onAudio({ frame, pcm }, receivedMs) {
     stats.dropouts++;
     log("capture", `capture timeline jumped ${jump.toFixed(1)} ms (dropout?)`);
   }
-  if (!lowPower) wave.push(pcm);
+  if (!lowPower) spectrogram.push(pcm);
   for (const chunk of c.chunker.push(ts, pcm)) onChunk(c, chunk);
 }
 
@@ -709,29 +709,98 @@ document.addEventListener("visibilitychange", () => {
   else if (capture) log("capture", "page hidden: some browsers pause the microphone in the background");
 });
 
-// ---- waveform (min/max per column over the last few seconds) ----
-const wave = {
-  cols: 300, seconds: 6, min: new Float32Array(300), max: new Float32Array(300), head: 0,
-  curMin: 0, curMax: 0, curN: 0, peak: 0, peakAt: 0,
+// ---- spectrogram (scrolling "waterfall": time right to left, frequency upwards) ----
+
+/// In-place radix-2 FFT of `re`/`im` (length a power of two).
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2;
+        const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr; im[a] += ti;
+        [cr, ci] = [cr * wr - ci * wi, cr * wi + ci * wr];
+      }
+    }
+  }
+}
+
+const spectrogram = {
+  cols: 300, seconds: 6, fftSize: 1024, maxHz: 12000, range: 50,
+  // levels[col][bin]: dB, newest column at `head - 1`.
+  levels: [], head: 0, filled: 0,
+  buf: new Float32Array(1024), bufN: 0, sinceCol: 0, peak: 0, peakAt: 0, top: -30,
+  window: Float32Array.from({ length: 1024 }, (_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / 1023)),
+  bins() { return Math.min(this.fftSize / 2, Math.ceil(this.maxHz * this.fftSize / capture.ctx.sampleRate)); },
   push(pcm) {
-    const per = Math.max(1, Math.round(capture.ctx.sampleRate * this.seconds / this.cols));
-    for (const s of pcm) {
-      if (s < this.curMin) this.curMin = s;
-      if (s > this.curMax) this.curMax = s;
-      if (++this.curN >= per) {
-        this.min[this.head] = this.curMin; this.max[this.head] = this.curMax;
-        this.head = (this.head + 1) % this.cols;
-        const p = Math.max(-this.curMin, this.curMax);
-        if (p >= this.peak || Date.now() - this.peakAt > 500) { this.peak = p; this.peakAt = Date.now(); }
-        this.curMin = this.curMax = 0; this.curN = 0;
+    const hop = Math.max(1, Math.round(capture.ctx.sampleRate * this.seconds / this.cols));
+    for (const x of pcm) {
+      // Keep the latest fftSize samples in a ring buffer.
+      this.buf[this.bufN++ % this.fftSize] = x;
+      const a = Math.abs(x);
+      if (a >= this.peak || Date.now() - this.peakAt > 500) { this.peak = a; this.peakAt = Date.now(); }
+      if (++this.sinceCol >= hop && this.bufN >= this.fftSize) {
+        this.sinceCol = 0;
+        this.column();
       }
     }
   },
+  column() {
+    const n = this.fftSize, re = new Float32Array(n), im = new Float32Array(n);
+    for (let i = 0; i < n; i++) re[i] = this.buf[(this.bufN + i) % n] * this.window[i];
+    fft(re, im);
+    const bins = this.bins(), col = new Float32Array(bins);
+    let colMax = -200;
+    for (let k = 0; k < bins; k++) {
+      // dBFS: a full-scale sine reads about 0 dB after the Hann window's gain of 1/2.
+      const mag = Math.hypot(re[k], im[k]) / (n / 4);
+      col[k] = 20 * Math.log10(mag + 1e-12);
+      if (k > 2 && col[k] > colMax) colMax = col[k];
+    }
+    // Auto-scale: follow the loudest recent level, falling back slowly.
+    this.top = Math.max(colMax, this.top - 0.05, -70);
+    this.levels[this.head] = col;
+    this.head = (this.head + 1) % this.cols;
+    this.filled = Math.min(this.cols, this.filled + 1);
+  },
   clear() {
-    this.min.fill(0); this.max.fill(0);
-    this.curMin = this.curMax = 0; this.curN = 0; this.peak = 0;
+    this.levels = []; this.head = 0; this.filled = 0;
+    this.bufN = 0; this.sinceCol = 0; this.peak = 0; this.top = -30;
   },
 };
+
+/// 256-entry colour lookup: one hue, from the chart surface (quiet) to strong blue (loud).
+/// Steps from the sequential blue ramp; dark mode runs dark to light against its dark surface.
+let spectroLut = null, spectroLutFor = "";
+function spectrogramLut() {
+  const css = getComputedStyle(document.documentElement);
+  const dark = css.colorScheme === "dark";
+  const surface = css.getPropertyValue("--surface").trim() || (dark ? "#1a1a19" : "#fcfcfb");
+  const key = surface + dark;
+  if (key === spectroLutFor) return spectroLut;
+  const ramp = dark
+    ? [surface, "#104281", "#1c5cab", "#3987e5", "#6da7ec", "#b7d3f6", "#ffffff"]
+    : [surface, "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#104281", "#0d366b"];
+  const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const stops = ramp.map(rgb);
+  spectroLut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1), a = Math.floor(t), b = Math.min(a + 1, stops.length - 1), f = t - a;
+    for (let c = 0; c < 3; c++) spectroLut[i * 3 + c] = stops[a][c] + (stops[b][c] - stops[a][c]) * f;
+  }
+  spectroLutFor = key;
+  return spectroLut;
+}
 
 let lastDraw = 0;
 let drawFrame = 0; // pending animation frame; none in low power mode
@@ -739,17 +808,48 @@ function drawLoop(t) {
   drawFrame = requestAnimationFrame(drawLoop);
   if (t - lastDraw < 100) return;
   lastDraw = t;
-  const cv = $("wave"), g = cv.getContext("2d");
-  const w = cv.width, h = cv.height, mid = h / 2, colW = w / wave.cols;
-  g.clearRect(0, 0, w, h);
-  g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--tick").trim() || "#2a78d6";
-  for (let i = 0; i < wave.cols; i++) {
-    const k = (wave.head + i) % wave.cols;
-    const top = mid - wave.max[k] * mid, bottom = mid - wave.min[k] * mid;
-    g.fillRect(i * colW, top, Math.max(1, colW), Math.max(1, bottom - top));
+  const sp = spectrogram, cv = $("spectrogram"), g = cv.getContext("2d");
+  const w = cv.width, h = cv.height;
+  const lut = spectrogramLut();
+  const img = g.createImageData(w, h);
+  const px = img.data;
+  // Background: the quiet end of the colour scale.
+  for (let i = 0; i < w * h; i++) { px[i * 4] = lut[0]; px[i * 4 + 1] = lut[1]; px[i * 4 + 2] = lut[2]; px[i * 4 + 3] = 255; }
+  const sr = capture ? capture.ctx.sampleRate : 48000;
+  const hzPerBin = sr / sp.fftSize, maxHz = Math.min(sp.maxHz, sr / 2);
+  const colW = w / sp.cols;
+  for (let i = 0; i < sp.filled; i++) {
+    // Newest column at the right edge.
+    const col = sp.levels[(sp.head - 1 - i + sp.cols) % sp.cols];
+    const x1 = Math.round(w - i * colW), x0 = Math.max(0, Math.round(w - (i + 1) * colW));
+    for (let y = 0; y < h; y++) {
+      const k = Math.min(col.length - 1, Math.floor((1 - (y + 0.5) / h) * maxHz / hzPerBin));
+      // A gentle curve keeps the noise floor close to the background so calls stand out.
+      const t = Math.max(0, Math.min(1, (col[k] - (sp.top - sp.range)) / sp.range));
+      const v = Math.round(Math.pow(t, 1.6) * 255);
+      for (let x = x0; x < x1; x++) {
+        const o = (y * w + x) * 4;
+        px[o] = lut[v * 3]; px[o + 1] = lut[v * 3 + 1]; px[o + 2] = lut[v * 3 + 2];
+      }
+    }
   }
+  g.putImageData(img, 0, 0);
+
+  // Frequency labels on the left, with a halo so they read over any colour.
+  const css = getComputedStyle(document.documentElement);
+  g.font = "11px system-ui, sans-serif";
+  g.lineWidth = 3;
+  g.strokeStyle = css.getPropertyValue("--surface").trim() || "#fff";
+  g.fillStyle = css.getPropertyValue("--ink-2").trim() || "#555";
+  g.textBaseline = "middle";
+  for (let khz = 2; khz * 1000 < maxHz; khz += 2) {
+    const y = Math.round(h * (1 - khz * 1000 / maxHz));
+    g.strokeText(`${khz} kHz`, 4, y);
+    g.fillText(`${khz} kHz`, 4, y);
+  }
+
   $("level").textContent = capture
-    ? `peak ${wave.peak > 0 ? (20 * Math.log10(wave.peak)).toFixed(0) : "-inf"} dBFS, last ${wave.seconds} s`
+    ? `peak ${sp.peak > 0 ? (20 * Math.log10(sp.peak)).toFixed(0) : "-inf"} dBFS, last ${sp.seconds} s, 0–${maxHz / 1000} kHz`
     : "";
 }
 
@@ -762,7 +862,7 @@ function setLowPower(on) {
     cancelAnimationFrame(drawFrame);
     drawFrame = 0;
   } else {
-    wave.clear(); // samples were not collected meanwhile
+    spectrogram.clear(); // samples were not collected meanwhile
     if (!drawFrame) drawFrame = requestAnimationFrame(drawLoop);
     renderEvents();
     refreshServerEvents();

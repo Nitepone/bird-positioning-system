@@ -62,7 +62,7 @@ so it stays the same across restarts.
 
 **Or use a browser as a client:** open `https://SERVER/client` on the device (phone, laptop) and
 click **Start**. The page shows the microphone in use and whether the browser really turned its
-audio processing off, a live waveform, connection and clock status, and recent events. **Flag for
+audio processing off, a live spectrogram (the last 6 s, 0–12 kHz, so you can see calls arrive), connection and clock status, and recent events. **Flag for
 positioning** does what Enter does on `bsp-client`. **Low power mode** blacks out the screen while
 capture continues. Keep the page open and in front: most browsers pause the microphone in background
 tabs, and iOS pauses it when the screen locks (the page holds a screen wake lock where supported).
