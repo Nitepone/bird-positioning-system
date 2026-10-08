@@ -1,0 +1,30 @@
+[package]
+name = "bsp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bsp server: client ingest, identification, location and control API"
+
+[features]
+default = ["birdnet"]
+birdnet = ["bsp-core/birdnet"]
+
+[dependencies]
+bsp-proto.workspace = true
+bsp-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+axum = "0.8"
+rusqlite = { version = "0.40", features = ["bundled"] }
+toml = "1"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rcgen = "0.14"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

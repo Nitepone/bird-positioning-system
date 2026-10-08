@@ -1,0 +1,459 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>bsp</title>
+<style>
+  body { font-family: sans-serif; font-size: 14px; margin: 0; }
+  #titlebar { background: #246; color: #fff; padding: 6px 1em; }
+  #titlebar a { color: #fff; margin-right: 1.5em; text-decoration: none; }
+  #titlebar a.current { font-weight: bold; text-decoration: underline; }
+  main { margin: 1em; }
+  table { border-collapse: collapse; margin-bottom: 1em; }
+  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; vertical-align: middle; }
+  th { background: #ddd; }
+  tr.inactive { color: #888; }
+  tr.requesting { background: #ffd; }
+  tr.unexpected { background: #fde8d8; }
+  .tag { color: #a40; font-weight: bold; font-size: 12px; }
+  fieldset { margin-bottom: 0.8em; max-width: 50em; }
+  #banner { background: #ffd; border: 2px solid #c90; padding: 6px; margin-bottom: 1em; display: none; }
+  .mono { font-family: monospace; font-size: 12px; }
+  img.wave { display: block; cursor: pointer; }
+  button.play.playing { background: #9c6; }
+</style>
+</head>
+<body>
+<div id="titlebar">
+  <a href="#/" data-page="home">Bird Positioning System</a>
+  <a href="#/config" data-page="config">Config</a>
+  <a href="#/logs" data-page="logs">Logs</a>
+  <span id="status" class="mono"></span>
+</div>
+
+<main>
+<p id="error" style="color: red"></p>
+
+<div id="banner">
+  <b>Positioning request:</b> <span id="banner-text"></span>
+  <button onclick="configureRequested()">Configure</button>
+  <button onclick="clearPositioning()">Dismiss</button>
+</div>
+
+<section id="page-home">
+  <h2>Detections</h2>
+  <p><small>Click a waveform to play the clearest recording, or a client name to hear that client's recording.
+    The highlighted band is the identified call.</small></p>
+  <table id="detections">
+    <thead><tr><th>Time</th><th>Waveform</th><th>Species</th><th>Confidence</th><th>Heard by</th><th>Direction</th><th>Position (E, N) m</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="page-config">
+  <h2>Server settings</h2>
+  <form id="settings" onsubmit="saveSettings(event)">
+    <fieldset>
+      <legend>Site location</legend>
+      Latitude <input id="set-lat" size="12" placeholder="e.g. 42.4534">
+      Longitude <input id="set-lon" size="12" placeholder="e.g. -76.4735">
+      <button type="button" onclick="detectLocation()">Detect location</button>
+      <div id="set-loc-msg"><small></small></div>
+      <p id="set-species"></p>
+      <small>Species unlikely to occur here at any time of year are flagged <span class="tag">unexpected</span>.
+        Leave both fields empty to treat every species as expected.</small>
+    </fieldset>
+    <fieldset>
+      <legend>Minimum confidence: expected species</legend>
+      <div id="set-conf-expected"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Minimum confidence: unexpected species</legend>
+      <div id="set-conf-unexpected"></div>
+    </fieldset>
+    <button type="submit">Save settings</button>
+    <span id="set-msg"></span>
+  </form>
+  <details id="species-list" ontoggle="if (this.open) loadSpeciesList()">
+    <summary>Expected species list</summary>
+    <table><thead><tr><th>Species</th><th>Scientific name</th><th>Year-round likelihood</th></tr></thead><tbody></tbody></table>
+  </details>
+
+  <h2>Clients</h2>
+  <table id="clients">
+    <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Position (E, N, Up) m</th><th>Clock offset / RTT</th><th>Address</th><th>Last seen</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Configure client</h2>
+  <form id="config" onsubmit="saveConfig(event)">
+    <table>
+      <tr><td>Client</td><td><select id="cfg-id" onchange="loadConfig()"></select></td></tr>
+      <tr><td>Name</td><td><input id="cfg-name" size="30"></td></tr>
+      <tr><td>East (x, m)</td><td><input id="cfg-x" size="10"></td></tr>
+      <tr><td>North (y, m)</td><td><input id="cfg-y" size="10"></td></tr>
+      <tr><td>Up (z, m)</td><td><input id="cfg-z" size="10"></td></tr>
+    </table>
+    <button type="submit">Save</button>
+    <span id="cfg-msg"></span>
+    <p><small>Leave all position fields empty to clear the position.</small></p>
+  </form>
+</section>
+
+<section id="page-logs">
+  <h2>Client events</h2>
+  <p>
+    Kind: <input id="ev-kind" size="15" placeholder="any">
+    <label><input type="checkbox" id="ev-hide-hb" checked> hide heartbeats</label>
+  </p>
+  <table id="events">
+    <thead><tr><th>#</th><th>Time</th><th>Client</th><th>Kind</th><th>Detail</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+</main>
+
+<script>
+const API = "/api/v1/control";
+const PAGES = ["home", "config", "logs"];
+let clients = [];
+let positioning = null;
+let configDirty = false;
+let detectionsKey = "";
+
+// ---- helpers ----
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function fmtTime(ns) { return ns ? new Date(ns / 1e6).toLocaleString() : ""; }
+function fmtAgo(ns) {
+  const s = Math.round((Date.now() * 1e6 - ns) / 1e9);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  return fmtTime(ns);
+}
+function fmtPos(p, dims) { return p ? (dims || ["x", "y", "z"]).map(k => p[k].toFixed(1)).join(", ") : "not set"; }
+function clientName(id) {
+  const c = clients.find(c => c.id === id);
+  return c && c.name ? c.name : (id ? id.slice(0, 8) : "server");
+}
+async function api(path, opts) {
+  const r = await fetch(API + path, opts);
+  if (!r.ok) throw new Error(path + ": " + r.status + " " + await r.text());
+  return r.status === 204 ? null : r.json();
+}
+
+// ---- pages ----
+function currentPage() {
+  const p = location.hash.replace(/^#\/?/, "");
+  return PAGES.includes(p) ? p : "home";
+}
+function showPage() {
+  const page = currentPage();
+  for (const p of PAGES) document.getElementById("page-" + p).style.display = p === page ? "" : "none";
+  for (const a of document.querySelectorAll("#titlebar a")) a.classList.toggle("current", a.dataset.page === page);
+  if (page === "config" && !settingsDirty) loadSettings();
+  refresh();
+}
+
+// ---- audio playback (one clip at a time) ----
+const player = new Audio();
+let playingUrl = null;
+function clipUrl(detectionId, clientId) { return `${API}/detections/${detectionId}/audio/${clientId}`; }
+function play(url) {
+  if (playingUrl === url && !player.paused) {
+    player.pause();
+    setPlaying(null);
+    return;
+  }
+  player.src = url;
+  player.play().catch(e => { document.getElementById("error").textContent = "Playback failed: " + e.message; });
+  setPlaying(url);
+}
+function setPlaying(url) {
+  playingUrl = url;
+  for (const b of document.querySelectorAll("button.play")) b.classList.toggle("playing", b.dataset.url === url);
+}
+player.addEventListener("ended", () => setPlaying(null));
+
+// ---- status / banner (all pages) ----
+async function refreshStatus() {
+  const s = await api("/status");
+  document.getElementById("status").textContent =
+    `identifier: ${s.identifier} | clients: ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} known`;
+}
+
+async function refreshClients() {
+  clients = await api("/clients");
+  positioning = await api("/positioning-request");
+
+  const banner = document.getElementById("banner");
+  if (positioning) {
+    const left = Math.max(0, Math.round((positioning.expires_at - Date.now() * 1e6) / 1e9));
+    document.getElementById("banner-text").textContent =
+      `${clientName(positioning.client_id)} (${positioning.client_id}) is asking to have its position set. ` +
+      `Expires in ${Math.floor(left / 60)}m ${left % 60}s.`;
+    banner.style.display = "block";
+  } else {
+    banner.style.display = "none";
+  }
+  if (currentPage() === "config") renderConfigPage();
+}
+
+// ---- home page ----
+async function refreshDetections() {
+  const ds = await api("/detections?limit=100");
+  // Only re-render when something changed, so playback buttons and images stay put.
+  const key = ds.map(d => d.id).join() + "|" + clients.map(c => c.id + c.name).join();
+  if (key === detectionsKey) return;
+  detectionsKey = key;
+  document.querySelector("#detections tbody").innerHTML = ds.map(d => {
+    const loc = d.location;
+    const dir = loc ? `${loc.cardinal} (${loc.bearing_deg.toFixed(0)}&deg;)` : "-";
+    const wave = d.clips.length
+      ? `<img class="wave" width="300" height="60" loading="lazy" alt="waveform"
+           src="${API}/detections/${d.id}/waveform" onclick="play('${clipUrl(d.id, d.clips[0])}')"
+           title="Play ${esc(clientName(d.clips[0]))}">`
+      : "<small>no audio</small>";
+    const heard = d.calls.map(c => {
+      const name = esc(clientName(c.client_id));
+      if (!d.clips.includes(c.client_id)) return name;
+      const url = clipUrl(d.id, c.client_id);
+      return `<button class="play" data-url="${url}" onclick="play('${url}')">&#9654; ${name}</button>`;
+    }).join(" ");
+    const tag = d.unexpected ? ` <span class="tag" title="Not expected at this location">unexpected</span>` : "";
+    return `<tr class="${d.unexpected ? "unexpected" : ""}">
+      <td>${fmtTime(d.time)}</td>
+      <td>${wave}</td>
+      <td>${esc(d.species.common)}${tag}<br><i>${esc(d.species.scientific)}</i></td>
+      <td>${d.confidence.toFixed(2)}</td>
+      <td>${heard}</td>
+      <td>${dir}</td>
+      <td>${loc && loc.position ? fmtPos(loc.position, ["x", "y"]) : "-"}</td>
+    </tr>`;
+  }).join("");
+  setPlaying(player.paused ? null : playingUrl);
+}
+
+// ---- config page: server settings ----
+let settingsDirty = false;
+
+function radios(name, levels, selected) {
+  return levels.map(l => `<label><input type="radio" name="${name}" value="${l.id}"
+      ${l.id === selected ? "checked" : ""}> ${esc(l.label)} (${Math.round(l.value * 100)}%)</label><br>`).join("");
+}
+
+function showSpeciesSummary(ls) {
+  const el = document.getElementById("set-species");
+  el.textContent = {
+    ready: `${ls.count} species are expected at this location.`,
+    no_location: "Location not set: every species is treated as expected.",
+    no_geo_model: "The geo model is not installed (run scripts/fetch-birdnet.sh): every species is treated as expected.",
+    error: "Could not compute expected species: " + (ls.error || "unknown error"),
+  }[ls.status] || "";
+  document.getElementById("species-list").style.display = ls.status === "ready" ? "" : "none";
+}
+
+function renderSettings(v) {
+  const site = v.settings.site;
+  document.getElementById("set-lat").value = site ? site.latitude : "";
+  document.getElementById("set-lon").value = site ? site.longitude : "";
+  document.getElementById("set-conf-expected").innerHTML =
+    radios("conf-expected", v.levels, v.settings.min_confidence_expected);
+  document.getElementById("set-conf-unexpected").innerHTML =
+    radios("conf-unexpected", v.levels, v.settings.min_confidence_unexpected);
+  showSpeciesSummary(v.local_species);
+  settingsDirty = false;
+}
+
+async function loadSettings() {
+  try { renderSettings(await api("/settings")); }
+  catch (e) { document.getElementById("set-msg").textContent = e.message; }
+}
+
+async function saveSettings(ev) {
+  ev.preventDefault();
+  const msg = document.getElementById("set-msg");
+  const lat = document.getElementById("set-lat").value.trim();
+  const lon = document.getElementById("set-lon").value.trim();
+  let site = null;
+  if (lat !== "" || lon !== "") {
+    site = { latitude: Number(lat), longitude: Number(lon) };
+    if (lat === "" || lon === "" || !Number.isFinite(site.latitude) || !Number.isFinite(site.longitude)) {
+      msg.textContent = "Enter both latitude and longitude as numbers, or leave both empty.";
+      return;
+    }
+  }
+  const checked = name => document.querySelector(`input[name="${name}"]:checked`).value;
+  msg.textContent = "Saving...";
+  try {
+    renderSettings(await api("/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        site,
+        min_confidence_expected: checked("conf-expected"),
+        min_confidence_unexpected: checked("conf-unexpected"),
+      }),
+    }));
+    msg.textContent = "Saved.";
+    const list = document.getElementById("species-list");
+    if (list.open) loadSpeciesList();
+  } catch (e) { msg.textContent = e.message; }
+}
+
+function detectLocation() {
+  const msg = document.querySelector("#set-loc-msg small");
+  if (!window.isSecureContext || !navigator.geolocation) {
+    msg.textContent = "Your browser only allows location detection on https:// or http://localhost pages. " +
+      "Open the UI that way, or enter the coordinates manually.";
+    return;
+  }
+  msg.textContent = "Detecting location...";
+  navigator.geolocation.getCurrentPosition(pos => {
+    document.getElementById("set-lat").value = pos.coords.latitude.toFixed(4);
+    document.getElementById("set-lon").value = pos.coords.longitude.toFixed(4);
+    settingsDirty = true;
+    msg.textContent = `Detected (accuracy about ${Math.round(pos.coords.accuracy)} m). Click "Save settings" to apply.`;
+  }, err => {
+    msg.textContent = "Could not detect location: " + err.message;
+  }, { enableHighAccuracy: false, timeout: 15000 });
+}
+
+async function loadSpeciesList() {
+  const ls = await api("/local-species");
+  const rows = ls.status === "ready" ? ls.species : [];
+  document.querySelector("#species-list tbody").innerHTML = rows.map(s => `<tr>
+      <td>${esc(s.species.common)}</td><td><i>${esc(s.species.scientific)}</i></td>
+      <td>${Math.round(s.probability * 100)}%</td></tr>`).join("");
+}
+
+// ---- config page: clients ----
+function renderConfigPage() {
+  document.querySelector("#clients tbody").innerHTML = clients.map(c => {
+    const cls = (c.active ? "" : "inactive") + (c.positioning_requested ? " requesting" : "");
+    const clock = c.clock ? `${(c.clock.offset_ns / 1e6).toFixed(3)} ms / ${(c.clock.rtt_ns / 1e6).toFixed(2)} ms` : "-";
+    const status = (c.active ? "active" : "inactive") + (c.synced ? ", synced" : (c.active ? ", NOT synced" : ""))
+      + (c.positioning_requested ? ", <b>requesting position</b>" : "");
+    return `<tr class="${cls}">
+      <td>${esc(c.name) || "<i>unnamed</i>"}</td>
+      <td class="mono">${esc(c.id)}</td>
+      <td>${status}</td>
+      <td>${fmtPos(c.position)}</td>
+      <td>${clock}</td>
+      <td class="mono">${esc(c.last_addr)}</td>
+      <td>${fmtAgo(c.last_seen)}</td>
+      <td><button onclick="selectClient('${c.id}')">Edit</button></td>
+    </tr>`;
+  }).join("");
+
+  const sel = document.getElementById("cfg-id");
+  const current = sel.value;
+  sel.innerHTML = clients.map(c =>
+    `<option value="${c.id}">${esc(c.name || "unnamed")} - ${c.id.slice(0, 8)}${c.positioning_requested ? " (requesting)" : ""}</option>`
+  ).join("");
+  if (current && clients.some(c => c.id === current)) sel.value = current;
+  if (!configDirty) {
+    if (!current && positioning) sel.value = positioning.client_id;
+    loadConfig();
+  }
+}
+
+function configureRequested() {
+  if (!positioning) return;
+  renderConfigPage(); // make sure the form's client list is populated before selecting
+  selectClient(positioning.client_id);
+  location.hash = "#/config";
+}
+
+function selectClient(id) {
+  document.getElementById("cfg-id").value = id;
+  configDirty = false;
+  loadConfig();
+  document.getElementById("config").scrollIntoView();
+}
+
+function loadConfig() {
+  const c = clients.find(c => c.id === document.getElementById("cfg-id").value);
+  if (!c) return;
+  document.getElementById("cfg-name").value = c.name;
+  for (const k of ["x", "y", "z"]) document.getElementById("cfg-" + k).value = c.position ? c.position[k] : "";
+  configDirty = false;
+}
+
+async function saveConfig(ev) {
+  ev.preventDefault();
+  const id = document.getElementById("cfg-id").value;
+  const vals = ["x", "y", "z"].map(k => document.getElementById("cfg-" + k).value.trim());
+  const msg = document.getElementById("cfg-msg");
+  let position = null;
+  if (vals.some(v => v !== "")) {
+    const nums = vals.map(v => Number(v === "" ? "0" : v));
+    if (nums.some(n => !Number.isFinite(n))) { msg.textContent = "Position must be numbers."; return; }
+    position = { x: nums[0], y: nums[1], z: nums[2] };
+  }
+  try {
+    await api("/clients/" + id, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: document.getElementById("cfg-name").value, position }),
+    });
+    msg.textContent = "Saved.";
+    configDirty = false;
+    await refreshClients();
+  } catch (e) { msg.textContent = e.message; }
+}
+
+async function clearPositioning() {
+  await api("/positioning-request", { method: "DELETE" });
+  refreshClients();
+}
+
+// ---- logs page ----
+async function refreshEvents() {
+  const kind = document.getElementById("ev-kind").value.trim();
+  const hide = document.getElementById("ev-hide-hb").checked && kind !== "heartbeat";
+  const q = new URLSearchParams({ limit: 200 });
+  if (kind) q.set("kind", kind);
+  if (hide) q.set("exclude_kind", "heartbeat");
+  const evs = await api("/events?" + q);
+  document.querySelector("#events tbody").innerHTML = evs.map(e => `<tr>
+      <td>${e.id}</td>
+      <td>${fmtTime(e.ts)}</td>
+      <td>${esc(clientName(e.client_id))}</td>
+      <td>${esc(e.kind)}</td>
+      <td class="mono">${esc(JSON.stringify(e.detail))}</td>
+    </tr>`).join("");
+}
+
+// ---- polling ----
+let refreshing = false;
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await refreshClients();
+    const page = currentPage();
+    await Promise.all([
+      refreshStatus(),
+      page === "home" ? refreshDetections() : null,
+      page === "logs" ? refreshEvents() : null,
+    ]);
+    document.getElementById("error").textContent = "";
+  } catch (e) {
+    document.getElementById("error").textContent = "Error: " + e.message;
+  } finally {
+    refreshing = false;
+  }
+}
+
+document.getElementById("settings").addEventListener("input", () => { settingsDirty = true; });
+for (const k of ["name", "x", "y", "z"]) {
+  document.getElementById("cfg-" + k).addEventListener("input", () => { configDirty = true; });
+}
+window.addEventListener("hashchange", showPage);
+showPage();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

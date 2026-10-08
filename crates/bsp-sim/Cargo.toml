@@ -1,0 +1,15 @@
+[package]
+name = "bsp-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Simulates several bsp clients hearing the same bird, for end-to-end testing"
+
+[dependencies]
+bsp-proto.workspace = true
+bsp-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reqwest.workspace = true

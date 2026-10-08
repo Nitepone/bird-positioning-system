@@ -1,0 +1,20 @@
+[package]
+name = "bsp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bsp domain logic: audio utilities, identification and location"
+
+[features]
+default = ["birdnet"]
+birdnet = ["dep:ort"]
+
+[dependencies]
+bsp-proto.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+uuid.workspace = true
+hound.workspace = true
+rustfft.workspace = true
+tracing.workspace = true
+ort = { version = "=2.0.0-rc.13", optional = true }

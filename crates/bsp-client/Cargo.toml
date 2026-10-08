@@ -1,0 +1,19 @@
+[package]
+name = "bsp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bsp client: captures audio, filters noise, uploads timestamped chunks"
+
+[dependencies]
+bsp-proto.workspace = true
+bsp-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+cpal = "0.18"

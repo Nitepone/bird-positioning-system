@@ -1,0 +1,46 @@
+client_listen = "0.0.0.0:2473"  # client devices (2473 = "BIRD" on a phone keypad)
+udp_listen = "0.0.0.0:2473"
+db_path = "bsp.db"
+active_timeout_s = 15
+max_clock_offset_us = 2000
+max_call_skew_ms = 200
+group_window_s = 15
+audio_retention_s = 120
+event_retention = 10000
+positioning_request_ttl_s = 600
+
+[web]  # web UI and control API; ports below 1024 need privileges (see README)
+https = true
+https_listen = "0.0.0.0:443"
+http_listen = "0.0.0.0:80"
+cert_path = "tls/cert.pem"
+key_path = "tls/key.pem"
+self_signed_names = []  # e.g. ["192.168.1.20", "birds.local"] for a generated certificate
+
+[identifier]
+kind = "birdnet"  # or "mock" (no model; every loud burst is "Unknown bird")
+mock_threshold_db = 12.0
+
+[identifier.geo]  # flags species not expected at the site (location set in the web UI)
+model_path = "models/birdnet-geo/model.onnx"
+labels_path = "models/birdnet-geo/labels.txt"
+threshold = 0.03
+
+[identifier.birdnet]
+version = "v3.0"  # or "v2.4"; must match model_path
+model_path = "models/birdnet-v3.0/model.onnx"
+labels_path = "models/birdnet-v3.0/labels.txt"
+min_confidence = 0.5  # discard floor; reporting thresholds are set in the web UI
+sensitivity = 1.0
+hop_secs = 1.5
+threads = 4
+
+[clients]
+heartbeat_interval_s = 5
+chunk_secs = 9.0
+
+[clients.gate]
+band_low_hz = 1000.0
+band_high_hz = 10000.0
+threshold_db = 10.0
+frame_ms = 100
