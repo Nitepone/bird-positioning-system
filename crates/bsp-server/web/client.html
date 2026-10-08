@@ -3,29 +3,114 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bsp client</title>
+<title>Bird Positioning System Client</title>
 <style>
-  body { font-family: sans-serif; font-size: 14px; margin: 0; background: #fff; }
-  #titlebar { background: #246; color: #fff; padding: 6px 1em; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.5em; }
+  /* Colour tokens: copied from index.html so both pages share one theme. */
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --hairline: rgba(11, 11, 11, 0.10);
+    --cell-border: #999;
+    --th: #e6e5e0;
+    --titlebar: #224466;
+    --link: #1c5cab;
+    --tag: #a34000;
+    --row-unexpected: #fde8d8;
+    --row-requesting: #ffffd6;
+    --row-inactive: #898781;
+    --playing: #b5dc8f;
+    /* Timeline ticks; validated as a pair for colour-vision deficiency and contrast. */
+    --tick: #2a78d6;
+    --tick-unexpected: #eb6834;
+    /* Status text (client page); >= 5:1 contrast on --page in both themes. */
+    --ok: #1e7b34;
+    --warn: #a34000;
+    --bad: #c62828;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --hairline: rgba(255, 255, 255, 0.10);
+      --cell-border: #4a4a47;
+      --th: #2c2c2a;
+      --titlebar: #16263a;
+      --link: #86b6ef;
+      --tag: #f2a57a;
+      --row-unexpected: #3a2418;
+      --row-requesting: #3a3510;
+      --playing: #3d5a22;
+      --tick: #3987e5;
+      --tick-unexpected: #d95926;
+      --ok: #6cc785;
+      --warn: #f2a57a;
+      --bad: #f28b82;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --hairline: rgba(255, 255, 255, 0.10);
+    --cell-border: #4a4a47;
+    --th: #2c2c2a;
+    --titlebar: #16263a;
+    --link: #86b6ef;
+    --tag: #f2a57a;
+    --row-unexpected: #3a2418;
+    --row-requesting: #3a3510;
+    --playing: #3d5a22;
+    --tick: #3987e5;
+    --tick-unexpected: #d95926;
+    --ok: #6cc785;
+    --warn: #f2a57a;
+    --bad: #f28b82;
+  }
+
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; margin: 0;
+         background: var(--page); color: var(--ink); }
+  a { color: var(--link); }
+  #titlebar { background: var(--titlebar); color: #fff; padding: 6px 1em; display: flex; flex-wrap: wrap;
+              align-items: baseline; gap: 0 1em; }
+  #titlebar .brand { font-weight: bold; }
+  #titlebar #title-id { opacity: 0.85; }
   #titlebar a { color: #fff; text-decoration: none; }
-  #titlebar a.right { margin-left: auto; padding-left: 1em; }
+  #titlebar a.right { margin-left: auto; }
   main { margin: 1em; max-width: 50em; }
   section { margin-bottom: 1.2em; }
   h2 { font-size: 16px; margin: 0 0 0.4em; }
+  h2 small { color: var(--ink-2); font-weight: normal; }
   table { border-collapse: collapse; }
-  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; vertical-align: top; }
-  th { background: #ddd; font-weight: normal; white-space: nowrap; }
+  th, td { border: 1px solid var(--cell-border); padding: 2px 6px; text-align: left; vertical-align: top; }
+  th { background: var(--th); font-weight: normal; white-space: nowrap; }
   .mono { font-family: monospace; font-size: 12px; }
-  .ok { color: #070; }
-  .warn { color: #a40; }
-  .bad { color: #c00; font-weight: bold; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); font-weight: bold; }
   #controls button { font-size: 15px; padding: 6px 12px; margin: 0 6px 6px 0; }
-  #start.running { background: #9c6; }
-  #wave { width: 100%; height: 80px; background: #f4f4f4; border: 1px solid #999; display: block; }
-  #events { list-style: none; padding: 0; margin: 0; max-height: 18em; overflow-y: auto; border: 1px solid #999; }
-  #events li { padding: 2px 6px; border-bottom: 1px solid #eee; }
-  #events .src { color: #888; display: inline-block; width: 4em; }
+  #start.running { background: var(--playing); }
+  #wave { width: 100%; height: 80px; background: var(--surface); border: 1px solid var(--cell-border); display: block; }
+  #events { list-style: none; padding: 0; margin: 0; max-height: 18em; overflow-y: auto;
+            background: var(--surface); border: 1px solid var(--cell-border); }
+  #events li { padding: 2px 6px; border-bottom: 1px solid var(--grid); }
+  #events .src { color: var(--ink-2); display: inline-block; width: 4em; }
   #message { min-height: 1.2em; }
+  /* The low power overlay is pure black in both themes. */
   #lowpower { display: none; position: fixed; inset: 0; background: #000; color: #555; z-index: 10;
               flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 0.6em; }
   /* Low power: only the overlay stays in the layout. */
@@ -37,7 +122,7 @@
 </head>
 <body>
 <div id="titlebar">
-  <b>Bird Positioning System Client</b> <span class="mono" id="title-id"></span>
+  <span class="brand">Bird Positioning System Client</span> <span class="mono" id="title-id"></span>
   <a href="/" class="right">[Server UI]</a>
 </div>
 
@@ -632,7 +717,7 @@ function drawLoop(t) {
   const cv = $("wave"), g = cv.getContext("2d");
   const w = cv.width, h = cv.height, mid = h / 2, colW = w / wave.cols;
   g.clearRect(0, 0, w, h);
-  g.fillStyle = "#246";
+  g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--tick").trim() || "#2a78d6";
   for (let i = 0; i < wave.cols; i++) {
     const k = (wave.head + i) % wave.cols;
     const top = mid - wave.max[k] * mid, bottom = mid - wave.min[k] * mid;
