@@ -102,14 +102,17 @@
   .ok { color: var(--ok); }
   .warn { color: var(--warn); }
   .bad { color: var(--bad); font-weight: bold; }
-  #controls button { font-size: 15px; padding: 6px 12px; margin: 0 6px 6px 0; }
+  /* Buttons and the checkbox wrap as whole items, never mid-label. */
+  #controls .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  #controls button { font-size: 15px; padding: 6px 12px; }
+  #controls label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; margin-left: 4px; }
   #start.running { background: var(--playing); }
   #wave { width: 100%; height: 80px; background: var(--surface); border: 1px solid var(--cell-border); display: block; }
   #events { list-style: none; padding: 0; margin: 0; max-height: 18em; overflow-y: auto;
             background: var(--surface); border: 1px solid var(--cell-border); }
   #events li { padding: 2px 6px; border-bottom: 1px solid var(--grid); }
   #events .src { color: var(--ink-2); display: inline-block; width: 4em; }
-  #message { min-height: 1.2em; }
+  #message { min-height: 1.2em; margin: 0.6em 0 0; }
   /* The low power overlay is pure black in both themes. */
   #lowpower { display: none; position: fixed; inset: 0; background: #000; color: #555; z-index: 10;
               flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 0.6em; }
@@ -128,10 +131,12 @@
 
 <main>
 <section id="controls">
-  <button id="start" onclick="toggleRunning()">Start</button>
-  <button id="flag" onclick="flagPositioning()">Flag for positioning</button>
-  <button onclick="setLowPower(true)">Low power mode</button>
-  <label><input type="checkbox" id="no-gate"> Upload every chunk (bypass noise gate)</label>
+  <div class="actions">
+    <button id="start" onclick="toggleRunning()">Start</button>
+    <button id="flag" onclick="flagPositioning()">Flag for positioning</button>
+    <button onclick="setLowPower(true)">Low power mode</button>
+    <label><input type="checkbox" id="no-gate"> Upload every chunk (bypass noise gate)</label>
+  </div>
   <p id="message"></p>
 </section>
 
