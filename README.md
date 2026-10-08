@@ -98,6 +98,10 @@ Browser clients are less precise than `bsp-client` for positioning:
 
 You can also click **Edit** on any row in the Clients table.
 
+The **Microphone positions** map beside the form shows every positioned microphone as an "×"
+around the site origin, with distance rings. The client being edited is highlighted, and a
+position you type appears as "unsaved" before you save it, which makes typos easy to spot.
+
 ### 5. Watch the birds
 
 The **Dashboard** shows one day at a time (today by default; use the arrows or date picker):

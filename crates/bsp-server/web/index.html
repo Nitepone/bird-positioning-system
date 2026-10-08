@@ -119,6 +119,25 @@
   .tables > div { flex: 1 1 26em; }
   .tables table { width: 100%; }
   .tables h3 { font-size: 15px; margin: 0.5em 0; }
+  .side-by-side { display: flex; flex-wrap: wrap; gap: 0 3em; align-items: flex-start; }
+  .side-by-side > .map-column { flex: 0 1 440px; min-width: 260px; }
+
+  /* Microphone map (Config page) */
+  #mic-map { width: 100%; max-width: 440px; border: 1px solid var(--cell-border); display: block; }
+  #mic-map .ring { fill: none; stroke: var(--grid); }
+  #mic-map .axis { stroke: var(--axis); }
+  #mic-map .scale, #mic-map .compass { fill: var(--ink-2); font-size: 11px; }
+  /* A halo in the background colour keeps text readable where it crosses rings or marks. */
+  #mic-map text { paint-order: stroke; stroke: var(--page); stroke-width: 3px; stroke-linejoin: round; }
+  #mic-map .compass { font-weight: bold; }
+  #mic-map .mic { stroke: var(--ink); stroke-width: 2; stroke-linecap: round; }
+  #mic-map .mic-label { fill: var(--ink); font-size: 12px; }
+  #mic-map .inactive .mic { stroke: var(--muted); }
+  #mic-map .inactive .mic-label { fill: var(--ink-2); }
+  #mic-map .selected .mic { stroke: var(--tick); stroke-width: 3; }
+  #mic-map .selected .mic-label { font-weight: bold; }
+  #mic-map .draft .mic { stroke: var(--tick); stroke-dasharray: 2 2; }
+  #mic-map .draft .mic-label { fill: var(--tick); }
   .legend { color: var(--ink-2); font-size: 12px; display: flex; gap: 1.5em; margin-bottom: 4px; }
   .legend .key { display: inline-block; width: 4px; height: 12px; border-radius: 1px; vertical-align: -1px; margin-right: 6px; }
   #timeline { width: 100%; }
@@ -279,6 +298,8 @@
     <tbody></tbody>
   </table>
 
+  <div class="side-by-side">
+  <div>
   <h2>Configure client</h2>
   <form id="config" onsubmit="saveConfig(event)">
     <table>
@@ -293,6 +314,15 @@
     <p><small>Leave the name empty to use the name the client suggests, if any.
       Leave all position fields empty to clear the position.</small></p>
   </form>
+  </div>
+  <div class="map-column">
+    <h2>Microphone positions</h2>
+    <svg id="mic-map" viewBox="0 0 400 400" role="img" aria-label="Map of microphone positions"></svg>
+    <p class="hint" id="mic-map-missing"></p>
+    <p class="hint">Seen from above, centred on the site origin; height is not shown. The client selected in the
+      form is highlighted, and a position being typed shows as "unsaved" until it is saved.</p>
+  </div>
+  </div>
 </section>
 
 <section id="page-logs">
@@ -1019,6 +1049,7 @@ function renderConfigPage() {
     if (!current && positioning) sel.value = positioning.client_id;
     loadConfig();
   }
+  renderMicMap();
 }
 
 function configureRequested() {
@@ -1035,6 +1066,75 @@ function selectClient(id) {
   document.getElementById("config").scrollIntoView();
 }
 
+/// Draws the positioned microphones around the site origin, with distance rings.
+const MAP_SIZE = 400, MAP_CENTER = 200, MAP_RADIUS = 164;
+let micMapKey = "";
+function renderMicMap() {
+  const svg = document.getElementById("mic-map");
+  const selected = document.getElementById("cfg-id").value;
+  const mics = clients.filter(c => c.position).map(c => ({
+    id: c.id, label: displayName(c) || c.id.slice(0, 8), x: c.position.x, y: c.position.y, z: c.position.z,
+    cls: (c.active ? "" : "inactive") + (c.id === selected ? " selected" : ""),
+  }));
+  // The position being typed for the selected client, if it differs from the saved one.
+  const num = k => { const v = document.getElementById("cfg-" + k).value.trim(); return v === "" ? NaN : Number(v); };
+  const [dx, dy, dz] = [num("x"), num("y"), num("z")];
+  const saved = mics.find(m => m.id === selected);
+  if (selected && Number.isFinite(dx) && Number.isFinite(dy) && !(saved && saved.x === dx && saved.y === dy)) {
+    const c = clients.find(c => c.id === selected);
+    mics.push({ id: selected, label: `${(c && displayName(c)) || selected.slice(0, 8)} (unsaved)`,
+                x: dx, y: dy, z: Number.isFinite(dz) ? dz : 0, cls: "draft" });
+  }
+
+  const missing = clients.filter(c => !c.position && !(c.id === selected && mics.some(m => m.cls === "draft")))
+    .map(c => displayName(c) || c.id.slice(0, 8));
+  document.getElementById("mic-map-missing").textContent = missing.length ? "No position yet: " + missing.join(", ") : "";
+
+  const key = JSON.stringify(mics);
+  if (key === micMapKey) return;
+  micMapKey = key;
+
+  // Ring spacing: a round step (1, 2 or 5 x 10^n m) giving a few rings out to the farthest mic.
+  const extent = Math.max(1, ...mics.map(m => Math.hypot(m.x, m.y)));
+  let step = 1;
+  for (const s of [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
+    step = s;
+    if (extent / s <= 4) break;
+  }
+  const rings = Math.max(1, Math.ceil(extent * 1.05 / step));
+  const scale = MAP_RADIUS / (rings * step);
+  const px = x => MAP_CENTER + x * scale, py = y => MAP_CENTER - y * scale;
+
+  const parts = [];
+  for (let i = 1; i <= rings; i++) {
+    const r = i * step * scale;
+    parts.push(`<circle class="ring" cx="${MAP_CENTER}" cy="${MAP_CENTER}" r="${r.toFixed(1)}"/>`);
+    parts.push(`<text class="scale" x="${MAP_CENTER + 4}" y="${(MAP_CENTER - r - 3).toFixed(1)}">${i * step} m</text>`);
+  }
+  const R = rings * step * scale;
+  parts.push(`<line class="axis" x1="${MAP_CENTER - R}" y1="${MAP_CENTER}" x2="${MAP_CENTER + R}" y2="${MAP_CENTER}"/>`);
+  parts.push(`<line class="axis" x1="${MAP_CENTER}" y1="${MAP_CENTER - R}" x2="${MAP_CENTER}" y2="${MAP_CENTER + R}"/>`);
+  parts.push(`<text class="compass" x="${MAP_CENTER}" y="16" text-anchor="middle">N</text>`);
+  parts.push(`<text class="compass" x="${MAP_CENTER}" y="${MAP_SIZE - 6}" text-anchor="middle">S</text>`);
+  parts.push(`<text class="compass" x="${MAP_SIZE - 8}" y="${MAP_CENTER + 4}" text-anchor="middle">E</text>`);
+  parts.push(`<text class="compass" x="8" y="${MAP_CENTER + 4}" text-anchor="middle">W</text>`);
+
+  // Draw the selected and draft marks last, so they sit on top.
+  const order = m => (m.cls.includes("draft") ? 2 : m.cls.includes("selected") ? 1 : 0);
+  for (const m of [...mics].sort((a, b) => order(a) - order(b))) {
+    const x = px(m.x), y = py(m.y), k = 5;
+    // Keep labels inside the map: flip to the left of the mark near the right edge.
+    const right = x < MAP_SIZE - 110;
+    parts.push(`<g class="${m.cls}"><title>${esc(m.label)}: ${m.x} m E, ${m.y} m N, ${m.z} m up</title>` +
+      `<path class="mic" d="M${x - k} ${y - k}L${x + k} ${y + k}M${x - k} ${y + k}L${x + k} ${y - k}"/>` +
+      `<text class="mic-label" x="${right ? x + 8 : x - 8}" y="${y - 7}" text-anchor="${right ? "start" : "end"}">${esc(m.label)}</text></g>`);
+  }
+  if (!mics.length) {
+    parts.push(`<text class="scale" x="${MAP_CENTER}" y="${MAP_CENTER - 12}" text-anchor="middle">No microphone has a position yet.</text>`);
+  }
+  svg.innerHTML = parts.join("");
+}
+
 function loadConfig() {
   const c = clients.find(c => c.id === document.getElementById("cfg-id").value);
   if (!c) return;
@@ -1042,6 +1142,7 @@ function loadConfig() {
   document.getElementById("cfg-name").placeholder = c.suggested_name ? `suggested: ${c.suggested_name}` : "";
   for (const k of ["x", "y", "z"]) document.getElementById("cfg-" + k).value = c.position ? c.position[k] : "";
   configDirty = false;
+  renderMicMap();
 }
 
 async function saveConfig(ev) {
@@ -1114,7 +1215,7 @@ async function refresh() {
 
 document.getElementById("settings").addEventListener("input", () => { settingsDirty = true; });
 for (const k of ["name", "x", "y", "z"]) {
-  document.getElementById("cfg-" + k).addEventListener("input", () => { configDirty = true; });
+  document.getElementById("cfg-" + k).addEventListener("input", () => { configDirty = true; renderMicMap(); });
 }
 window.addEventListener("hashchange", showPage);
 loadDashPrefs();
