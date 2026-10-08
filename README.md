@@ -59,6 +59,31 @@ Click **Save settings**. Settings are stored in the server's database.
 The client shows up in the **Clients** table on the **Config** page. Its ID is stored in `./state/client_id`,
 so it stays the same across restarts.
 
+**Or use a browser as a client:** open `https://SERVER/client` on the device (phone, laptop) and
+click **Start**. The page shows the microphone in use and whether the browser really turned its
+audio processing off, a live waveform, connection and clock status, and recent events. **Flag for
+positioning** does what Enter does on `bsp-client`. **Low power mode** blacks out the screen while
+capture continues. Keep the page open and in front: most browsers pause the microphone in background
+tabs, and iOS pauses it when the screen locks (the page holds a screen wake lock where supported).
+Its ID is kept in the browser's local storage, so each browser profile is one client.
+
+Browser clients are less precise than `bsp-client` for positioning:
+
+- Browsers apply echo cancellation, noise suppression and automatic gain by default. The page asks
+  for all of them off (`echoCancellation`, `noiseSuppression`, `autoGainControl` and `voiceIsolation`
+  set to `false`). It then shows what the browser actually applied. Chrome, Edge and Firefox honour
+  this. Safari on macOS turns its voice processing off with `echoCancellation: false`. On macOS, also
+  set the menu-bar **Mic Mode** to *Standard*, because the system's *Voice Isolation* mode is outside
+  the page's control. **Safari on iOS/iPadOS keeps its voice processing on** whatever the page
+  requests (it band-limits and alters the signal), so use iOS devices for identification only, not
+  positioning.
+- Browsers cannot discipline the system clock or send UDP, so the page measures its offset to the
+  server over a WebSocket and corrects its own timestamps. It reports the worst error left in them
+  (including half the round-trip time) as its clock offset. A slow or busy network therefore shows
+  up as **NOT synced**, not as wrong directions.
+- Some input latency is invisible to a web page. Chrome reports it and the page compensates. Other
+  browsers may leave a constant offset of a few milliseconds per device.
+
 ### 4. Set each client's name and position
 
 1. Press **Enter** in the client's terminal. A banner appears on every page; click
@@ -210,9 +235,10 @@ so run the server with `kind = "mock"` for this test.
   - `POST /{id}/heartbeat`
   - `POST /{id}/audio`: WAV body plus an `x-bsp-start-ns` header
   - `POST /{id}/position-request`
+  - `GET /timesync`: WebSocket carrying the UDP clock-measurement packets (for browser clients)
 - Clock measurement: UDP on port 2473.
-- The client endpoints are served only on port 2473 (plain HTTP), and the control endpoints only
-  on the web ports (HTTPS).
+- The client endpoints are served on port 2473 (plain HTTP) and also on the web ports (HTTPS), where
+  the browser client at `/client` uses them. The control endpoints are served only on the web ports.
 - Control endpoints, under `/api/v1/control`:
   - `GET /status`
   - `GET|PUT /settings`: site location and confidence levels

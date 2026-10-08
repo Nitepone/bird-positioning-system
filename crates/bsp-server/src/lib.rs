@@ -15,7 +15,8 @@ pub mod web;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::response::Html;
+use axum::http::{HeaderName, header};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use bsp_core::identifier::{Identifier, LocalSpeciesFilter, MockIdentifier, RangeModel};
 use bsp_core::locator::TdoaLocator;
@@ -33,6 +34,22 @@ use tokio::sync::mpsc;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 /// Charting library for the web UI, embedded so the UI works offline.
 const ECHARTS_JS: &str = include_str!("../web/vendor/echarts-6.1.0/echarts.min.js");
+const CLIENT_HTML: &str = include_str!("../web/client.html");
+const CLIENT_WORKLET_JS: &str = include_str!("../web/client-worklet.js");
+
+/// Cross-origin isolation for the browser client: it raises the resolution of
+/// `performance.now()` (otherwise coarsened to 0.1-1 ms), which the client's
+/// timestamps and clock measurement rely on.
+const ISOLATION_HEADERS: [(HeaderName, &str); 2] = [
+    (
+        HeaderName::from_static("cross-origin-opener-policy"),
+        "same-origin",
+    ),
+    (
+        HeaderName::from_static("cross-origin-embedder-policy"),
+        "require-corp",
+    ),
+];
 
 pub fn build_identifier(cfg: &ServerConfig) -> anyhow::Result<Arc<dyn Identifier>> {
     Ok(match cfg.identifier.kind {
@@ -83,15 +100,20 @@ pub fn build_geo(cfg: &ServerConfig) -> Option<Arc<dyn RangeModel>> {
     None
 }
 
-/// API for client devices (served on `client_listen`).
-pub fn client_router(state: SharedState) -> Router {
+fn client_api() -> Router<SharedState> {
     Router::new()
         .nest(CLIENT_API_PREFIX, api::client::router())
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .with_state(state)
 }
 
-/// Web UI and control API (served on the `[web]` listeners).
+/// API for client devices (served on `client_listen`).
+pub fn client_router(state: SharedState) -> Router {
+    client_api().with_state(state)
+}
+
+/// Web UI, browser client and control API (served on the `[web]` listeners).
+/// The client API is served here too: browsers only allow microphone access
+/// on HTTPS pages, and those pages cannot call the plain-HTTP client port.
 pub fn web_router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
@@ -114,7 +136,23 @@ pub fn web_router(state: SharedState) -> Router {
                 )
             }),
         )
+        .route(
+            "/client",
+            get(|| async { (ISOLATION_HEADERS, Html(CLIENT_HTML)) }),
+        )
+        .route(
+            "/client-worklet.js",
+            get(|| async {
+                (
+                    ISOLATION_HEADERS,
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    CLIENT_WORKLET_JS,
+                )
+                    .into_response()
+            }),
+        )
         .nest("/api/v1/control", api::control::router())
+        .merge(client_api())
         .with_state(state)
 }
 

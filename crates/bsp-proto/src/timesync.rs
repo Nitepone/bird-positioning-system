@@ -1,7 +1,7 @@
 //! NTP-style UDP clock measurement.
 //!
-//! Request (client -> server, 32 bytes): magic, version, kind=1, seq, client id, t1.
-//! Response (server -> client, 40 bytes): magic, version, kind=2, seq, t1 (echoed), t2, t3.
+//! Request (client -> server, 36 bytes): magic, version, kind=1, seq, client id, t1.
+//! Response (server -> client, 36 bytes): magic, version, kind=2, seq, t1 (echoed), t2, t3.
 //! t1 = client send, t2 = server receive, t3 = server send, t4 = client receive.
 
 use crate::{ClientId, Timestamp};

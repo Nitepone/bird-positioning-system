@@ -142,7 +142,7 @@ pub async fn serve(cfg: WebConfig, app: Router, handle: Handle<SocketAddr>) -> a
         let https_port = listener.local_addr()?.port();
         tracing::info!(addr = %listener.local_addr()?, "web UI (HTTPS)");
         let server = axum_server::from_tcp_rustls(listener, tls)?.handle(handle.clone());
-        tasks.spawn(server.serve(app.into_make_service()));
+        tasks.spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
         if !cfg.http_listen.is_empty() {
             let listener = bind(&cfg.http_listen, "HTTP redirect")?;
             tracing::info!(addr = %listener.local_addr()?, "redirecting HTTP to HTTPS");
@@ -153,7 +153,7 @@ pub async fn serve(cfg: WebConfig, app: Router, handle: Handle<SocketAddr>) -> a
         let listener = bind(&cfg.http_listen, "HTTP")?;
         tracing::warn!(addr = %listener.local_addr()?, "web UI over plain HTTP ([web] https = false)");
         let server = axum_server::from_tcp(listener)?.handle(handle.clone());
-        tasks.spawn(server.serve(app.into_make_service()));
+        tasks.spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
     }
     while let Some(result) = tasks.join_next().await {
         result?.context("web server")?;

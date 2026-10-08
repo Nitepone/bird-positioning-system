@@ -1,0 +1,765 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bsp client</title>
+<style>
+  body { font-family: sans-serif; font-size: 14px; margin: 0; background: #fff; }
+  #titlebar { background: #246; color: #fff; padding: 6px 1em; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.5em; }
+  #titlebar a { color: #fff; text-decoration: none; }
+  #titlebar a.right { margin-left: auto; padding-left: 1em; }
+  main { margin: 1em; max-width: 50em; }
+  section { margin-bottom: 1.2em; }
+  h2 { font-size: 16px; margin: 0 0 0.4em; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; vertical-align: top; }
+  th { background: #ddd; font-weight: normal; white-space: nowrap; }
+  .mono { font-family: monospace; font-size: 12px; }
+  .ok { color: #070; }
+  .warn { color: #a40; }
+  .bad { color: #c00; font-weight: bold; }
+  #controls button { font-size: 15px; padding: 6px 12px; margin: 0 6px 6px 0; }
+  #start.running { background: #9c6; }
+  #wave { width: 100%; height: 80px; background: #f4f4f4; border: 1px solid #999; display: block; }
+  #events { list-style: none; padding: 0; margin: 0; max-height: 18em; overflow-y: auto; border: 1px solid #999; }
+  #events li { padding: 2px 6px; border-bottom: 1px solid #eee; }
+  #events .src { color: #888; display: inline-block; width: 4em; }
+  #message { min-height: 1.2em; }
+  #lowpower { display: none; position: fixed; inset: 0; background: #000; color: #555; z-index: 10;
+              flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 0.6em; }
+  /* Low power: only the overlay stays in the layout. */
+  body.lowpower #lowpower { display: flex; }
+  body.lowpower #titlebar, body.lowpower main { display: none; }
+  #lowpower .big { font-size: 18px; }
+  #lowpower button { background: #000; color: #555; border: 1px solid #333; font-size: 15px; padding: 8px 16px; margin-top: 1.5em; }
+</style>
+</head>
+<body>
+<div id="titlebar">
+  <b>Bird Positioning System Client</b> <span class="mono" id="title-id"></span>
+  <a href="/" class="right">[Server UI]</a>
+</div>
+
+<main>
+<section id="controls">
+  <button id="start" onclick="toggleRunning()">Start</button>
+  <button id="flag" onclick="flagPositioning()">Flag for positioning</button>
+  <button onclick="setLowPower(true)">Low power mode</button>
+  <label><input type="checkbox" id="no-gate"> Upload every chunk (bypass noise gate)</label>
+  <p id="message"></p>
+</section>
+
+<section>
+  <h2>Audio device</h2>
+  <p>
+    <select id="device" onchange="deviceChanged()"><option value="">Default microphone</option></select>
+  </p>
+  <table id="device-info"><tbody></tbody></table>
+</section>
+
+<section>
+  <h2>Waveform <small id="level"></small></h2>
+  <canvas id="wave" width="600" height="80"></canvas>
+</section>
+
+<section>
+  <h2>Status</h2>
+  <table id="status"><tbody></tbody></table>
+</section>
+
+<section>
+  <h2>Recent events</h2>
+  <ul id="events"></ul>
+</section>
+</main>
+
+<div id="lowpower">
+  <div class="big">Bird Positioning System Client (<span class="lp-id"></span>)</div>
+  <div class="big" id="lp-state"></div>
+  <div id="lp-detail"></div>
+  <button onclick="setLowPower(false)">Show full UI</button>
+</div>
+
+<script>
+"use strict";
+// Browser client: does what bsp-client does, from a web page.
+//
+// Timing is what matters for positioning, so every chunk's start time is
+// derived without trusting the wall clock or the main thread's timers:
+//
+//  1. Samples: the AudioWorklet tags each batch with its AudioContext frame
+//     number, so time *within* the stream is exact (sample count / rate).
+//  2. Audio clock -> local clock: each batch's arrival time on the main thread
+//     is a late-only estimate of when it was captured; the Timestamper keeps a
+//     smooth sample timeline and only moves it by the smallest error seen per
+//     window (same method as bsp-client's capture.rs), which tracks ADC drift
+//     and dropouts while ignoring scheduling jitter.
+//  3. Local clock -> server clock: the local clock is performance.timeOrigin +
+//     performance.now() (monotonic and high resolution; Date.now() is neither).
+//     Browsers cannot discipline the OS clock, so the client measures its
+//     offset to the server over a WebSocket (NTP-style, lowest-RTT sample
+//     wins) and adds it to every chunk's start time itself.
+
+const CLIENT_API = "/api/v1/client";
+const CONTROL_API = "/api/v1/control";
+const VERSION = "web-0.1.0";
+const RAW_AUDIO = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+  // Newer Media Capture Extensions constraint; ignored where unsupported.
+  voiceIsolation: false,
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: 48000 }, // BirdNET's native rate
+};
+const PROCESSING_KEYS = ["echoCancellation", "noiseSuppression", "autoGainControl", "voiceIsolation"];
+const SYNC_INTERVAL_MS = 250;
+const SYNC_HISTORY = 20;
+const SYNC_STALE_MS = 10000;
+const UPLOAD_QUEUE_MAX = 50;
+
+// ---- helpers ----
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/** The local clock, in ms since the Unix epoch. */
+const localMs = () => performance.timeOrigin + performance.now();
+const msToNs = ms => BigInt(Math.round(ms * 1e6));
+const fmtMs = ns => (Number(ns) / 1e6).toFixed(3) + " ms";
+
+function stored(key, make) {
+  try {
+    let v = localStorage.getItem(key);
+    if (!v) { v = make(); localStorage.setItem(key, v); }
+    return v;
+  } catch { return make(); }
+}
+function store(key, value) { try { localStorage.setItem(key, value); } catch {} }
+function newUuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+const clientId = stored("bsp-client-id", newUuid);
+const startedAt = Date.now();
+
+// ---- event log ----
+const localEvents = [];
+let serverEvents = [];
+function log(kind, text) {
+  localEvents.unshift({ ts: Date.now(), src: "client", kind, text });
+  localEvents.length = Math.min(localEvents.length, 50);
+  renderEvents();
+}
+function message(text, cls) {
+  $("message").className = cls || "";
+  $("message").textContent = text;
+}
+
+// ---- server connection ----
+let registered = false;
+let registerInfo = null;
+let lastServerError = "";
+let maxClockOffsetNs = 2000000n;
+
+function capabilities() {
+  const s = capture?.settings || {};
+  return {
+    sample_rate: capture ? capture.ctx.sampleRate : 0,
+    channels: s.channelCount || 1,
+    sample_format: "f32",
+    clock_source: "browser (WebSocket timesync)",
+    device_name: capture ? capture.track.label || "microphone" : "not started",
+  };
+}
+
+async function clientApi(path, opts) {
+  const r = await fetch(CLIENT_API + path, opts);
+  if (r.status === 404 && path !== "/register") {
+    registered = false;
+    throw new Error("server does not know this client");
+  }
+  if (!r.ok) throw new Error(`${path}: ${r.status} ${await r.text()}`);
+  return r.status === 204 ? null : r.json().catch(() => null);
+}
+
+async function register() {
+  const ua = navigator.userAgentData?.platform || navigator.platform || "browser";
+  registerInfo = await clientApi("/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: clientId, hostname: "web: " + ua, version: VERSION, capabilities: capabilities() }),
+  });
+  if (!registered) log("register", "registered with the server");
+  registered = true;
+  lastServerError = "";
+}
+
+async function registerUntilOk() {
+  let delay = 1000;
+  for (;;) {
+    try { await register(); return; } catch (e) {
+      lastServerError = e.message;
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30000);
+    }
+  }
+}
+
+/** Runs `fn`, re-registering if the server has forgotten this client. */
+async function withServer(fn) {
+  try { return await fn(); } catch (e) {
+    lastServerError = e.message;
+    if (!registered) await registerUntilOk();
+    throw e;
+  }
+}
+
+async function loadServerLimits() {
+  try {
+    const s = await (await fetch(CONTROL_API + "/status")).json();
+    maxClockOffsetNs = BigInt(s.max_clock_offset_us) * 1000n;
+  } catch {}
+}
+
+// ---- clock measurement (bsp_proto::timesync packets over a WebSocket) ----
+const sync = { ws: null, connected: false, seq: 0, history: [], best: null, lastReply: 0, appliedNs: 0n };
+const idBytes = Uint8Array.from(clientId.replace(/-/g, "").match(/../g), h => parseInt(h, 16));
+
+function syncConnect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${CLIENT_API}/timesync`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { sync.connected = true; log("timesync", "clock measurement connected"); };
+  ws.onmessage = ev => onSyncReply(ev.data, localMs());
+  ws.onclose = () => {
+    if (sync.connected) log("timesync", "clock measurement disconnected");
+    sync.connected = false;
+    setTimeout(syncConnect, 2000);
+  };
+  sync.ws = ws;
+}
+
+function sendSyncRequest() {
+  if (!sync.connected) return;
+  const b = new DataView(new ArrayBuffer(36)); // bsp_proto::timesync::REQUEST_LEN
+  [0x42, 0x53, 0x50, 1, 1].forEach((x, i) => b.setUint8(i, x)); // "BSP", version 1, request
+  b.setUint32(8, ++sync.seq >>> 0);
+  idBytes.forEach((x, i) => b.setUint8(12 + i, x));
+  b.setBigInt64(28, msToNs(localMs()));
+  sync.ws.send(b.buffer);
+}
+
+function onSyncReply(buf, receivedMs) {
+  if (buf.byteLength !== 36) return; // RESPONSE_LEN
+  const b = new DataView(buf);
+  if (b.getUint8(0) !== 0x42 || b.getUint8(1) !== 0x53 || b.getUint8(2) !== 0x50 || b.getUint8(4) !== 2) return;
+  const [t1, t2, t3, t4] = [b.getBigInt64(12), b.getBigInt64(20), b.getBigInt64(28), msToNs(receivedMs)];
+  const offsetNs = ((t2 - t1) + (t3 - t4)) / 2n; // server minus local
+  const rttNs = (t4 - t1) - (t3 - t2);
+  sync.history.push({ offsetNs, rttNs });
+  if (sync.history.length > SYNC_HISTORY) sync.history.shift();
+  sync.best = sync.history.reduce((a, s) => s.rttNs < a.rttNs ? s : a);
+  sync.lastReply = receivedMs;
+}
+
+/** Correction to add to local timestamps to get server time, if known. */
+function clockCorrectionNs() {
+  return sync.best && localMs() - sync.lastReply < SYNC_STALE_MS ? sync.best.offsetNs : null;
+}
+
+/**
+ * What the heartbeat reports. This client corrects its own timestamps, so the
+ * "offset" is the worst-case error left in them: the change in the measured
+ * offset since the last chunk boundary, plus half the round trip (the
+ * measurement cannot tell how the delay splits between the two directions).
+ * The server's usual |offset| limit then means what it says.
+ */
+function clockStatus() {
+  const corr = clockCorrectionNs();
+  if (corr === null) return null;
+  const residual = corr - sync.appliedNs;
+  const bound = (residual < 0n ? -residual : residual) + sync.best.rttNs / 2n;
+  return {
+    offset_ns: Number(residual < 0n ? -bound : bound),
+    rtt_ns: Number(sync.best.rttNs),
+    measured_at: Number(msToNs(sync.lastReply) + corr),
+  };
+}
+
+// ---- capture timeline (port of bsp-client's Timestamper / Chunker) ----
+class Timestamper {
+  constructor(sampleRate) {
+    this.sr = sampleRate;
+    this.anchor = null; // local ms of frame `frame0`
+    this.frame0 = 0;
+    this.windowMin = Infinity;
+    this.windowFrames = 0;
+  }
+  /** Timestamp (local ms) of `frame`, given a late-only estimate of it; plus any timeline jump. */
+  push(frame, n, estimate) {
+    if (this.anchor === null) { this.anchor = estimate; this.frame0 = frame; }
+    const ts = this.anchor + (frame - this.frame0) * 1000 / this.sr;
+    this.windowMin = Math.min(this.windowMin, estimate - ts);
+    this.windowFrames += n;
+    let jump = 0;
+    if (this.windowFrames >= 2 * this.sr) {
+      if (Math.abs(this.windowMin) > 0.5) { this.anchor += this.windowMin; jump = this.windowMin; }
+      this.windowMin = Infinity;
+      this.windowFrames = 0;
+    }
+    return { ts, jump };
+  }
+}
+
+/** Gap-free fixed-length chunks; a timeline discontinuity ends a chunk early. */
+class Chunker {
+  constructor(sampleRate, len) { this.sr = sampleRate; this.len = len; this.start = 0; this.parts = []; this.n = 0; }
+  take(count) {
+    const out = new Float32Array(count);
+    let at = 0;
+    while (at < count) {
+      const p = this.parts[0], k = Math.min(p.length, count - at);
+      out.set(p.subarray(0, k), at);
+      at += k;
+      if (k === p.length) this.parts.shift(); else this.parts[0] = p.subarray(k);
+    }
+    this.n -= count;
+    return out;
+  }
+  flush() {
+    if (this.n < this.sr) { this.parts = []; this.n = 0; return null; }
+    return { start: this.start, pcm: this.take(this.n) };
+  }
+  push(ts, pcm) {
+    const out = [];
+    const expected = this.start + this.n * 1000 / this.sr;
+    if (this.n > 0 && Math.abs(ts - expected) > 0.5) {
+      const c = this.flush();
+      if (c) out.push(c);
+    }
+    if (this.n === 0) this.start = ts;
+    this.parts.push(pcm);
+    this.n += pcm.length;
+    while (this.n >= this.len) {
+      out.push({ start: this.start, pcm: this.take(this.len) });
+      this.start += this.len * 1000 / this.sr;
+    }
+    return out;
+  }
+}
+
+// ---- noise gate (port of bsp-client's gate.rs) ----
+class Biquad {
+  constructor(b, a) { [this.b0, this.b1, this.b2] = b.map(x => x / a[0]); [this.a1, this.a2] = [a[1] / a[0], a[2] / a[0]]; this.z1 = this.z2 = 0; }
+  static params(sr, f) { const w0 = 2 * Math.PI * Math.min(f, sr * 0.45) / sr; return [Math.cos(w0), Math.sin(w0) / (2 * Math.SQRT1_2)]; }
+  static highpass(sr, f) { const [c, a] = Biquad.params(sr, f); return new Biquad([(1 + c) / 2, -(1 + c), (1 + c) / 2], [1 + a, -2 * c, 1 - a]); }
+  static lowpass(sr, f) { const [c, a] = Biquad.params(sr, f); return new Biquad([(1 - c) / 2, 1 - c, (1 - c) / 2], [1 + a, -2 * c, 1 - a]); }
+  process(x) { const y = this.b0 * x + this.z1; this.z1 = this.b1 * x - this.a1 * y + this.z2; this.z2 = this.b2 * x - this.a2 * y; return y; }
+}
+
+class NoiseGate {
+  constructor(cfg, sr) { this.cfg = cfg; this.sr = sr; this.hp = Biquad.highpass(sr, cfg.band_low_hz); this.lp = Biquad.lowpass(sr, cfg.band_high_hz); this.floor = null; }
+  check(pcm) {
+    const frame = Math.max(1, Math.floor(this.sr * this.cfg.frame_ms / 1000));
+    const frames = [];
+    for (let i = 0; i < pcm.length; i += frame) {
+      let sum = 0;
+      const end = Math.min(pcm.length, i + frame);
+      for (let j = i; j < end; j++) { const y = this.lp.process(this.hp.process(pcm[j])); sum += y * y; }
+      frames.push(20 * Math.log10(Math.max(Math.sqrt(sum / (end - i)), 1e-9)));
+    }
+    if (this.floor === null) {
+      const sorted = [...frames].sort((a, b) => a - b);
+      this.floor = sorted.length ? sorted[Math.round((sorted.length - 1) * 0.2)] : 0;
+    }
+    let floor = this.floor, peak = -Infinity;
+    for (const db of frames) {
+      const snr = db - floor;
+      peak = Math.max(peak, snr);
+      const rate = db < floor ? 0.3 : snr < this.cfg.threshold_db ? 0.05 : 0.002;
+      floor += (db - floor) * rate;
+    }
+    this.floor = floor;
+    return { pass: peak >= this.cfg.threshold_db, snr: peak, floor };
+  }
+}
+
+function encodeWav(sr, pcm) {
+  const v = new DataView(new ArrayBuffer(44 + pcm.length * 2));
+  const str = (at, s) => [...s].forEach((c, i) => v.setUint8(at + i, c.charCodeAt(0)));
+  str(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); str(8, "WAVE");
+  str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) v.setInt16(44 + 2 * i, Math.max(-1, Math.min(1, pcm[i])) * 32767, true);
+  return new Blob([v.buffer], { type: "audio/wav" });
+}
+
+// ---- uploads ----
+const stats = { chunksSent: 0, chunksGated: 0, dropouts: 0, lastChunk: null };
+const queue = [];
+let queueWake = null;
+
+function enqueue(startNs, wav) {
+  if (queue.length >= UPLOAD_QUEUE_MAX) { queue.shift(); log("upload", "upload queue full; dropped oldest chunk"); }
+  queue.push({ startNs, wav });
+  queueWake?.();
+}
+
+async function uploadLoop() {
+  for (;;) {
+    if (!queue.length) { await new Promise(r => { queueWake = r; }); queueWake = null; continue; }
+    const item = queue[0];
+    try {
+      await withServer(() => clientApi(`/${clientId}/audio`, {
+        method: "POST",
+        headers: { "x-bsp-start-ns": item.startNs.toString(), "content-type": "audio/wav" },
+        body: item.wav,
+      }));
+      if (queue[0] === item) queue.shift();
+      stats.chunksSent++;
+    } catch { await sleep(2000); }
+  }
+}
+
+// ---- capture ----
+let capture = null; // { stream, track, settings, ctx, node, stamper, chunker, gate, inputLatencyMs }
+let heartbeatTimer = null;
+let wakeLock = null;
+let starting = false;
+
+async function start() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    message("This browser only allows microphone access on https:// pages (or http://localhost).", "bad");
+    return;
+  }
+  starting = true;
+  render();
+  let stream, ctx;
+  try {
+    const deviceId = $("device").value;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { ...RAW_AUDIO, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) },
+    });
+    const track = stream.getAudioTracks()[0];
+    const settings = track.getSettings();
+    // Run the context at the microphone's rate so nothing is resampled
+    // (Firefox refuses to connect a microphone at a different rate).
+    try { ctx = new AudioContext(settings.sampleRate ? { sampleRate: settings.sampleRate } : {}); }
+    catch { ctx = new AudioContext(); }
+    await ctx.audioWorklet.addModule("/client-worklet.js");
+    const source = ctx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(ctx, "bsp-capture");
+    source.connect(node);
+    // The node outputs silence; connecting it makes every engine process it.
+    node.connect(ctx.destination);
+    await ctx.resume();
+
+    if (!registerInfo) await registerUntilOk();
+    const sr = ctx.sampleRate;
+    capture = {
+      stream, track, settings, ctx, node, source,
+      stamper: new Timestamper(sr),
+      chunker: new Chunker(sr, Math.round(registerInfo.chunk_secs * sr)),
+      gate: new NoiseGate(registerInfo.gate, sr),
+      // Capture-to-callback delay, when the browser reports it (seconds).
+      inputLatencyMs: typeof settings.latency === "number" ? settings.latency * 1000 : 0,
+    };
+    sync.appliedNs = clockCorrectionNs() ?? 0n;
+    node.port.onmessage = ev => onAudio(ev.data, localMs());
+    track.onended = () => { log("capture", "microphone disconnected"); stop(); };
+    ctx.onstatechange = () => {
+      if (!capture || capture.ctx !== ctx) return;
+      log("capture", "audio context " + ctx.state);
+      if (ctx.state !== "running") { stats.dropouts++; ctx.resume().catch(() => {}); }
+    };
+    await listDevices();
+    register().catch(() => {}); // report the real device and sample rate
+    heartbeatTimer = setInterval(sendHeartbeat, Math.max(1, registerInfo.heartbeat_interval_s) * 1000);
+    sendHeartbeat();
+    acquireWakeLock();
+    log("capture", `started: ${track.label || "microphone"} at ${sr} Hz`);
+    message("");
+  } catch (e) {
+    message("Could not start: " + e.message, "bad");
+    log("capture", "start failed: " + e.message);
+    if (capture) stop();
+    else { stream?.getTracks().forEach(t => t.stop()); ctx?.close().catch(() => {}); }
+  } finally {
+    starting = false;
+    render();
+  }
+}
+
+function stop() {
+  const c = capture;
+  capture = null;
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+  if (!c) { render(); return; }
+  const last = c.chunker.flush();
+  if (last) onChunk(c, last);
+  c.node.port.onmessage = null;
+  c.source.disconnect();
+  c.stream.getTracks().forEach(t => t.stop());
+  c.ctx.close().catch(() => {});
+  log("capture", "stopped");
+  render();
+}
+
+function toggleRunning() { if (capture) stop(); else if (!starting) start(); }
+
+async function deviceChanged() {
+  store("bsp-device", $("device").value);
+  if (capture) { stop(); await start(); }
+}
+
+function onAudio({ frame, pcm }, receivedMs) {
+  const c = capture;
+  if (!c) return;
+  const sr = c.ctx.sampleRate;
+  const estimate = receivedMs - pcm.length * 1000 / sr - c.inputLatencyMs;
+  const { ts, jump } = c.stamper.push(frame, pcm.length, estimate);
+  if (Math.abs(jump) > 20) {
+    stats.dropouts++;
+    log("capture", `capture timeline jumped ${jump.toFixed(1)} ms (dropout?)`);
+  }
+  if (!lowPower) wave.push(pcm);
+  for (const chunk of c.chunker.push(ts, pcm)) onChunk(c, chunk);
+}
+
+function onChunk(c, { start, pcm }) {
+  const corr = clockCorrectionNs() ?? 0n;
+  sync.appliedNs = corr;
+  const g = c.gate.check(pcm);
+  stats.lastChunk = { at: Date.now(), ...g };
+  if (!$("no-gate").checked && !g.pass) { stats.chunksGated++; return; }
+  enqueue(msToNs(start) + corr, encodeWav(c.ctx.sampleRate, pcm));
+}
+
+async function sendHeartbeat() {
+  const hb = {
+    clock: clockStatus(),
+    uptime_s: Math.floor((Date.now() - startedAt) / 1000),
+    chunks_sent: stats.chunksSent,
+    chunks_gated: stats.chunksGated,
+    queue_len: queue.length,
+    capture_dropouts: stats.dropouts,
+  };
+  try {
+    await withServer(() => clientApi(`/${clientId}/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(hb),
+    }));
+    stats.dropouts -= hb.capture_dropouts;
+    lastServerError = "";
+  } catch {}
+}
+
+async function flagPositioning() {
+  try {
+    await withServer(() => clientApi(`/${clientId}/position-request`, { method: "POST" }));
+    message("Positioning requested: set this client's position on the server's Config page.", "ok");
+    log("position_request", "positioning requested");
+  } catch (e) {
+    message("Positioning request failed: " + e.message, "bad");
+  }
+}
+
+async function listDevices() {
+  const sel = $("device");
+  const wanted = capture?.settings.deviceId ?? stored("bsp-device", () => "");
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput" && d.deviceId);
+    sel.innerHTML = `<option value="">Default microphone</option>` + devs.map(d =>
+      `<option value="${esc(d.deviceId)}">${esc(d.label || "Microphone " + d.deviceId.slice(0, 6))}</option>`).join("");
+  } catch {}
+  sel.value = [...sel.options].some(o => o.value === wanted) ? wanted : "";
+}
+
+// ---- screen wake lock (the page must stay visible to keep capturing) ----
+async function acquireWakeLock() {
+  if (!capture || wakeLock || !navigator.wakeLock || document.visibilityState !== "visible") return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") acquireWakeLock();
+  else if (capture) log("capture", "page hidden: some browsers pause the microphone in the background");
+});
+
+// ---- waveform (min/max per column over the last few seconds) ----
+const wave = {
+  cols: 300, seconds: 6, min: new Float32Array(300), max: new Float32Array(300), head: 0,
+  curMin: 0, curMax: 0, curN: 0, peak: 0, peakAt: 0,
+  push(pcm) {
+    const per = Math.max(1, Math.round(capture.ctx.sampleRate * this.seconds / this.cols));
+    for (const s of pcm) {
+      if (s < this.curMin) this.curMin = s;
+      if (s > this.curMax) this.curMax = s;
+      if (++this.curN >= per) {
+        this.min[this.head] = this.curMin; this.max[this.head] = this.curMax;
+        this.head = (this.head + 1) % this.cols;
+        const p = Math.max(-this.curMin, this.curMax);
+        if (p >= this.peak || Date.now() - this.peakAt > 500) { this.peak = p; this.peakAt = Date.now(); }
+        this.curMin = this.curMax = 0; this.curN = 0;
+      }
+    }
+  },
+  clear() {
+    this.min.fill(0); this.max.fill(0);
+    this.curMin = this.curMax = 0; this.curN = 0; this.peak = 0;
+  },
+};
+
+let lastDraw = 0;
+let drawFrame = 0; // pending animation frame; none in low power mode
+function drawLoop(t) {
+  drawFrame = requestAnimationFrame(drawLoop);
+  if (t - lastDraw < 100) return;
+  lastDraw = t;
+  const cv = $("wave"), g = cv.getContext("2d");
+  const w = cv.width, h = cv.height, mid = h / 2, colW = w / wave.cols;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#246";
+  for (let i = 0; i < wave.cols; i++) {
+    const k = (wave.head + i) % wave.cols;
+    const top = mid - wave.max[k] * mid, bottom = mid - wave.min[k] * mid;
+    g.fillRect(i * colW, top, Math.max(1, colW), Math.max(1, bottom - top));
+  }
+  $("level").textContent = capture
+    ? `peak ${wave.peak > 0 ? (20 * Math.log10(wave.peak)).toFixed(0) : "-inf"} dBFS, last ${wave.seconds} s`
+    : "";
+}
+
+// ---- rendering ----
+let lowPower = false;
+function setLowPower(on) {
+  lowPower = on;
+  document.body.classList.toggle("lowpower", on);
+  if (on) {
+    cancelAnimationFrame(drawFrame);
+    drawFrame = 0;
+  } else {
+    wave.clear(); // samples were not collected meanwhile
+    if (!drawFrame) drawFrame = requestAnimationFrame(drawLoop);
+    renderEvents();
+    refreshServerEvents();
+  }
+  render();
+}
+
+function syncSummary() {
+  const st = clockStatus();
+  if (!sync.connected) return { cls: "bad", text: "clock measurement not connected" };
+  if (!st) return { cls: "warn", text: "measuring..." };
+  const ok = BigInt(Math.abs(st.offset_ns)) <= maxClockOffsetNs;
+  return {
+    cls: ok ? "ok" : "bad",
+    text: `${ok ? "synced" : "NOT synced"}: error up to ${fmtMs(Math.abs(st.offset_ns))} (RTT ${fmtMs(st.rtt_ns)}, limit ${fmtMs(maxClockOffsetNs)})`,
+  };
+}
+
+function render() {
+  $("start").textContent = starting ? "Starting..." : capture ? "Stop" : "Start";
+  $("start").classList.toggle("running", !!capture);
+  const sync_ = syncSummary();
+  const server = registered && !lastServerError
+    ? { cls: "ok", text: "connected" }
+    : { cls: "bad", text: lastServerError || "connecting..." };
+
+  $("lp-state").textContent = capture ? "Running" : "Stopped";
+  $("lp-detail").textContent = `server ${server.text}; ${sync_.text.split(":")[0]}`;
+  if (lowPower) return;
+
+  const c = capture;
+  const s = c?.settings || {};
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() || {};
+  const proc = PROCESSING_KEYS.map(k => {
+    if (!c) return [k, supported[k] ? "supported" : "not supported by this browser"];
+    if (!(k in s)) return [k, `<span class="warn">not reported${supported[k] ? "" : " (unsupported)"}</span>`];
+    return [k, s[k] ? `<span class="bad">ON</span>` : `<span class="ok">off</span>`];
+  });
+  const raw = !c ? "-"
+    : PROCESSING_KEYS.some(k => s[k] === true) ? `<span class="bad">no: the browser is processing the audio</span>`
+    : "echoCancellation" in s ? `<span class="ok">yes (as reported by the browser)</span>`
+    : `<span class="warn">unverified: the browser does not report its processing</span>`;
+  const rows = [
+    ["Device", c ? esc(c.track.label || "microphone") : "not started"],
+    ["Raw input", raw],
+    ["Sample rate", c ? `${c.ctx.sampleRate} Hz` + (s.sampleRate && s.sampleRate !== c.ctx.sampleRate ? ` (mic ${s.sampleRate} Hz)` : "") : "-"],
+    ["Channels", c ? `${s.channelCount ?? "?"} (mixed to mono)` : "-"],
+    ["Input latency", c ? (typeof s.latency === "number" ? `${(s.latency * 1000).toFixed(1)} ms (compensated)` : `<span class="warn">not reported</span>`) : "-"],
+    ...proc,
+  ];
+  $("device-info").tBodies[0].innerHTML = rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("");
+
+  const lc = stats.lastChunk;
+  const statusRows = [
+    ["Client ID", `<span class="mono">${esc(clientId)}</span>`],
+    ["Server", `<span class="${server.cls}">${esc(server.text)}</span>`],
+    ["Clock", `<span class="${sync_.cls}">${esc(sync_.text)}</span>`],
+    ["Capture", c ? `<span class="ok">running</span> (audio context ${c.ctx.state}), ${stats.dropouts} dropouts pending report` : "stopped"],
+    ["Uploads", `${stats.chunksSent} sent, ${stats.chunksGated} gated, ${queue.length} queued`],
+    ["Last chunk", lc ? `${new Date(lc.at).toLocaleTimeString()}: ${lc.pass ? "passed" : "gated"} (peak SNR ${lc.snr.toFixed(1)} dB)` : "-"],
+    ["Screen wake lock", !navigator.wakeLock ? `<span class="warn">not supported: keep the screen on manually</span>` : wakeLock ? "held" : "not held"],
+    ["Timer resolution", self.crossOriginIsolated ? `<span class="ok">high (cross-origin isolated)</span>` : `<span class="warn">coarse (page not cross-origin isolated)</span>`],
+  ];
+  $("status").tBodies[0].innerHTML = statusRows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("");
+}
+
+function summarize(e) {
+  const d = e.detail || {};
+  switch (e.kind) {
+    case "audio": return `server received ${Number(d.duration_s).toFixed(1)} s chunk (latency ${d.latency_ms} ms)`;
+    case "identified": return "identified: " + (d.species || []).map(([n, c]) => `${n} (${Math.round(c * 100)}%)`).join(", ");
+    case "clock_synced": return "server considers this client synced";
+    case "clock_unsynced": return "server considers this client NOT synced";
+    default: return JSON.stringify(d).slice(0, 120);
+  }
+}
+
+function renderEvents() {
+  if (lowPower) return;
+  const all = [...localEvents, ...serverEvents].sort((a, b) => b.ts - a.ts).slice(0, 40);
+  $("events").innerHTML = all.map(e => `<li><span class="src">${e.src}</span>
+    ${new Date(e.ts).toLocaleTimeString()} <b>${esc(e.kind)}</b> ${esc(e.text)}</li>`).join("");
+}
+
+async function refreshServerEvents() {
+  if (lowPower || document.hidden || !registered) return;
+  try {
+    const q = new URLSearchParams({ client_id: clientId, exclude_kind: "heartbeat", limit: 20 });
+    const evs = await (await fetch(`${CONTROL_API}/events?${q}`)).json();
+    serverEvents = evs.map(e => ({ ts: e.ts / 1e6, src: "server", kind: e.kind, text: summarize(e) }));
+    renderEvents();
+  } catch {}
+}
+
+// ---- startup ----
+for (const el of document.querySelectorAll(".lp-id, #title-id")) el.textContent = clientId;
+syncConnect();
+setInterval(sendSyncRequest, SYNC_INTERVAL_MS);
+setInterval(render, 1000);
+setInterval(refreshServerEvents, 5000);
+drawFrame = requestAnimationFrame(drawLoop);
+loadServerLimits();
+registerUntilOk().then(refreshServerEvents);
+uploadLoop();
+listDevices();
+render();
+if (!self.crossOriginIsolated) log("clock", "page is not cross-origin isolated: timer resolution is reduced");
+</script>
+</body>
+</html>

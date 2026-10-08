@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use bsp_core::audio::{self, AudioSample};
 use bsp_proto::{
     AudioAccepted, ClientId, HEADER_START_NS, Heartbeat, NANOS_PER_SEC, RegisterRequest,
@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/register", post(register))
+        .route("/timesync", get(crate::timesync::websocket))
         .route("/{id}/heartbeat", post(heartbeat))
         .route("/{id}/audio", post(upload_audio))
         .route("/{id}/position-request", post(position_request))
