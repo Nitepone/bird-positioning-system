@@ -48,6 +48,10 @@ pub struct RegisterRequest {
     pub hostname: String,
     pub version: String,
     pub capabilities: Capabilities,
+    /// Name the client suggests for itself. A name set by the operator takes
+    /// precedence; the suggestion is shown while there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

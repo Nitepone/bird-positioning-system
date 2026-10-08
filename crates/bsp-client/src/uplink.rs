@@ -27,6 +27,7 @@ pub struct Session {
     pub base: String,
     pub id: ClientId,
     pub hostname: String,
+    pub name: Option<String>,
     pub caps: Capabilities,
 }
 
@@ -71,6 +72,7 @@ impl Session {
             hostname: self.hostname.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
             capabilities: self.caps.clone(),
+            name: self.name.clone(),
         };
         let resp = self
             .http

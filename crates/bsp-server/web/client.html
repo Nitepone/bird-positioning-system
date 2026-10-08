@@ -113,6 +113,9 @@
   #events li { padding: 2px 6px; border-bottom: 1px solid var(--grid); }
   #events .src { color: var(--ink-2); display: inline-block; width: 4em; }
   #message { min-height: 1.2em; margin: 0.6em 0 0; }
+  #name-row { margin: 0.6em 0 0; }
+  #name-row input { width: 16em; max-width: 60vw; }
+  .muted { color: var(--ink-2); }
   /* The low power overlay is pure black in both themes. */
   #lowpower { display: none; position: fixed; inset: 0; background: #000; color: #555; z-index: 10;
               flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 0.6em; }
@@ -137,6 +140,11 @@
     <button onclick="setLowPower(true)">Low power mode</button>
     <label><input type="checkbox" id="no-gate"> Upload every chunk (bypass noise gate)</label>
   </div>
+  <p id="name-row">
+    <label for="name">Suggested name</label>
+    <input id="name" maxlength="64" placeholder="e.g. North fence" onchange="nameChanged()">
+    <span id="name-note" class="muted"></span>
+  </p>
   <p id="message"></p>
 </section>
 
@@ -237,6 +245,8 @@ function newUuid() {
 }
 
 const clientId = stored("bsp-client-id", newUuid);
+let suggestedName = stored("bsp-client-name", () => "");
+let serverRecord = null; // this client as the server UI sees it
 const startedAt = Date.now();
 
 // ---- event log ----
@@ -284,7 +294,8 @@ async function register() {
   registerInfo = await clientApi("/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ client_id: clientId, hostname: "web: " + ua, version: VERSION, capabilities: capabilities() }),
+    body: JSON.stringify({ client_id: clientId, hostname: "web: " + ua, version: VERSION, capabilities: capabilities(),
+                           name: suggestedName || null }),
   });
   if (!registered) log("register", "registered with the server");
   registered = true;
@@ -655,6 +666,15 @@ async function sendHeartbeat() {
   } catch {}
 }
 
+async function nameChanged() {
+  suggestedName = $("name").value.trim();
+  $("name").value = suggestedName;
+  store("bsp-client-name", suggestedName);
+  log("name", suggestedName ? `suggesting the name "${suggestedName}"` : "no longer suggesting a name");
+  try { await register(); } catch (e) { lastServerError = e.message; }
+  refreshServerEvents();
+}
+
 async function flagPositioning() {
   try {
     await withServer(() => clientApi(`/${clientId}/position-request`, { method: "POST" }));
@@ -798,6 +818,7 @@ function render() {
   const lc = stats.lastChunk;
   const statusRows = [
     ["Client ID", `<span class="mono">${esc(clientId)}</span>`],
+    ["Name on server", nameOnServer()],
     ["Server", `<span class="${server.cls}">${esc(server.text)}</span>`],
     ["Clock", `<span class="${sync_.cls}">${esc(sync_.text)}</span>`],
     ["Capture", c ? `<span class="ok">running</span> (audio context ${c.ctx.state}), ${stats.dropouts} dropouts pending report` : "stopped"],
@@ -827,8 +848,22 @@ function renderEvents() {
     ${new Date(e.ts).toLocaleTimeString()} <b>${esc(e.kind)}</b> ${esc(e.text)}</li>`).join("");
 }
 
+/** The name the server UI shows for this client, and why. */
+function nameOnServer() {
+  const r = serverRecord;
+  if (!r) return "-";
+  if (r.name) return `${esc(r.name)} <span class="muted">(set on the server)</span>`;
+  if (r.suggested_name) return `${esc(r.suggested_name)} <span class="muted">(suggested)</span>`;
+  return `<span class="muted">unnamed</span>`;
+}
+
 async function refreshServerEvents() {
   if (lowPower || document.hidden || !registered) return;
+  try {
+    serverRecord = await (await fetch(`${CONTROL_API}/clients/${clientId}`)).json();
+    $("name-note").textContent = serverRecord.name && serverRecord.name !== suggestedName
+      ? `The server shows "${serverRecord.name}": a name set there takes precedence.` : "";
+  } catch {}
   try {
     const q = new URLSearchParams({ client_id: clientId, exclude_kind: "heartbeat", limit: 20 });
     const evs = await (await fetch(`${CONTROL_API}/events?${q}`)).json();
@@ -839,6 +874,7 @@ async function refreshServerEvents() {
 
 // ---- startup ----
 for (const el of document.querySelectorAll(".lp-id, #title-id")) el.textContent = clientId;
+$("name").value = suggestedName;
 syncConnect();
 setInterval(sendSyncRequest, SYNC_INTERVAL_MS);
 setInterval(render, 1000);

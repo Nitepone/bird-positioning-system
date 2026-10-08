@@ -30,19 +30,15 @@ async fn register(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisterResponse>> {
-    let is_new = state.db.register_client(
-        req.client_id,
-        &req.hostname,
-        &req.version,
-        &req.capabilities,
-        &addr.to_string(),
-        now_ns(),
-    )?;
+    let name = clean_name(req.name.as_deref().unwrap_or(""));
+    let is_new = state
+        .db
+        .register_client(&req, &name, &addr.to_string(), now_ns())?;
     state.event(
         Some(req.client_id),
         "register",
         json!({ "new": is_new, "addr": addr.to_string(), "hostname": req.hostname,
-                "version": req.version, "capabilities": req.capabilities }),
+                "version": req.version, "capabilities": req.capabilities, "name": name }),
     );
     let d = &state.cfg.clients;
     Ok(Json(RegisterResponse {
@@ -51,6 +47,24 @@ async fn register(
         chunk_secs: d.chunk_secs,
         gate: d.gate.clone(),
     }))
+}
+
+/// Longest suggested name kept, in characters.
+const MAX_NAME_CHARS: usize = 64;
+
+/// A client's suggested name, made safe to show: one line, trimmed, bounded.
+fn clean_name(name: &str) -> String {
+    let one_line: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    one_line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_NAME_CHARS)
+        .collect()
 }
 
 async fn heartbeat(
@@ -181,4 +195,16 @@ async fn position_request(
         json!({ "expires_at": req.expires_at }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_name;
+
+    #[test]
+    fn cleans_suggested_names() {
+        assert_eq!(clean_name("  North\tfence\n "), "North fence");
+        assert_eq!(clean_name(""), "");
+        assert_eq!(clean_name(&"é".repeat(100)).chars().count(), 64);
+    }
 }

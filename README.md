@@ -54,6 +54,7 @@ Click **Save settings**. Settings are stored in the server's database.
 ```sh
 ./target/release/bsp-client --list-devices                        # find your microphone
 ./target/release/bsp-client -s http://SERVER:2473 -d "USB Mic"     # -d is optional
+./target/release/bsp-client -s http://SERVER:2473 -n "North fence" # suggest a name (optional)
 ```
 
 The client shows up in the **Clients** table on the **Config** page. Its ID is stored in `./state/client_id`,
@@ -65,7 +66,8 @@ audio processing off, a live waveform, connection and clock status, and recent e
 positioning** does what Enter does on `bsp-client`. **Low power mode** blacks out the screen while
 capture continues. Keep the page open and in front: most browsers pause the microphone in background
 tabs, and iOS pauses it when the screen locks (the page holds a screen wake lock where supported).
-Its ID is kept in the browser's local storage, so each browser profile is one client.
+Its ID and **Suggested name** are kept in the browser's local storage, so each browser profile is
+one client.
 
 Browser clients are less precise than `bsp-client` for positioning:
 
@@ -89,7 +91,9 @@ Browser clients are less precise than `bsp-client` for positioning:
 1. Press **Enter** in the client's terminal. A banner appears on every page; click
    **Configure** to open that client in the **Config** page's form.
 2. Enter a name and its position in metres from a reference point you choose:
-   **East (x), North (y), Up (z)**.
+   **East (x), North (y), Up (z)**. A client started with `-n` (or given a name on the browser
+   client) is already shown by that suggested name. A name entered here takes precedence, and
+   clearing it goes back to the suggestion.
 3. Click **Save**.
 
 You can also click **Edit** on any row in the Clients table.

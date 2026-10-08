@@ -45,6 +45,9 @@ struct Args {
     /// Upload every chunk, bypassing the noise gate.
     #[arg(long)]
     no_gate: bool,
+    /// Name to suggest for this client (a name set in the web UI takes precedence).
+    #[arg(short, long)]
+    name: Option<String>,
 }
 
 fn load_or_create_id(dir: &Path) -> anyhow::Result<ClientId> {
@@ -131,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         base: base.clone(),
         id,
         hostname: hostname(),
+        name: args.name.clone(),
         caps: Capabilities {
             sample_rate: source.sample_rate,
             channels: source.channels,

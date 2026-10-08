@@ -4,7 +4,7 @@
 
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
-use bsp_proto::{Capabilities, ClientId, ClockStatus, Timestamp, Uuid};
+use bsp_proto::{Capabilities, ClientId, ClockStatus, RegisterRequest, Timestamp, Uuid};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::path::Path;
@@ -17,7 +17,10 @@ pub struct Db {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientRecord {
     pub id: ClientId,
+    /// Set by the operator; empty when unset.
     pub name: String,
+    /// The client's own suggestion from its latest registration; empty when none.
+    pub suggested_name: String,
     pub position: Option<Vec3>,
     pub hostname: String,
     pub version: String,
@@ -77,6 +80,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS clients (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT '',
+    suggested_name TEXT NOT NULL DEFAULT '',
     x REAL, y REAL, z REAL,
     hostname TEXT NOT NULL DEFAULT '',
     version TEXT NOT NULL DEFAULT '',
@@ -116,6 +120,24 @@ fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serialisable")
 }
 
+/// Upgrades a database created before `column` was added to `SCHEMA`.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let exists = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?
+        .exists([column])?;
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
     let id: String = r.get("id")?;
     let (x, y, z): (Option<f64>, Option<f64>, Option<f64>) =
@@ -125,6 +147,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
     Ok(ClientRecord {
         id: id.parse().unwrap_or_default(),
         name: r.get("name")?,
+        suggested_name: r.get("suggested_name")?,
         position: match (x, y, z) {
             (Some(x), Some(y), Some(z)) => Some(Vec3 { x, y, z }),
             _ => None,
@@ -151,21 +174,27 @@ impl Db {
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        add_column_if_missing(
+            &conn,
+            "clients",
+            "suggested_name",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Records a registration. Returns true if the client is new.
+    /// Records a registration, with the name it suggests already cleaned up.
+    /// Returns true if the client is new.
     pub fn register_client(
         &self,
-        id: ClientId,
-        hostname: &str,
-        version: &str,
-        caps: &Capabilities,
+        req: &RegisterRequest,
+        suggested_name: &str,
         addr: &str,
         now: Timestamp,
     ) -> rusqlite::Result<bool> {
+        let id = req.client_id;
         let conn = self.conn.lock().unwrap();
         let existed = conn
             .query_row(
@@ -176,11 +205,20 @@ impl Db {
             .optional()?
             .is_some();
         conn.execute(
-            "INSERT INTO clients (id, hostname, version, capabilities, first_seen, last_seen, last_addr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
+            "INSERT INTO clients (id, hostname, version, capabilities, first_seen, last_seen, last_addr,
+                                  suggested_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET hostname = ?2, version = ?3, capabilities = ?4,
-                                           last_seen = ?5, last_addr = ?6",
-            params![id.to_string(), hostname, version, json(caps), now, addr],
+                                           last_seen = ?5, last_addr = ?6, suggested_name = ?7",
+            params![
+                id.to_string(),
+                req.hostname,
+                req.version,
+                json(&req.capabilities),
+                now,
+                addr,
+                suggested_name
+            ],
         )?;
         Ok(!existed)
     }
@@ -468,6 +506,70 @@ impl Db {
 mod tests {
     use super::*;
     use bsp_core::identifier::{Call, Species};
+
+    fn register_request(id: ClientId) -> RegisterRequest {
+        RegisterRequest {
+            client_id: id,
+            hostname: "host".into(),
+            version: "0".into(),
+            capabilities: Capabilities {
+                sample_rate: 48000,
+                channels: 1,
+                sample_format: "F32".into(),
+                clock_source: "test".into(),
+                device_name: "mic".into(),
+            },
+            name: None,
+        }
+    }
+
+    #[test]
+    fn suggested_name_follows_registrations_and_leaves_name_alone() {
+        let db = Db::in_memory().unwrap();
+        let id = Uuid::from_u128(1);
+        let req = register_request(id);
+        assert!(db.register_client(&req, "North fence", "addr", 1).unwrap());
+        let c = db.get_client(id).unwrap().unwrap();
+        assert_eq!(
+            (c.name.as_str(), c.suggested_name.as_str()),
+            ("", "North fence")
+        );
+
+        db.configure_client(id, "Oak tree", None).unwrap();
+        assert!(!db.register_client(&req, "Gate", "addr", 2).unwrap());
+        let c = db.get_client(id).unwrap().unwrap();
+        assert_eq!(
+            (c.name.as_str(), c.suggested_name.as_str()),
+            ("Oak tree", "Gate")
+        );
+    }
+
+    #[test]
+    fn upgrades_clients_table_without_suggested_name() {
+        let path = std::env::temp_dir().join(format!("bsp-upgrade-{}.db", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clients (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+                   x REAL, y REAL, z REAL, hostname TEXT NOT NULL DEFAULT '',
+                   version TEXT NOT NULL DEFAULT '', capabilities TEXT,
+                   first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                   last_addr TEXT NOT NULL DEFAULT '', clock TEXT);
+                 INSERT INTO clients (id, name, first_seen, last_seen)
+                   VALUES ('00000000-0000-0000-0000-000000000001', 'Old', 1, 1);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let c = db.get_client(Uuid::from_u128(1)).unwrap().unwrap();
+        assert_eq!((c.name.as_str(), c.suggested_name.as_str()), ("Old", ""));
+        drop(db);
+        // Opening again finds the column already there.
+        Db::open(&path).unwrap();
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
 
     fn detection(
         time: i64,

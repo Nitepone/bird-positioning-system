@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 clock_source: "simulated".into(),
                 device_name: "simulator".into(),
             },
+            name: Some(format!("sim-{k}")),
         };
         http.post(format!("{base}{CLIENT_API_PREFIX}/register"))
             .json(&req)

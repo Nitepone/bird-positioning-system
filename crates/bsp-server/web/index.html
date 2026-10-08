@@ -287,7 +287,8 @@
     </table>
     <button type="submit">Save</button>
     <span id="cfg-msg"></span>
-    <p><small>Leave all position fields empty to clear the position.</small></p>
+    <p><small>Leave the name empty to use the name the client suggests, if any.
+      Leave all position fields empty to clear the position.</small></p>
   </form>
 </section>
 
@@ -328,9 +329,11 @@ function fmtAgo(ns) {
   return fmtTime(ns);
 }
 function fmtPos(p, dims) { return p ? (dims || ["x", "y", "z"]).map(k => p[k].toFixed(1)).join(", ") : "not set"; }
+/// The name set here, else the one the client suggested for itself ("" if neither).
+function displayName(c) { return c.name || c.suggested_name || ""; }
 function clientName(id) {
   const c = clients.find(c => c.id === id);
-  return c && c.name ? c.name : (id ? id.slice(0, 8) : "server");
+  return c && displayName(c) ? displayName(c) : (id ? id.slice(0, 8) : "server");
 }
 async function api(path, opts) {
   const r = await fetch(API + path, opts);
@@ -408,7 +411,7 @@ async function refreshClients() {
   const page = currentPage();
   if (page === "config") renderConfigPage();
   // Monitor names appear in the other pages; redraw them when names change.
-  const key = clients.map(c => c.id + c.name).join();
+  const key = clients.map(c => c.id + displayName(c)).join();
   const namesChanged = key !== clientNamesKey;
   clientNamesKey = key;
   if (page === "detections") {
@@ -776,7 +779,7 @@ function renderClientFilter() {
   const sel = document.getElementById("f-client");
   const want = detFilters.get("client") || "";
   const opts = `<option value="">any</option>` +
-    clients.map(c => `<option value="${c.id}">${esc(c.name || c.id.slice(0, 8))}</option>`).join("");
+    clients.map(c => `<option value="${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</option>`).join("");
   if (sel.innerHTML !== opts) sel.innerHTML = opts;
   sel.value = want;
 }
@@ -843,7 +846,7 @@ function renderDetections() {
   document.getElementById("det-more").hidden = !detMore;
 
   // Only re-render when something changed, so playback buttons and images stay put.
-  const key = detRows.map(d => d.id).join() + "|" + clients.map(c => c.id + c.name).join();
+  const key = detRows.map(d => d.id).join() + "|" + clients.map(c => c.id + displayName(c)).join();
   if (key === detectionsKey) return;
   detectionsKey = key;
   document.querySelector("#detections tbody").innerHTML = detRows.map(d => {
@@ -983,7 +986,9 @@ function renderConfigPage() {
     const status = (c.active ? "active" : "inactive") + (c.synced ? ", synced" : (c.active ? ", NOT synced" : ""))
       + (c.positioning_requested ? ", <b>requesting position</b>" : "");
     return `<tr class="${cls}">
-      <td>${esc(c.name) || "<i>unnamed</i>"}</td>
+      <td>${c.name ? esc(c.name)
+        : c.suggested_name ? `${esc(c.suggested_name)} <span class="muted">(suggested)</span>`
+        : "<i>unnamed</i>"}</td>
       <td class="mono">${esc(c.id)}</td>
       <td>${status}</td>
       <td>${fmtPos(c.position)}</td>
@@ -997,7 +1002,7 @@ function renderConfigPage() {
   const sel = document.getElementById("cfg-id");
   const current = sel.value;
   sel.innerHTML = clients.map(c =>
-    `<option value="${c.id}">${esc(c.name || "unnamed")} - ${c.id.slice(0, 8)}${c.positioning_requested ? " (requesting)" : ""}</option>`
+    `<option value="${c.id}">${esc(displayName(c) || "unnamed")} - ${c.id.slice(0, 8)}${c.positioning_requested ? " (requesting)" : ""}</option>`
   ).join("");
   if (current && clients.some(c => c.id === current)) sel.value = current;
   if (!configDirty) {
@@ -1024,6 +1029,7 @@ function loadConfig() {
   const c = clients.find(c => c.id === document.getElementById("cfg-id").value);
   if (!c) return;
   document.getElementById("cfg-name").value = c.name;
+  document.getElementById("cfg-name").placeholder = c.suggested_name ? `suggested: ${c.suggested_name}` : "";
   for (const k of ["x", "y", "z"]) document.getElementById("cfg-" + k).value = c.position ? c.position[k] : "";
   configDirty = false;
 }
