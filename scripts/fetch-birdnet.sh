@@ -184,6 +184,7 @@ location). Set the site's latitude/longitude on the web UI's Config page to enab
 
 EOF
 case "$VERSION" in
-  v3.0) echo "License: CC BY-SA 4.0, see $OUT/TERMS_OF_USE.txt (attribution to BirdNET required)." ;;
-  v2.4) echo "License: CC BY-NC-SA 4.0 (non-commercial; attribution to BirdNET required)." ;;
+  v3.0) echo "License: CC BY-SA 4.0 plus terms of use (no poaching or military use; attribution required), see $OUT/TERMS_OF_USE.txt." ;;
+  v2.4) echo "License: CC BY-NC 4.0 (non-commercial; attribution required)." ;;
 esac
+echo "Geo model license: Apache 2.0, see $DEST/birdnet-geo/LICENSE-MODELS.md. See the README's attribution section."

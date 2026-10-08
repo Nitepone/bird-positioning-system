@@ -110,7 +110,7 @@ and writes `models/birdnet-<version>/model.onnx` and `labels.txt`.
 | Release | BirdNET+ V3.0 developer preview 3.1 | stable |
 | Classes | 11,560 (includes some insects, frogs, mammals, humans) | 6,522 |
 | Download | official ONNX, ~270 MB (`--fp32` for ~540 MB) | TensorFlow model converted to ONNX; temporarily installs TensorFlow (~1 GB) |
-| License | CC BY-SA 4.0 | CC BY-NC-SA 4.0 (non-commercial) |
+| License | CC BY-SA 4.0 + terms of use | CC BY-NC 4.0 (non-commercial) |
 
 To use v2.4, run `scripts/fetch-birdnet.sh v2.4` and point `[identifier.birdnet]` at it. Set
 `version = "v2.4"` and the two `models/birdnet-v2.4/...` paths.
@@ -127,6 +127,34 @@ expected at a location: `cargo run --release -p bsp-core --example local_species
 
 For a run without any model, set `kind = "mock"`. Every loud burst is then reported as
 "Unknown bird", and its confidence only reflects loudness.
+
+## License and attribution
+
+bsp uses BirdNET models, but they are not part of this repository; `scripts/fetch-birdnet.sh`
+downloads them. Their licenses apply to anyone who downloads and uses them, separately from
+bsp's own code:
+
+| Model | License | Conditions |
+|---|---|---|
+| BirdNET+ V3.0 developer preview (acoustic, default) | [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) plus [terms of use](https://zenodo.org/records/20703646) | Commercial use allowed. Credit BirdNET, link the license and note changes; derivatives use the same license. **Never** use it for poaching or any military purpose. The terms describe it as provided solely for research and evaluation. |
+| BirdNET v2.4 (acoustic) | [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) | Non-commercial use only. Credit BirdNET. |
+| BirdNET+ Geomodel V3.0.4 (expected species) | [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) | Keep the license and notices when redistributing. |
+
+The license files are saved next to each model (`TERMS_OF_USE.txt`, `LICENSE-MODELS.md`).
+
+**Attribution.** BirdNET requires that publications, presentations and derived tools credit the
+models, either by citation or by an acknowledgment such as "Powered by BirdNET". If you publish
+or share results or a deployment of bsp, include that credit and cite:
+
+> Kahl, S., Wood, C. M., Eibl, M., & Klinck, H. (2021). BirdNET: A deep learning solution for
+> avian diversity monitoring. *Ecological Informatics*, 61, 101236.
+> https://doi.org/10.1016/j.ecoinf.2021.101236
+
+BirdNET is developed by the K. Lisa Yang Center for Conservation Bioacoustics at the Cornell Lab
+of Ornithology and Chemnitz University of Technology, with Museum für Naturkunde Berlin for
+V3.0. Model releases: [V3.0 preview](https://zenodo.org/records/20703646),
+[v2.4](https://zenodo.org/records/15050749),
+[geo model](https://github.com/birdnet-team/geomodel/releases/tag/v3.0.4).
 
 ## Testing without hardware
 
