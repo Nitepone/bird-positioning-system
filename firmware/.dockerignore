@@ -1,0 +1,6 @@
+# Config files hold Wi-Fi passwords: never send them to the image.
+*.conf
+!bps.conf.example
+.pio
+host/bps-host-client
+**/__pycache__

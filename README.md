@@ -86,6 +86,10 @@ Browser clients are less precise than `bsp-client` for positioning:
 - Some input latency is invisible to a web page. Chrome reports it and the page compensates. Other
   browsers may leave a constant offset of a few milliseconds per device.
 
+**Or use a microcontroller as a client:** a Raspberry Pi Pico W, Pico 2 W or classic ESP32 with an
+I2S microphone such as the Adafruit ICS-43434 makes a cheap, always-on client. See
+[Microcontroller clients](#microcontroller-clients-pico-w-esp32).
+
 ### 4. Set each client's name and position
 
 1. Press **Enter** in the client's terminal. A banner appears on every page; click
@@ -163,6 +167,101 @@ answered measurements, and for one client at a time, charts of the last 15 minut
 (kept in the server's memory, so they start afresh when it restarts). Use it to compare networks
 or placements, or to screenshot a client's sync for a bug report.
 
+### Microcontroller clients (Pico W / ESP32)
+
+The firmware in `firmware/` turns a Raspberry Pi Pico W, Pico 2 W or classic ESP32 (e.g.
+ESP32-DevKitC) with an I2S microphone into a client. It uses the same client API as `bsp-client`,
+so to the server it is just another client: it appears in the **Clients** table, is measured on the
+**Clocks** page and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
+(any I2S microphone with 24-bit samples in 32-bit slots should work).
+
+**Wiring** (defaults; `./configure.sh` lets you choose other pins):
+
+| ICS-43434 | Pico W / Pico 2 W | ESP32 |
+|---|---|---|
+| 3V | 3V3 (pin 36) | 3V3 |
+| GND | GND | GND |
+| BCLK | GP18 | GPIO 26 |
+| LRCL (word select) | GP19 (must be BCLK + 1) | GPIO 25 |
+| DOUT | GP20 | GPIO 33 |
+| SEL | GND or unconnected (left channel) | GND or unconnected |
+
+**Configure, build and flash.** Two scripts in `firmware/` do it:
+
+```sh
+cd firmware
+./configure.sh       # edit the settings: board, Wi-Fi, server, name, pins
+./build.sh -f -m     # build, flash the board connected by USB, show its log
+```
+
+`./configure.sh` is a text UI (it needs `whiptail` or `dialog`). It lists every setting with its
+current value and says whether they are ready to use. Choose a setting to change it, then
+**Save**, or **Save & build** to go straight on to building and flashing. It writes `bps.conf`
+(see `bps.conf.example` to write one by hand).
+
+`./build.sh` builds for the board named in the config. `-f` flashes, `-m` shows the board's log
+(Ctrl-C leaves it), `-c` rebuilds from scratch, `-t` runs the unit tests, and `-h` lists the
+rest. It uses [PlatformIO](https://platformio.org/) Core if installed (free and open source:
+`pipx install platformio`). If not, it uses Docker, building the `bps-firmware` image from
+`firmware/Dockerfile` the first time. That image holds every board's toolchain (about 8.5 GB), so
+later builds work offline. Pass `--docker` to use it even when PlatformIO is installed.
+
+To flash a Pico for the first time, hold its BOOTSEL button while plugging it in. Later flashes
+work without it. When building in Docker, `./build.sh -f` flashes a Pico from outside the
+container: with `picotool` if installed, otherwise by copying `firmware.uf2` to the Pico's
+BOOTSEL drive. An ESP32 flashes over its USB serial port (`-p /dev/ttyUSB0` if detection picks
+the wrong one). The firmware is written to `firmware/.pio/build/<board>/`.
+
+For several boards, keep one config per board: `./configure.sh north.conf`, then
+`./build.sh -f north.conf`. Each board's client ID is derived from its chip's unique ID, so it
+stays the same across reflashes without any storage. The settings, including the Wi-Fi password,
+are compiled into the firmware. Config files are created readable only by you, and git and the
+Docker build ignore them.
+
+**Status LED:**
+
+| LED | Meaning |
+|---|---|
+| fast blink | joining Wi-Fi or registering |
+| short flash every second | registered, clock not yet synced |
+| on | synced and listening |
+| on, flickering | uploading a chunk |
+
+To request positioning (what Enter does on `bsp-client`), wire a push button from a GPIO to GND
+and set it as **Button pin** in `./configure.sh`. ESP32 boards use their BOOT button (GPIO 0) by
+default.
+
+**How it differs from `bsp-client`.**
+
+- **Noise gate and look-back.** A 9 s chunk is 864 KB, far more than these boards' RAM, so they
+  cannot record a chunk and then decide whether to send it. Instead, they run the noise gate on
+  the live audio and keep the last second or so in a ring buffer. When a sound passes the gate,
+  they stream a 9 s chunk that starts that **look-back** before the sound. If it is still going
+  at the end of a chunk, the next chunk follows without a gap. Silence is never sent.
+- **What gets dropped.** A sound that starts quietly and passes the gate only later than the
+  look-back loses its quiet start. There is no upload queue: while the server is unreachable,
+  audio is dropped. If Wi-Fi stalls for longer than the ring buffer holds, the lost stretch is
+  sent as silence, so the rest of the chunk keeps its exact timing.
+- **Wi-Fi and sync.** A worst-case clock error includes half the fastest round trip, and a Pico
+  W's Wi-Fi round trips are rarely under 4 ms. So on many networks it stays above the server's
+  default 2 ms limit (**NOT synced**: identified, but left out of positioning). Its status line
+  shows the best round trip and the signal strength.
+- **Clock.** The boards have no clock of their own beyond a timer from boot. They set their
+  clock from the server once, then measure and correct it over UDP exactly like `bsp-client`. The
+  I2S sample clock runs off the same crystal as that timer. Wi-Fi power saving is turned off,
+  because it delays packets.
+
+| Board | RAM | Ring buffer | Default look-back |
+|---|---|---|---|
+| Pico W (RP2040) | 264 KB | about 1.4 s | 0.75 s |
+| Pico 2 W (RP2350) | 520 KB | about 4 s | 2.5 s |
+| ESP32 (classic) | 520 KB, about half free | about 1.5–2 s | 1 s |
+
+The board takes what `RING_KB` asks for, as long as 32 KB of heap stays free for the network
+stack. At startup it logs what it got and the look-back it can keep. It also logs the
+microphone's level on both I2S channels: a channel at about −180 dBFS is silent, which means
+`MIC_CHANNEL` or the wiring is wrong.
+
 ### Troubleshooting
 
 | Symptom | Check |
@@ -172,6 +271,10 @@ or placements, or to screenshot a client's sync for a bug report.
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
+| Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
+| Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
+| "upload: the network stalled; … sent as silence" | Wi-Fi stalled for longer than the ring buffer holds: check the `Wi-Fi … dBm` in the status line, move the board or access point, or lower `LOOKBACK_MS` for more slack |
+| Microcontroller stays **NOT synced** | Its status line's *best round trip*: the error bound includes half of it, so above about 4 ms it cannot get under the default 2 ms. Improve the Wi-Fi path (signal, a less busy channel, no router between board and server), or raise `max_clock_offset_us` if looser positioning is acceptable |
 
 ## BirdNET
 
@@ -243,10 +346,30 @@ its license and notice in `crates/bsp-server/web/vendor/` so the UI works withou
 known direction. The detection appears after about 15 s. Its synthetic chirp is not a real bird,
 so run the server with `kind = "mock"` for this test.
 
+The microcontroller client's code also builds for Linux, with a WAV file standing in for the
+microphone and Enter for the positioning button:
+
+```sh
+make -C firmware/host
+firmware/host/bps-host-client -s SERVER -w birds.wav -n "Host test"   # 16-bit PCM WAV, loops
+```
+
 ## Developer notes
 
 **Crates:** `bsp-proto` (wire types), `bsp-core` (audio helpers, `Identifier`, `Locator`,
-`Detection`), `bsp-server`, `bsp-client`, `bsp-sim`.
+`Detection`), `bsp-server`, `bsp-client`, `bsp-sim`, `bps-mcu-check` (tests only: checks the
+firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
+
+**Firmware** (`firmware/`, PlatformIO):
+- `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement,
+  `Timestamper` and noise gate, plus the ring buffer and the client's state machines.
+  `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
+  `esp32.cpp` (Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
+  `host/` is a Linux board layer for testing.
+- `scripts/bps_config.py` holds the board defaults and the config validation, used by both
+  `./configure.sh` and the build. `./build.sh` drives PlatformIO, locally or in Docker.
+- Tests: `./build.sh -t` (or `pio test -e native`) runs the core's unit tests on the computer, and `cargo test` runs
+  `bps-mcu-check`. Both run without hardware.
 
 **How a call becomes a detection:**
 

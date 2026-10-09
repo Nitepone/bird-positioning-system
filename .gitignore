@@ -4,3 +4,8 @@
 /state
 /models
 /tls
+/firmware/*.conf
+!/firmware/bps.conf.example
+/firmware/.pio
+/firmware/host/bps-host-client
+/firmware/scripts/__pycache__

@@ -1,0 +1,19 @@
+# bps microcontroller client settings. ./configure.sh writes this file for you;
+# to write it by hand, copy it to bps.conf and fill it in. Empty settings take
+# the board's defaults (see scripts/bps_config.py).
+
+BOARD=pico_w                # pico_w, pico2_w or esp32
+WIFI_SSID='My network'
+WIFI_PASSWORD='change me!'  # empty for an open network
+SERVER_HOST=192.168.1.10    # the bps server
+SERVER_PORT=2473            # its client port (not the web UI port)
+CLIENT_NAME='North fence'   # suggested name (optional)
+
+I2S_BCLK=18                 # Pico: LRCL (word select) goes to BCLK + 1
+I2S_DATA=20
+MIC_CHANNEL=left            # left: SEL to GND or unconnected; right: SEL to 3V
+
+BUTTON_PIN=none             # GPIO of a positioning button to GND
+LED_PIN=builtin             # status LED: a GPIO, none, or builtin (Pico)
+LOOKBACK_MS=750             # audio kept before the sound that opened the gate
+RING_KB=160                 # RAM asked for the ring buffer

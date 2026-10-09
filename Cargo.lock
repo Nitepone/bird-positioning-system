@@ -301,6 +301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bps-mcu-check"
+version = "0.1.0"
+dependencies = [
+ "bsp-core",
+ "bsp-proto",
+ "cc",
+]
+
+[[package]]
 name = "bsp-client"
 version = "0.1.0"
 dependencies = [
