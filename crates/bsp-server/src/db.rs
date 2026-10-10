@@ -64,7 +64,15 @@ pub struct SpeciesSeen {
 pub struct Clip {
     /// Timestamp of the first sample.
     pub start: Timestamp,
-    pub wav: Vec<u8>,
+    /// FLAC, or WAV for clips stored before FLAC (see [`crate::clip_audio`]).
+    pub audio: Vec<u8>,
+}
+
+/// What [`Db::maintain`] changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Maintenance {
+    pub detections_removed: usize,
+    pub clips_converted: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,7 +108,7 @@ CREATE TABLE IF NOT EXISTS detection_clips (
     detection_id TEXT NOT NULL,
     client_id TEXT NOT NULL,
     start INTEGER NOT NULL,
-    wav BLOB NOT NULL,
+    audio BLOB NOT NULL,
     PRIMARY KEY (detection_id, client_id)
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -120,6 +128,13 @@ fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serialisable")
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    conn.prepare(&format!(
+        "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+    ))?
+    .exists([column])
+}
+
 /// Upgrades a database created before `column` was added to `SCHEMA`.
 fn add_column_if_missing(
     conn: &Connection,
@@ -127,12 +142,7 @@ fn add_column_if_missing(
     column: &str,
     decl: &str,
 ) -> rusqlite::Result<()> {
-    let exists = conn
-        .prepare(&format!(
-            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
-        ))?
-        .exists([column])?;
-    if !exists {
+    if !column_exists(conn, table, column)? {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     }
     Ok(())
@@ -173,6 +183,10 @@ impl Db {
 
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Clips were WAV-only before FLAC.
+        if column_exists(&conn, "detection_clips", "wav")? {
+            conn.execute_batch("ALTER TABLE detection_clips RENAME COLUMN wav TO audio")?;
+        }
         conn.execute_batch(SCHEMA)?;
         add_column_if_missing(
             &conn,
@@ -416,8 +430,8 @@ impl Db {
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO detection_clips (detection_id, client_id, start, wav) VALUES (?1, ?2, ?3, ?4)",
-            params![detection.to_string(), client.to_string(), clip.start, clip.wav],
+            "INSERT OR REPLACE INTO detection_clips (detection_id, client_id, start, audio) VALUES (?1, ?2, ?3, ?4)",
+            params![detection.to_string(), client.to_string(), clip.start, clip.audio],
         )?;
         Ok(())
     }
@@ -425,12 +439,12 @@ impl Db {
     pub fn get_clip(&self, detection: Uuid, client: ClientId) -> rusqlite::Result<Option<Clip>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT start, wav FROM detection_clips WHERE detection_id = ?1 AND client_id = ?2",
+            "SELECT start, audio FROM detection_clips WHERE detection_id = ?1 AND client_id = ?2",
             [detection.to_string(), client.to_string()],
             |r| {
                 Ok(Clip {
                     start: r.get(0)?,
-                    wav: r.get(1)?,
+                    audio: r.get(1)?,
                 })
             },
         )
@@ -446,7 +460,70 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()?.parse().ok()).collect())
     }
 
-    /// Newest-first detections, optionally older than `before`.
+    /// Removes detections (and their clips) below `min_confidence`, re-encodes
+    /// WAV clips as FLAC, and compacts the file if anything changed.
+    pub fn maintain(&self, min_confidence: f32) -> anyhow::Result<Maintenance> {
+        let mut done = Maintenance::default();
+        {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM detection_clips WHERE detection_id IN
+                   (SELECT id FROM detections WHERE json_extract(body, '$.confidence') < ?1)",
+                [min_confidence],
+            )?;
+            done.detections_removed = tx.execute(
+                "DELETE FROM detections WHERE json_extract(body, '$.confidence') < ?1",
+                [min_confidence],
+            )?;
+            tx.commit()?;
+        }
+
+        // In batches, converting outside the lock so the server keeps running.
+        let mut after = 0i64;
+        loop {
+            let batch: Vec<(i64, Vec<u8>)> = {
+                let conn = self.conn.lock().unwrap();
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rowid, audio FROM detection_clips
+                     WHERE rowid > ?1 AND substr(audio, 1, 4) = CAST('RIFF' AS BLOB)
+                     ORDER BY rowid LIMIT 32",
+                )?;
+                stmt.query_map([after], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            after = last;
+            let converted: Vec<(i64, Vec<u8>)> = batch
+                .into_iter()
+                .filter_map(
+                    |(rowid, wav)| match crate::clip_audio::flac_from_wav(&wav) {
+                        Ok(flac) => Some((rowid, flac)),
+                        Err(e) => {
+                            tracing::warn!(rowid, "keeping clip as WAV: {e:#}");
+                            None
+                        }
+                    },
+                )
+                .collect();
+            let conn = self.conn.lock().unwrap();
+            let mut stmt =
+                conn.prepare_cached("UPDATE detection_clips SET audio = ?2 WHERE rowid = ?1")?;
+            for (rowid, flac) in converted {
+                stmt.execute(params![rowid, flac])?;
+                done.clips_converted += 1;
+            }
+        }
+
+        if done != Maintenance::default() {
+            let conn = self.conn.lock().unwrap();
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok(done)
+    }
+
     /// Newest-first detections matching `f`.
     pub fn list_detections(
         &self,
@@ -602,6 +679,57 @@ mod tests {
             unexpected,
             location: None,
             created_at: time,
+        }
+    }
+
+    #[test]
+    fn maintenance_drops_low_confidence_and_converts_wav() {
+        let path = std::env::temp_dir().join(format!("bsp-maintain-{}.db", Uuid::new_v4()));
+        let pcm: Vec<f32> = (0..20_000).map(|i| (i as f32 / 9.0).sin() * 0.3).collect();
+        let wav = bsp_core::audio::encode_wav(48_000, &pcm);
+        let (low, high) = (
+            detection(100, "a", "A", &[1], 0.55, false),
+            detection(200, "b", "B", &[1], 0.70, false),
+        );
+        {
+            // A database from before FLAC, with the clip column still named `wav`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE detection_clips (detection_id TEXT NOT NULL, client_id TEXT NOT NULL,
+                   start INTEGER NOT NULL, wav BLOB NOT NULL, PRIMARY KEY (detection_id, client_id));",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        for d in [&low, &high] {
+            db.insert_detection(d).unwrap();
+            let clip = Clip {
+                start: d.time,
+                audio: wav.clone(),
+            };
+            db.insert_clip(d.id, Uuid::from_u128(1), &clip).unwrap();
+        }
+
+        let done = db.maintain(0.7).unwrap();
+        assert_eq!(
+            done,
+            Maintenance {
+                detections_removed: 1,
+                clips_converted: 1
+            }
+        );
+        assert!(db.get_detection(low.id).unwrap().is_none());
+        assert!(db.clip_clients(low.id).unwrap().is_empty());
+        let clip = db.get_clip(high.id, Uuid::from_u128(1)).unwrap().unwrap();
+        assert!(crate::clip_audio::is_flac(&clip.audio));
+        assert_eq!(
+            crate::clip_audio::decode(&clip.audio).unwrap(),
+            crate::clip_audio::decode(&wav).unwrap()
+        );
+        assert_eq!(db.maintain(0.7).unwrap(), Maintenance::default());
+        drop(db);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
     }
 

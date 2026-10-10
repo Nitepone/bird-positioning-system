@@ -24,6 +24,9 @@
     --row-requesting: #ffffd6;
     --row-inactive: #898781;
     --playing: #b5dc8f;
+    /* Clip views: the playback position and the identified call. */
+    --playhead: #e00000;
+    --call: #eb6834;
     /* Timeline ticks; validated as a pair for colour-vision deficiency and contrast. */
     --tick: #2a78d6;
     --tick-unexpected: #eb6834;
@@ -49,6 +52,8 @@
       --row-unexpected: #3a2418;
       --row-requesting: #3a3510;
       --playing: #3d5a22;
+      --playhead: #ff4040;
+      --call: #f2a57a;
       --tick: #3987e5;
       --tick-unexpected: #d95926;
       --ok: #6cc785;
@@ -72,6 +77,8 @@
     --row-unexpected: #3a2418;
     --row-requesting: #3a3510;
     --playing: #3d5a22;
+    --playhead: #ff4040;
+    --call: #f2a57a;
     --tick: #3987e5;
     --tick-unexpected: #d95926;
     --ok: #6cc785;
@@ -103,7 +110,11 @@
   /* Links that look like the surrounding text until hovered. */
   a.quiet { color: inherit; text-decoration: none; }
   a.quiet:hover, a.quiet:focus-visible { text-decoration: underline; }
-  img.wave { display: block; cursor: pointer; }
+  .clip { position: relative; width: 300px; height: 60px; cursor: pointer; outline: 1px solid var(--hairline); }
+  .clip > img, .clip > canvas { display: block; width: 100%; height: 100%; }
+  .clip .playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px;
+                    background: var(--playhead); pointer-events: none; display: none; }
+  .clip.playing .playhead { display: block; }
   button.play.playing { background: var(--playing); }
 
   /* Filter rows: one left-aligned row above the content they scope. */
@@ -272,10 +283,19 @@
     <button type="button" onclick="clearFilters()">Clear filters</button>
   </form>
   <p class="muted" id="det-summary"></p>
-  <p><small class="muted">Click a waveform to play the clearest recording, or a monitor's button to hear its recording.
-    The highlighted band is the identified call.</small></p>
+  <div class="filters">
+    <label>Show recordings as
+      <select id="clip-view">
+        <option value="spectrogram">spectrogram</option>
+        <option value="waveform">waveform</option>
+      </select>
+    </label>
+    <label title="Play every recording at the same peak volume, so quiet calls are easier to hear">
+      <input type="checkbox" id="clip-normalize" checked> Normalize volume</label>
+  </div>
+  <p><small class="muted" id="clip-help"></small></p>
   <table id="detections">
-    <thead><tr><th>Time</th><th>Waveform</th><th>Species</th><th>Confidence</th><th>Heard by</th><th>Direction</th><th>Position (E, N) m</th></tr></thead>
+    <thead><tr><th>Time</th><th id="clip-col">Recording</th><th>Species</th><th>Confidence</th><th>Heard by</th><th>Direction</th><th>Position (E, N) m</th></tr></thead>
     <tbody></tbody>
   </table>
   <button type="button" id="det-more" onclick="loadOlder()" hidden>Load older detections</button>
@@ -457,25 +477,308 @@ function showPage() {
   refresh();
 }
 
-// ---- audio playback (one clip at a time) ----
-const player = new Audio();
-let playingUrl = null;
+// ---- detection recordings: spectrogram or waveform, and playback (one clip at a time) ----
 function clipUrl(detectionId, clientId) { return `${API}/detections/${detectionId}/audio/${clientId}`; }
-function play(url) {
-  if (playingUrl === url && !player.paused) {
-    player.pause();
-    setPlaying(null);
+function waveformUrl(detectionId, clientId) { return `${API}/detections/${detectionId}/waveform?client=${clientId}`; }
+
+const clipPrefs = { view: "spectrogram", normalize: true };
+try { Object.assign(clipPrefs, JSON.parse(localStorage.getItem("bsp.clips") || "{}")); } catch (e) { /* ignore */ }
+function saveClipPrefs() {
+  try { localStorage.setItem("bsp.clips", JSON.stringify(clipPrefs)); } catch (e) { /* not remembered */ }
+}
+
+/// Fetches and decodes a stored clip: { buffer, call: [startS, endS] or null }.
+let decodeCtx = null;
+async function fetchClip(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  const range = (r.headers.get("x-call-range") || "").split(",").map(parseFloat);
+  // An offline context decodes without needing a user gesture first.
+  decodeCtx = decodeCtx || new OfflineAudioContext(1, 1, 48000);
+  const buffer = await decodeCtx.decodeAudioData(await r.arrayBuffer());
+  return { buffer, call: range.length === 2 && range.every(Number.isFinite) ? range : null };
+}
+
+/// In-place radix-2 FFT of `re`/`im` (length a power of two).
+const fftTwiddles = new Map();
+function fft(re, im) {
+  const n = re.length;
+  let tw = fftTwiddles.get(n);
+  if (!tw) {
+    tw = { cos: new Float32Array(n / 2), sin: new Float32Array(n / 2) };
+    for (let k = 0; k < n / 2; k++) { tw.cos[k] = Math.cos(-2 * Math.PI * k / n); tw.sin[k] = Math.sin(-2 * Math.PI * k / n); }
+    fftTwiddles.set(n, tw);
+  }
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1, step = n / len;
+    for (let i = 0; i < n; i += len) {
+      for (let k = 0; k < half; k++) {
+        const a = i + k, b = a + half, wr = tw.cos[k * step], wi = tw.sin[k * step];
+        const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr; im[a] += ti;
+      }
+    }
+  }
+}
+
+const SPECTRO = { w: 600, h: 120, fftSize: 512, maxHz: 12000, gamma: 1.2, floorDb: 6, minRangeDb: 20 };
+const SPECTRO_WINDOW = Float32Array.from({ length: SPECTRO.fftSize },
+  (_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (SPECTRO.fftSize - 1)));
+
+/// Spectrogram of a whole clip as colour-scale indices (0..255), SPECTRO.w x SPECTRO.h, low
+/// frequencies at the bottom. Each frequency's typical level (its median over the clip) plus a
+/// few dB is the zero point, which flattens steady noise such as wind or traffic so calls stand
+/// out; the top of the scale is a high percentile, so one loud click doesn't wash out the rest.
+function spectrogramLevels(buffer) {
+  const pcm = buffer.getChannelData(0), sr = buffer.sampleRate;
+  const { w, h, fftSize: n } = SPECTRO;
+  const bins = Math.min(n / 2, Math.ceil(SPECTRO.maxHz * n / sr));
+  const db = new Float32Array(w * bins);
+  const re = new Float32Array(n), im = new Float32Array(n);
+  for (let x = 0; x < w; x++) {
+    const start = Math.round((x + 0.5) / w * pcm.length) - n / 2;
+    for (let i = 0; i < n; i++) {
+      const j = start + i;
+      re[i] = j >= 0 && j < pcm.length ? pcm[j] * SPECTRO_WINDOW[i] : 0;
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k < bins; k++) db[x * bins + k] = 10 * Math.log10(re[k] * re[k] + im[k] * im[k] + 1e-12);
+  }
+  const col = new Float32Array(w);
+  for (let k = 0; k < bins; k++) {
+    for (let x = 0; x < w; x++) col[x] = db[x * bins + k];
+    const zero = col.sort()[w >> 1] + SPECTRO.floorDb;
+    for (let x = 0; x < w; x++) db[x * bins + k] -= zero;
+  }
+  const top = Math.max(SPECTRO.minRangeDb, db.slice().sort()[Math.floor(db.length * 0.998)]);
+  const out = new Uint8Array(w * h);
+  const binsShown = SPECTRO.maxHz * n / sr;
+  for (let y = 0; y < h; y++) {
+    const k = Math.floor((1 - (y + 0.5) / h) * binsShown);
+    if (k >= bins) continue; // above the recording's Nyquist frequency
+    for (let x = 0; x < w; x++) {
+      const t = Math.max(0, Math.min(1, db[x * bins + k] / top));
+      out[y * w + x] = Math.round(Math.pow(t, SPECTRO.gamma) * 255);
+    }
+  }
+  return out;
+}
+
+/// 256-entry colour lookup, as on the client page: one hue, from the surface (quiet) to strong
+/// blue (loud); dark mode runs dark to light against its dark surface.
+let spectroLut = null, spectroLutFor = "";
+function spectrogramLut() {
+  const css = getComputedStyle(document.documentElement);
+  const dark = css.colorScheme === "dark";
+  const surface = css.getPropertyValue("--surface").trim() || (dark ? "#1a1a19" : "#fcfcfb");
+  const key = surface + dark;
+  if (key === spectroLutFor) return spectroLut;
+  const ramp = dark
+    ? [surface, "#104281", "#1c5cab", "#3987e5", "#6da7ec", "#b7d3f6", "#ffffff"]
+    : [surface, "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#104281", "#0d366b"];
+  const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const stops = ramp.map(rgb);
+  spectroLut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1), a = Math.floor(t), b = Math.min(a + 1, stops.length - 1), f = t - a;
+    for (let c = 0; c < 3; c++) spectroLut[i * 3 + c] = stops[a][c] + (stops[b][c] - stops[a][c]) * f;
+  }
+  spectroLutFor = key;
+  return spectroLut;
+}
+
+/// Computed spectrograms by "detection/client", kept so re-rendering the table or switching
+/// theme doesn't refetch; oldest dropped first.
+const spectroCache = new Map();
+function cacheSpectrogram(key, clip) {
+  const entry = { levels: spectrogramLevels(clip.buffer), call: clip.call, duration: clip.buffer.duration };
+  spectroCache.set(key, entry);
+  if (spectroCache.size > 200) spectroCache.delete(spectroCache.keys().next().value);
+  return entry;
+}
+
+function paintSpectrogram(canvas, { levels, call, duration }) {
+  const { w, h } = SPECTRO, lut = spectrogramLut();
+  const g = canvas.getContext("2d"), img = g.createImageData(w, h), px = img.data;
+  for (let i = 0; i < w * h; i++) {
+    const v = levels[i] * 3;
+    px[i * 4] = lut[v]; px[i * 4 + 1] = lut[v + 1]; px[i * 4 + 2] = lut[v + 2]; px[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  if (call && duration > 0) {
+    // The identified call: a bar along the bottom edge.
+    const x0 = Math.max(0, call[0] / duration * w), x1 = Math.min(w, call[1] / duration * w);
+    g.fillStyle = cssVar("--call");
+    g.fillRect(x0, h - 6, Math.max(2, x1 - x0), 6);
+  }
+}
+
+async function drawSpectrogram(canvas) {
+  const view = canvas.parentElement, key = view.dataset.det + "/" + view.dataset.client;
+  try {
+    const entry = spectroCache.get(key) ||
+      cacheSpectrogram(key, await fetchClip(clipUrl(view.dataset.det, view.dataset.client)));
+    paintSpectrogram(canvas, entry);
+  } catch (e) {
+    // Fall back to the server-drawn waveform.
+    if (canvas.isConnected) canvas.replaceWith(waveformImg(view.dataset.det, view.dataset.client));
+  }
+}
+
+const spectroObserver = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    spectroObserver.unobserve(e.target);
+    drawSpectrogram(e.target);
+  }
+}, { rootMargin: "300px" });
+
+function waveformImg(det, client) {
+  const img = document.createElement("img");
+  img.alt = "waveform"; img.loading = "lazy"; img.width = 300; img.height = 60;
+  img.src = waveformUrl(det, client);
+  return img;
+}
+
+/// The row's picture of `client`'s recording, in the chosen style.
+function clipVisual(det, client) {
+  if (clipPrefs.view === "waveform") return waveformImg(det, client);
+  const canvas = document.createElement("canvas");
+  canvas.width = SPECTRO.w; canvas.height = SPECTRO.h;
+  canvas.setAttribute("aria-label", "spectrogram");
+  return canvas;
+}
+
+/// Shows `client`'s recording in the detection's row (for when another monitor's is played).
+function showClipInRow(det, client) {
+  const view = document.querySelector(`.clip[data-det="${det}"]`);
+  if (!view) return null;
+  if (view.dataset.client !== client) {
+    view.dataset.client = client;
+    view.title = "Play " + clientName(client);
+    view.firstElementChild.replaceWith(clipVisual(det, client));
+    if (view.firstElementChild.tagName === "CANVAS") drawSpectrogram(view.firstElementChild);
+  }
+  return view;
+}
+
+function redrawSpectrograms() {
+  for (const canvas of document.querySelectorAll(".clip > canvas")) {
+    const v = canvas.parentElement, entry = spectroCache.get(v.dataset.det + "/" + v.dataset.client);
+    if (entry) paintSpectrogram(canvas, entry);
+  }
+}
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", redrawSpectrograms);
+
+// Playback goes through Web Audio so quiet recordings can be brought up to a common peak level.
+const NORMALIZE_PEAK = 0.89; // -1 dBFS
+const NORMALIZE_MAX_GAIN = 31.6; // +30 dB, so a near-silent clip isn't turned into loud hiss
+let audioCtx = null;
+const playback = { key: null, url: null, source: null, gain: null, normGain: 1, startedAt: 0, duration: 0, frame: 0 };
+
+function normalizeGain(buffer) {
+  let peak = 0;
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    for (const x of buffer.getChannelData(c)) if (x > peak) peak = x; else if (-x > peak) peak = -x;
+  }
+  return peak > 0 ? Math.min(NORMALIZE_MAX_GAIN, NORMALIZE_PEAK / peak) : 1;
+}
+
+async function playClip(det, client) {
+  const key = det + "/" + client, url = clipUrl(det, client);
+  const toggledOff = playback.key === key;
+  stopPlayback();
+  if (toggledOff) return;
+  // Created and resumed within the click, as browsers require.
+  audioCtx = audioCtx || new AudioContext();
+  audioCtx.resume();
+  playback.key = key;
+  playback.url = url;
+  setPlaying(url);
+  let clip;
+  try {
+    clip = await fetchClip(url);
+  } catch (e) {
+    if (playback.key === key) stopPlayback();
+    document.getElementById("error").textContent = "Playback failed: " + e.message;
     return;
   }
-  player.src = url;
-  player.play().catch(e => { document.getElementById("error").textContent = "Playback failed: " + e.message; });
-  setPlaying(url);
+  if (playback.key !== key) return; // something else was played meanwhile
+  const source = audioCtx.createBufferSource(), gain = audioCtx.createGain();
+  source.buffer = clip.buffer;
+  playback.normGain = normalizeGain(clip.buffer);
+  gain.gain.value = clipPrefs.normalize ? playback.normGain : 1;
+  source.connect(gain).connect(audioCtx.destination);
+  source.onended = () => { if (playback.source === source) stopPlayback(); };
+  Object.assign(playback, { source, gain, startedAt: audioCtx.currentTime, duration: clip.buffer.duration });
+  source.start();
+  showClipInRow(det, client);
+  playback.frame = requestAnimationFrame(movePlayhead);
 }
+
+/// Moves the red line across the playing recording's picture.
+function movePlayhead() {
+  playback.frame = requestAnimationFrame(movePlayhead);
+  const [det, client] = playback.key.split("/");
+  for (const v of document.querySelectorAll(".clip.playing")) {
+    if (v.dataset.det !== det || v.dataset.client !== client) v.classList.remove("playing");
+  }
+  const view = document.querySelector(`.clip[data-det="${det}"][data-client="${client}"]`);
+  if (!view) return;
+  const f = Math.min(1, (audioCtx.currentTime - playback.startedAt) / playback.duration);
+  view.classList.add("playing");
+  view.querySelector(".playhead").style.left = (f * 100).toFixed(2) + "%";
+}
+
+function stopPlayback() {
+  if (playback.source) {
+    playback.source.onended = null;
+    try { playback.source.stop(); } catch (e) { /* already stopped */ }
+  }
+  cancelAnimationFrame(playback.frame);
+  Object.assign(playback, { key: null, url: null, source: null, gain: null, frame: 0 });
+  for (const v of document.querySelectorAll(".clip.playing")) v.classList.remove("playing");
+  setPlaying(null);
+}
+
 function setPlaying(url) {
-  playingUrl = url;
   for (const b of document.querySelectorAll("button.play")) b.classList.toggle("playing", b.dataset.url === url);
 }
-player.addEventListener("ended", () => setPlaying(null));
+
+function renderClipControls() {
+  document.getElementById("clip-view").value = clipPrefs.view;
+  document.getElementById("clip-normalize").checked = clipPrefs.normalize;
+  document.getElementById("clip-col").textContent = clipPrefs.view === "waveform" ? "Waveform" : "Spectrogram";
+  document.getElementById("clip-help").textContent =
+    "Click a recording to play it (the clearest monitor's is shown first), or a monitor's button to hear and show its own. " +
+    (clipPrefs.view === "waveform"
+      ? "The shaded band is the identified call."
+      : "Spectrograms show 0-12 kHz, low to high; the orange bar marks the identified call.");
+}
+document.getElementById("clip-view").addEventListener("change", e => {
+  clipPrefs.view = e.target.value;
+  saveClipPrefs();
+  renderClipControls();
+  detectionsKey = "";
+  renderDetections();
+});
+document.getElementById("clip-normalize").addEventListener("change", e => {
+  clipPrefs.normalize = e.target.checked;
+  saveClipPrefs();
+  if (playback.gain) playback.gain.gain.value = clipPrefs.normalize ? playback.normGain : 1;
+});
+renderClipControls();
 
 // ---- status / banner (all pages) ----
 async function refreshStatus() {
@@ -943,15 +1246,15 @@ function renderDetections() {
     const loc = d.location;
     const dir = loc ? `${loc.cardinal} (${loc.bearing_deg.toFixed(0)}&deg;)` : "-";
     const wave = d.clips.length
-      ? `<img class="wave" width="300" height="60" loading="lazy" alt="waveform"
-           src="${API}/detections/${d.id}/waveform" onclick="play('${clipUrl(d.id, d.clips[0])}')"
-           title="Play ${esc(clientName(d.clips[0]))}">`
+      ? `<div class="clip" data-det="${d.id}" data-client="${d.clips[0]}"
+           onclick="playClip(this.dataset.det, this.dataset.client)" title="Play ${esc(clientName(d.clips[0]))}">
+           <div class="playhead"></div></div>`
       : "<small>no audio</small>";
     const heard = d.calls.map(c => {
       const name = esc(clientName(c.client_id));
       if (!d.clips.includes(c.client_id)) return name;
-      const url = clipUrl(d.id, c.client_id);
-      return `<button class="play" data-url="${url}" onclick="play('${url}')">&#9654; ${name}</button>`;
+      return `<button class="play" data-url="${clipUrl(d.id, c.client_id)}"
+        onclick="playClip('${d.id}', '${c.client_id}')">&#9654; ${name}</button>`;
     }).join(" ");
     const tag = d.unexpected ? ` <span class="tag" title="Not expected at this location">unexpected</span>` : "";
     return `<tr class="${d.unexpected ? "unexpected" : ""}">
@@ -964,7 +1267,15 @@ function renderDetections() {
       <td>${loc && loc.position ? fmtPos(loc.position, ["x", "y"]) : "-"}</td>
     </tr>`;
   }).join("");
-  setPlaying(player.paused ? null : playingUrl);
+  for (const view of document.querySelectorAll("#detections .clip")) {
+    const visual = clipVisual(view.dataset.det, view.dataset.client);
+    view.prepend(visual);
+    if (visual.tagName !== "CANVAS") continue;
+    const cached = spectroCache.get(view.dataset.det + "/" + view.dataset.client);
+    if (cached) paintSpectrogram(visual, cached);
+    else spectroObserver.observe(visual);
+  }
+  setPlaying(playback.url);
 }
 
 // Filters apply as soon as they change; typing in the search box waits for a pause.

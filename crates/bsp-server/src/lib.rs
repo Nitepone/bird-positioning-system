@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod audio_buffer;
+pub mod clip_audio;
 pub mod clock_history;
 pub mod config;
 pub mod db;
@@ -221,6 +222,19 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         "server_start",
         serde_json::json!({ "identifier": state.identifier.name() }),
     );
+
+    let maintenance = state.clone();
+    tokio::task::spawn_blocking(move || {
+        match maintenance.db.maintain(settings::ConfidenceLevel::MIN) {
+            Ok(m) if m != db::Maintenance::default() => tracing::info!(
+                detections_removed = m.detections_removed,
+                clips_converted_to_flac = m.clips_converted,
+                "database maintenance done"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!("database maintenance failed: {e:#}"),
+        }
+    });
 
     tokio::spawn(timesync::run(udp));
     tokio::spawn(pipeline::run(state.clone(), calls_rx, locator));

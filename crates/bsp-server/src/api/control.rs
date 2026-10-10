@@ -1,6 +1,7 @@
 //! Configuration and monitoring endpoints used by the web UI.
 
 use super::{ApiError, ApiResult};
+use crate::clip_audio;
 use crate::clock_history::{self, ClockReport};
 use crate::db::{ClientRecord, DetectionFilter, Event, SpeciesSeen};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
@@ -12,7 +13,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use bsp_core::audio;
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{ClientId, NANOS_PER_SEC, Timestamp, Uuid, now_ns};
@@ -341,6 +341,10 @@ async fn species_seen(State(state): State<SharedState>) -> ApiResult<Json<Vec<Sp
 /// Stored clips never change, so browsers may cache them indefinitely.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
+/// Where the identified call lies within a clip, in seconds from its start,
+/// as `start,end` (for drawing it over the clip in the browser).
+const CALL_RANGE: &str = "x-call-range";
+
 async fn detection_audio(
     State(state): State<SharedState>,
     Path((id, client)): Path<(Uuid, ClientId)>,
@@ -349,12 +353,21 @@ async fn detection_audio(
         .db
         .get_clip(id, client)?
         .ok_or_else(|| ApiError::not_found("clip"))?;
+    let call = state
+        .db
+        .get_detection(id)?
+        .and_then(|d| d.calls.into_iter().find(|c| c.client_id == client));
+    let range = call.map_or(String::new(), |c| {
+        let secs = |t: Timestamp| (t - clip.start) as f64 / NANOS_PER_SEC as f64;
+        format!("{:.3},{:.3}", secs(c.start), secs(c.end))
+    });
     Ok((
         [
-            (header::CONTENT_TYPE, "audio/wav"),
+            (header::CONTENT_TYPE, clip_audio::content_type(&clip.audio)),
             (header::CACHE_CONTROL, IMMUTABLE),
         ],
-        clip.wav,
+        [(CALL_RANGE, range)],
+        clip.audio,
     ))
 }
 
@@ -384,7 +397,7 @@ async fn detection_waveform(
         .get_clip(id, client)?
         .ok_or_else(|| ApiError::not_found("clip"))?;
     let svg = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let (sample_rate, pcm) = audio::decode_wav(&clip.wav)?;
+        let (sample_rate, pcm) = clip_audio::decode(&clip.audio)?;
         let len_ns = pcm.len() as f64 * NANOS_PER_SEC as f64 / sample_rate as f64;
         let highlight = d.calls.iter().find(|c| c.client_id == client).map(|c| {
             (

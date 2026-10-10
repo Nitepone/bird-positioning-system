@@ -45,7 +45,8 @@ On the **Config** page under **Server settings**:
   outside that list are still reported but flagged **unexpected**.
 - **Minimum confidence:** separate levels for expected and unexpected species: very high (95%),
   high (90%), medium (80%) or low (70%). The defaults are medium for expected species and high
-  for unexpected ones, so unusual species need stronger evidence.
+  for unexpected ones, so unusual species need stronger evidence. Detections below the lowest
+  level (70%) are never kept; any already in the database are removed when the server starts.
 
 Click **Save settings**. Settings are stored in the server's database.
 
@@ -123,9 +124,14 @@ data doesn't cover (non-bird classes, "Unknown bird" from the mock identifier). 
 the timeline says what is hidden. Without a site location nothing can be classified, so
 everything is shown.
 
-The **Detections** page lists individual detections, newest first, with a waveform image, the
-species, confidence and which monitors heard it. Click the waveform to play the clearest
-recording, or a monitor's button to hear its recording; the shaded band is the identified call.
+The **Detections** page lists individual detections, newest first, with a picture of the
+recording, the species, confidence and which monitors heard it. The picture is a spectrogram
+(0–12 kHz, low to high, with steady background noise flattened so calls stand out; an orange bar
+marks the identified call) or, if you choose **Show recordings as: waveform**, the waveform with
+the call shaded. Click it to play the clearest recording, or a monitor's button to hear and show
+that monitor's; a red line follows playback. **Normalize volume** (on by default) plays every
+recording at the same peak level, up to +30 dB, so quiet calls are audible; a loud non-bird sound
+in the same clip limits how much a quiet call is raised.
 Click a scientific name (dashboard tables, Detections, Config's expected-species list) to open the
 species on Wikipedia in a new tab. Filter by species name, monitor, date range, expected or unexpected species, minimum confidence,
 or detections with a direction. The filters are part of the page address, so a filtered view can
@@ -404,7 +410,9 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     `client`, `from` / `to` (ns), `unexpected`, `located`, `min_confidence`, `before`, `limit`
   - `GET /timeline?from=&to=`: compact detections for the dashboard
   - `GET /species`: every species detected so far
-  - `GET /detections/{id}/audio/{client_id}`: that client's clip as WAV
+  - `GET /detections/{id}/audio/{client_id}`: that client's clip as 16-bit FLAC (clips stored
+    before FLAC are converted when the server starts), with an `x-call-range: start,end` header
+    giving the identified call in seconds from the clip's start
   - `GET /detections/{id}/waveform[?client=]`: SVG waveform of the best (or given) clip
   - `GET /events`
   - `GET|DELETE /positioning-request`
@@ -412,7 +420,8 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 **Known limitations:**
 
 - No authentication on any endpoint.
-- Audio clips (about 1–2 s per client per detection) are kept in the database indefinitely.
+- Audio clips (about 1–2 s per client per detection, roughly 50 KB each as FLAC) are kept in the
+  database indefinitely.
 - A call that spans two chunks may be missed.
 - The direction is measured from the centre of the microphone array, so it is less accurate
   when the bird is close to the array.

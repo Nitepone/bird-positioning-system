@@ -1,8 +1,9 @@
 //! Groups calls heard by different clients into detections and runs the locator.
 
+use crate::clip_audio;
 use crate::db::Clip;
+use crate::settings::ConfidenceLevel;
 use crate::state::SharedState;
-use bsp_core::audio;
 use bsp_core::detection::Detection;
 use bsp_core::identifier::Call;
 use bsp_core::locator::{Locator, LocatorInput, MIN_MICS};
@@ -40,6 +41,12 @@ pub async fn run(
             _ = tick.tick() => {
                 for group in take_ready_groups(&mut pending, skew, now_ns() - window) {
                     let d = build_detection(&state, group, locator.clone()).await;
+                    // The identifier's thresholds normally see to this already.
+                    if d.confidence < ConfidenceLevel::MIN {
+                        tracing::debug!(species = %d.species.common, confidence = d.confidence,
+                                        "dropping low-confidence detection");
+                        continue;
+                    }
                     tracing::info!(
                         species = %d.species.common, mics = d.calls.len(),
                         bearing = ?d.location.as_ref().map(|l| l.bearing_deg), "detection"
@@ -48,7 +55,8 @@ pub async fn run(
                         tracing::error!("failed to store detection: {e}");
                         continue;
                     }
-                    store_clips(&state, &d);
+                    let state = state.clone();
+                    tokio::task::spawn_blocking(move || store_clips(&state, &d));
                 }
             }
         }
@@ -109,7 +117,7 @@ fn store_clips(state: &SharedState, d: &Detection) {
         };
         let clip = Clip {
             start,
-            wav: audio::encode_wav(sample_rate, &pcm),
+            audio: clip_audio::encode(sample_rate, &pcm),
         };
         if let Err(e) = state.db.insert_clip(d.id, call.client_id, &clip) {
             tracing::error!("failed to store clip: {e}");

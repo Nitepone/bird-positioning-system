@@ -19,7 +19,10 @@ pub enum ConfidenceLevel {
 impl ConfidenceLevel {
     pub const ALL: [Self; 4] = [Self::VeryHigh, Self::High, Self::Medium, Self::Low];
 
-    pub fn value(self) -> f32 {
+    /// Detections below the lowest level are never kept.
+    pub const MIN: f32 = Self::Low.value();
+
+    pub const fn value(self) -> f32 {
         match self {
             Self::VeryHigh => 0.95,
             Self::High => 0.90,

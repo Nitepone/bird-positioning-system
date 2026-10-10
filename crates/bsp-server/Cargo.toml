@@ -25,6 +25,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 toml = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rcgen = "0.14"
+flacenc = { version = "0.5", default-features = false }
+claxon = "0.4"
+hound.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
