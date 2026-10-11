@@ -193,59 +193,6 @@ bool bps_json_number(const char *json, size_t len, const char *key, double *out)
     return false;
 }
 
-bool bps_json_flag(const char *json, size_t len, const char *key, bool *out)
-{
-    size_t klen = strlen(key);
-    for (size_t i = 0; i + klen + 2 <= len; i++) {
-        if (json[i] != '"' || memcmp(json + i + 1, key, klen) != 0 || json[i + klen + 1] != '"')
-            continue;
-        size_t p = i + klen + 2;
-        while (p < len && (json[p] == ' ' || json[p] == ':'))
-            p++;
-        if (p + 4 <= len && memcmp(json + p, "true", 4) == 0) {
-            *out = true;
-            return true;
-        }
-        if (p + 5 <= len && memcmp(json + p, "false", 5) == 0) {
-            *out = false;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-/* ---- WAV ---- */
-
-static void le32(uint8_t *b, uint32_t v)
-{
-    for (int i = 0; i < 4; i++)
-        b[i] = (uint8_t)(v >> (8 * i));
-}
-
-static void le16(uint8_t *b, uint16_t v)
-{
-    b[0] = (uint8_t)v;
-    b[1] = (uint8_t)(v >> 8);
-}
-
-void bps_wav_header(uint8_t out[BPS_WAV_HEADER_LEN], uint32_t sample_rate, uint32_t samples)
-{
-    uint32_t data = samples * 2;
-    memcpy(out, "RIFF", 4);
-    le32(out + 4, 36 + data);
-    memcpy(out + 8, "WAVEfmt ", 8);
-    le32(out + 16, 16);
-    le16(out + 20, 1); /* PCM */
-    le16(out + 22, 1); /* mono */
-    le32(out + 24, sample_rate);
-    le32(out + 28, sample_rate * 2);
-    le16(out + 32, 2);
-    le16(out + 34, 16);
-    memcpy(out + 36, "data", 4);
-    le32(out + 40, data);
-}
-
 /* ---- UUIDs ---- */
 
 static const char MARKER[7] = {'b', 'p', 's', '-', 'm', 'c', 'u'};

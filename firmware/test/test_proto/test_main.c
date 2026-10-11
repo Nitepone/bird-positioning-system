@@ -1,4 +1,4 @@
-// HTTP framing, JSON, WAV header and UUIDs.
+// HTTP framing, JSON and UUIDs.
 #include <unity.h>
 
 #include <string.h>
@@ -27,18 +27,6 @@ static void test_http_head(void)
     TEST_ASSERT_EQUAL_STRING("POST /p HTTP/1.1\r\nHost: h:1\r\nConnection: close\r\n"
                              "Content-Type: audio/flac\r\nTransfer-Encoding: chunked\r\n\r\n",
                              b);
-}
-
-static void test_json_flag(void)
-{
-    const char *j = "{\"udp_timesync_port\": 2474, \"flac_uploads\":true, \"other\": false}";
-    bool v = false;
-    TEST_ASSERT_TRUE(bps_json_flag(j, strlen(j), "flac_uploads", &v));
-    TEST_ASSERT_TRUE(v);
-    TEST_ASSERT_TRUE(bps_json_flag(j, strlen(j), "other", &v));
-    TEST_ASSERT_FALSE(v);
-    TEST_ASSERT_FALSE(bps_json_flag(j, strlen(j), "udp_timesync_port", &v)); // not a boolean
-    TEST_ASSERT_FALSE(bps_json_flag(j, strlen(j), "missing", &v));
 }
 
 static void test_http_parse(void)
@@ -101,19 +89,6 @@ static void test_json_number(void)
     TEST_ASSERT_FALSE(bps_json_number(r, strlen(r), "missing", &v));
 }
 
-static void test_wav_header(void)
-{
-    uint8_t h[BPS_WAV_HEADER_LEN];
-    bps_wav_header(h, 48000, 432000);
-    TEST_ASSERT_EQUAL_MEMORY("RIFF", h, 4);
-    TEST_ASSERT_EQUAL_MEMORY("WAVEfmt ", h + 8, 8);
-    TEST_ASSERT_EQUAL_MEMORY("data", h + 36, 4);
-    uint32_t data = h[40] | h[41] << 8 | h[42] << 16 | (uint32_t)h[43] << 24;
-    TEST_ASSERT_EQUAL_UINT32(864000, data);
-    uint32_t rate = h[24] | h[25] << 8 | h[26] << 16 | (uint32_t)h[27] << 24;
-    TEST_ASSERT_EQUAL_UINT32(48000, rate);
-}
-
 static void test_uuids(void)
 {
     const uint8_t chip[8] = {0xe6, 0x61, 0x38, 0x52, 0x83, 0x2b, 0x4c, 0x2d};
@@ -142,8 +117,6 @@ int main(void)
     RUN_TEST(test_http_parse);
     RUN_TEST(test_json_writer);
     RUN_TEST(test_json_number);
-    RUN_TEST(test_json_flag);
-    RUN_TEST(test_wav_header);
     RUN_TEST(test_uuids);
     return UNITY_END();
 }

@@ -1,6 +1,6 @@
 /*
  * Small wire helpers: HTTP/1.1 request heads and response parsing, a JSON
- * writer plus number lookup, the WAV header, and client UUIDs.
+ * writer plus number lookup, and client UUIDs.
  */
 #ifndef BPS_PROTO_H
 #define BPS_PROTO_H
@@ -50,14 +50,6 @@ void bps_json_bool(bps_json *j, bool v);
 
 /* The number stored under `"key"` anywhere in `json` (keys must be unique). */
 bool bps_json_number(const char *json, size_t len, const char *key, double *out);
-/* The boolean stored under `"key"`, likewise. */
-bool bps_json_flag(const char *json, size_t len, const char *key, bool *out);
-
-/* ---- WAV ---- */
-
-#define BPS_WAV_HEADER_LEN 44
-/* Header of a 16-bit mono PCM WAV holding `samples` samples. */
-void bps_wav_header(uint8_t out[BPS_WAV_HEADER_LEN], uint32_t sample_rate, uint32_t samples);
 
 /* ---- UUIDs ---- */
 
