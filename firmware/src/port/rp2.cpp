@@ -6,10 +6,12 @@
 #include <I2S.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <pico/unique_id.h>
+#ifdef BPS_NET_DEBUG
 #include <lwip/priv/tcp_priv.h>
 #include <lwip/tcp.h>
 #include <lwip_wrap.h>
-#include <pico/unique_id.h>
+#endif
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -135,7 +137,9 @@ extern "C" void port_tcp_close(int h)
     tcp_used[h] = false;
 }
 
-// WiFiClient hides its lwIP connection; find it by local port.
+#ifdef BPS_NET_DEBUG
+// WiFiClient hides its lwIP connection; find it by local port. This reads
+// lwIP's private list of connections, so it may break with a core update.
 extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
 {
     if (h < 0 || h >= MAX_TCP || !tcp_used[h])
@@ -156,6 +160,7 @@ extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
     }
     return false;
 }
+#endif
 
 // ---- UDP (one socket is all the client needs) ----
 

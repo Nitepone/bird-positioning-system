@@ -42,6 +42,7 @@ int port_tcp_write(int h, const void *buf, size_t len);
 int port_tcp_read(int h, void *buf, size_t len);
 void port_tcp_close(int h);
 
+#ifdef BPS_NET_DEBUG
 /* A TCP connection's state, for diagnosing slow uploads. */
 typedef struct {
     uint32_t retransmits; /* of the oldest unacknowledged segment */
@@ -52,6 +53,7 @@ typedef struct {
 } port_tcp_stats;
 /* False where the board cannot tell. */
 bool port_tcp_get_stats(int h, port_tcp_stats *out);
+#endif
 
 int port_udp_open(const char *host, uint16_t port);
 int port_udp_send(int h, const void *buf, size_t len);

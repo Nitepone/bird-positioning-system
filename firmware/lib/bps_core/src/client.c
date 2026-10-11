@@ -21,10 +21,6 @@
 #define UPLOAD_STALL_US 5000000
 #define WIFI_RETRY_US 20000000
 #define STATUS_LOG_US 60000000
-/* Parts of the loop that take longer hold up everything else: log them. */
-#define LOOP_SLOW_US 300000
-/* Upload writes that make no progress for longer count as a stall. */
-#define UPLOAD_STALL_LOG_US 200000
 /* The server's default `max_clock_offset_us`, for the LED only. */
 #define SYNCED_ERROR_NS 2000000
 /* Kept free between the oldest sample uploaded and the ring's write position. */
@@ -79,7 +75,7 @@ static bool hb_failing;
 static struct {
     int h;
     uint32_t seq;
-    bool waiting, warned, uploading;
+    bool waiting, warned;
     int64_t t1;
     uint64_t sent_us, next_us;
 } ts = {.h = -1};
@@ -100,29 +96,13 @@ static struct {
     bps_http_response resp;
     uint64_t progress_us, deadline_us, retry_us;
     uint32_t lost; /* samples of this chunk sent as silence */
-    /* Diagnostics, logged when the upload ends. */
+    /* Logged when the upload ends. */
     struct {
         uint64_t begun_us, sent_us; /* sent_us: when the last byte was handed over */
         uint32_t connect_ms;
-        uint32_t behind_start, behind_max; /* samples between the next to send and the newest */
-        uint64_t stall_max_us, write_max_us;
-        uint32_t stalls;
-        uint64_t bytes;        /* written to the connection */
-        uint64_t encode_us;    /* FLAC encoding, in all */
-        uint32_t encode_max_us; /* the slowest frame */
-        bool tcp_seen;
-        uint32_t retransmits, nrtx, rto_max_ms, cwnd_min, wnd_min, wnd_zero;
+        uint64_t bytes; /* written to the connection */
     } d;
 } up = {.h = -1};
-
-/* Network diagnostics over one status interval. */
-#define NET_MAX_RTTS 128
-static struct {
-    uint16_t rtt_idle[NET_MAX_RTTS], rtt_up[NET_MAX_RTTS]; /* time sync round trips, 0.1 ms */
-    uint32_t n_idle, n_up, late, timeouts;
-    uint64_t part_max_us;
-    const char *part_max;
-} net;
 
 static struct {
     uint64_t chunks_sent, chunks_gated;
@@ -422,6 +402,101 @@ static void register_poll(uint64_t now)
     reg_delay_us = reg_delay_us * 2 > 30000000 ? 30000000 : reg_delay_us * 2;
 }
 
+/* ---- Network diagnostics (with BPS_NET_DEBUG) ---- */
+
+#ifdef BPS_NET_DEBUG
+/* Parts of the loop that take longer hold up everything else: log them. */
+#define LOOP_SLOW_US 300000
+#define NET_MAX_RTTS 128
+
+/* Over one status interval. */
+static struct {
+    uint16_t rtt_idle[NET_MAX_RTTS], rtt_up[NET_MAX_RTTS]; /* time sync round trips, 0.1 ms */
+    uint32_t n_idle, n_up, late, timeouts;
+    uint64_t part_max_us;
+    const char *part_max;
+} net;
+static bool net_uploading;  /* when the pending time sync request went out */
+static uint64_t net_part_us; /* when the current loop part started */
+
+static void diag_ts_sent(void) { net_uploading = up.state != UP_IDLE; }
+
+static void diag_ts_timeout(void) { net.timeouts++; }
+
+/* A reply read `wait_us` after its request went out. */
+static void diag_ts_reply(uint64_t wait_us, int64_t rtt_ns)
+{
+    /* Picked up after the wait: the round trip includes loop delay. */
+    if (wait_us > TIMESYNC_SPIN_US)
+        net.late++;
+    int64_t tenths = rtt_ns / 100000;
+    uint16_t v = (uint16_t)(tenths > UINT16_MAX ? UINT16_MAX : tenths < 0 ? 0 : tenths);
+    if (net_uploading && net.n_up < NET_MAX_RTTS)
+        net.rtt_up[net.n_up++] = v;
+    else if (!net_uploading && net.n_idle < NET_MAX_RTTS)
+        net.rtt_idle[net.n_idle++] = v;
+}
+
+static void diag_loop_start(void) { net_part_us = port_mono_us(); }
+
+/* Ends one part of the loop, noting the slowest: it holds up everything else. */
+static void diag_loop_part(const char *what)
+{
+    uint64_t us = port_mono_us() - net_part_us;
+    if (us > net.part_max_us) {
+        net.part_max_us = us;
+        net.part_max = what;
+    }
+    if (us >= LOOP_SLOW_US)
+        port_log("loop: %s took %lu ms", what, (unsigned long)(us / 1000));
+    net_part_us = port_mono_us();
+}
+
+/* "min/median/max ms (count)" of round trips in tenths of a ms. */
+static const char *rtt_summary(char *buf, size_t cap, uint16_t *v, uint32_t n)
+{
+    if (n == 0) {
+        snprintf(buf, cap, "none");
+        return buf;
+    }
+    for (uint32_t i = 1; i < n; i++)
+        for (uint32_t j = i; j > 0 && v[j - 1] > v[j]; j--) {
+            uint16_t t = v[j];
+            v[j] = v[j - 1];
+            v[j - 1] = t;
+        }
+    snprintf(buf, cap, "%u.%u/%u.%u/%u.%u ms (%lu)", v[0] / 10, v[0] % 10, v[n / 2] / 10,
+             v[n / 2] % 10, v[n - 1] / 10, v[n - 1] % 10, (unsigned long)n);
+    return buf;
+}
+
+static void diag_log_net(void)
+{
+    char idle[48], uploading[48], wifi[128];
+    port_log("net: time sync round trips idle %s, during uploads %s; %lu picked up after the %lu "
+             "ms wait, %lu unanswered; slowest loop part %s %lu ms",
+             rtt_summary(idle, sizeof idle, net.rtt_idle, net.n_idle),
+             rtt_summary(uploading, sizeof uploading, net.rtt_up, net.n_up),
+             (unsigned long)net.late, (unsigned long)(TIMESYNC_SPIN_US / 1000),
+             (unsigned long)net.timeouts, net.part_max ? net.part_max : "-",
+             (unsigned long)(net.part_max_us / 1000));
+    port_wifi_diag(wifi, sizeof wifi);
+    port_log("wifi: %s, %d dBm", wifi, port_wifi_rssi());
+    memset(&net, 0, sizeof net);
+}
+#else
+static inline void diag_ts_sent(void) {}
+static inline void diag_ts_timeout(void) {}
+static inline void diag_ts_reply(uint64_t wait_us, int64_t rtt_ns)
+{
+    (void)wait_us;
+    (void)rtt_ns;
+}
+static inline void diag_loop_start(void) {}
+static inline void diag_loop_part(const char *what) { (void)what; }
+static inline void diag_log_net(void) {}
+#endif
+
 /* ---- Clock measurement ---- */
 
 static void timesync_handle(const uint8_t *buf, int n, uint64_t at_us)
@@ -446,15 +521,7 @@ static void timesync_handle(const uint8_t *buf, int n, uint64_t at_us)
     if (!bps_ts_sample_of(&r, t4, &s))
         return;
     bps_clock_add_sample(&clk, s);
-    /* Picked up after the wait: the round trip includes loop delay. */
-    if (at_us - ts.sent_us > TIMESYNC_SPIN_US)
-        net.late++;
-    int64_t tenths = s.rtt_ns / 100000;
-    uint16_t v = (uint16_t)(tenths > UINT16_MAX ? UINT16_MAX : tenths < 0 ? 0 : tenths);
-    if (ts.uploading && net.n_up < NET_MAX_RTTS)
-        net.rtt_up[net.n_up++] = v;
-    else if (!ts.uploading && net.n_idle < NET_MAX_RTTS)
-        net.rtt_idle[net.n_idle++] = v;
+    diag_ts_reply(at_us - ts.sent_us, s.rtt_ns);
 }
 
 static bool timesync_recv(void)
@@ -477,7 +544,7 @@ static void timesync_poll(uint64_t now)
         if (ts.waiting && now - ts.sent_us > TIMESYNC_TIMEOUT_US) {
             ts.waiting = false;
             bps_clock_count_request(&clk);
-            net.timeouts++;
+            diag_ts_timeout();
             if (!ts.warned)
                 port_log("timesync: no reply from %s:%u", cfg.server_host, (unsigned)udp_port);
             ts.warned = true;
@@ -497,7 +564,7 @@ static void timesync_poll(uint64_t now)
     bps_ts_request_encode(&req, pkt);
     ts.t1 = req.t1;
     ts.sent_us = m;
-    ts.uploading = up.state != UP_IDLE;
+    diag_ts_sent();
     if (port_udp_send(ts.h, pkt, sizeof pkt) < 0)
         return;
     ts.waiting = true;
@@ -634,25 +701,97 @@ static void position_poll(uint64_t now)
 
 static unsigned long samples_ms(uint64_t n) { return (unsigned long)(n * 1000 / cfg.sample_rate); }
 
-/* Notes the connection's TCP state (where the board can tell). */
-static void upload_sample_tcp(void)
+#ifdef BPS_NET_DEBUG
+/* Upload writes that make no progress for longer count as a stall. */
+#define UPLOAD_STALL_LOG_US 200000
+
+/* More about the current upload, logged when it ends. */
+static struct {
+    uint32_t behind_start, behind_max; /* samples between the next to send and the newest */
+    uint64_t stall_max_us, write_max_us;
+    uint32_t stalls;
+    uint64_t encode_us;     /* FLAC encoding, in all */
+    uint32_t encode_max_us; /* the slowest frame */
+    bool tcp_seen;
+    uint32_t retransmits, nrtx, rto_max_ms, cwnd_min, wnd_min, wnd_zero;
+} upd;
+
+static void diag_upload_begin(void)
 {
+    memset(&upd, 0, sizeof upd);
+    upd.behind_start = upd.behind_max = (uint32_t)bps_idx_diff(bps_ring_written(&ring), up.start);
+    upd.cwnd_min = upd.wnd_min = UINT32_MAX;
+}
+
+/* Notes how far behind the upload is, and the connection's TCP state (where
+ * the board can tell). */
+static void diag_upload_pump(void)
+{
+    uint32_t behind = (uint32_t)bps_idx_diff(bps_ring_written(&ring), up.next);
+    if (behind > upd.behind_max)
+        upd.behind_max = behind;
     port_tcp_stats st;
     if (!port_tcp_get_stats(up.h, &st))
         return;
-    up.d.tcp_seen = true;
-    if (st.retransmits > up.d.nrtx) /* per segment: it restarts at 0 once acknowledged */
-        up.d.retransmits += st.retransmits - up.d.nrtx;
-    up.d.nrtx = st.retransmits;
-    if (st.rto_ms > up.d.rto_max_ms)
-        up.d.rto_max_ms = st.rto_ms;
-    if (st.cwnd < up.d.cwnd_min)
-        up.d.cwnd_min = st.cwnd;
-    if (st.peer_wnd < up.d.wnd_min)
-        up.d.wnd_min = st.peer_wnd;
+    upd.tcp_seen = true;
+    if (st.retransmits > upd.nrtx) /* per segment: it restarts at 0 once acknowledged */
+        upd.retransmits += st.retransmits - upd.nrtx;
+    upd.nrtx = st.retransmits;
+    if (st.rto_ms > upd.rto_max_ms)
+        upd.rto_max_ms = st.rto_ms;
+    if (st.cwnd < upd.cwnd_min)
+        upd.cwnd_min = st.cwnd;
+    if (st.peer_wnd < upd.wnd_min)
+        upd.wnd_min = st.peer_wnd;
     if (st.peer_wnd == 0)
-        up.d.wnd_zero++;
+        upd.wnd_zero++;
 }
+
+static void diag_upload_write(uint64_t call_us)
+{
+    if (call_us > upd.write_max_us)
+        upd.write_max_us = call_us;
+}
+
+/* A write that made progress, `gap_us` after the previous one. */
+static void diag_upload_progress(uint64_t gap_us)
+{
+    if (gap_us > upd.stall_max_us)
+        upd.stall_max_us = gap_us;
+    if (gap_us > UPLOAD_STALL_LOG_US)
+        upd.stalls++;
+}
+
+static void diag_upload_encode(uint32_t us)
+{
+    upd.encode_us += us;
+    if (us > upd.encode_max_us)
+        upd.encode_max_us = us;
+}
+
+static void diag_upload_report(void)
+{
+    port_log("upload:   behind %lu ms at start, %lu at most; %lu stalls over %lu ms, longest %lu "
+             "ms; slowest write call %lu ms; encoding %lu ms (slowest frame %lu us)",
+             samples_ms(upd.behind_start), samples_ms(upd.behind_max), (unsigned long)upd.stalls,
+             (unsigned long)(UPLOAD_STALL_LOG_US / 1000), (unsigned long)(upd.stall_max_us / 1000),
+             (unsigned long)(upd.write_max_us / 1000), (unsigned long)(upd.encode_us / 1000),
+             (unsigned long)upd.encode_max_us);
+    if (upd.tcp_seen)
+        port_log("upload:   tcp: %lu retransmits, timeout up to %lu ms, cwnd down to %lu B, server "
+                 "window down to %lu B (0 seen %lu times)",
+                 (unsigned long)upd.retransmits, (unsigned long)upd.rto_max_ms,
+                 (unsigned long)upd.cwnd_min, (unsigned long)upd.wnd_min,
+                 (unsigned long)upd.wnd_zero);
+}
+#else
+static inline void diag_upload_begin(void) {}
+static inline void diag_upload_pump(void) {}
+static inline void diag_upload_write(uint64_t call_us) { (void)call_us; }
+static inline void diag_upload_progress(uint64_t gap_us) { (void)gap_us; }
+static inline void diag_upload_encode(uint32_t us) { (void)us; }
+static inline void diag_upload_report(void) {}
+#endif
 
 /* What the upload took, to tell a slow network from a slow server or loop. */
 static void upload_report(uint64_t now, const char *outcome)
@@ -669,18 +808,7 @@ static void upload_report(uint64_t now, const char *outcome)
              outcome, samples_ms(sent), samples_ms(chunk_len), (unsigned long)(send_us / 1000), kb_s,
              (unsigned long)(cfg.sample_rate * 2 / 1000), ratio, samples_ms(up.lost),
              (unsigned long)up.d.connect_ms, answer);
-    port_log("upload:   behind %lu ms at start, %lu at most; %lu stalls over %lu ms, longest %lu "
-             "ms; slowest write call %lu ms; encoding %lu ms (slowest frame %lu us)",
-             samples_ms(up.d.behind_start), samples_ms(up.d.behind_max),
-             (unsigned long)up.d.stalls, (unsigned long)(UPLOAD_STALL_LOG_US / 1000),
-             (unsigned long)(up.d.stall_max_us / 1000), (unsigned long)(up.d.write_max_us / 1000),
-             (unsigned long)(up.d.encode_us / 1000), (unsigned long)up.d.encode_max_us);
-    if (up.d.tcp_seen)
-        port_log("upload:   tcp: %lu retransmits, timeout up to %lu ms, cwnd down to %lu B, server "
-                 "window down to %lu B (0 seen %lu times)",
-                 (unsigned long)up.d.retransmits, (unsigned long)up.d.rto_max_ms,
-                 (unsigned long)up.d.cwnd_min, (unsigned long)up.d.wnd_min,
-                 (unsigned long)up.d.wnd_zero);
+    diag_upload_report();
 }
 
 static void upload_finish(void)
@@ -766,8 +894,6 @@ static void upload_begin(uint32_t start, uint64_t now)
     memset(&up.d, 0, sizeof up.d);
     up.d.begun_us = now;
     up.d.connect_ms = (uint32_t)((port_mono_us() - t0) / 1000);
-    up.d.behind_start = up.d.behind_max = (uint32_t)bps_idx_diff(bps_ring_written(&ring), start);
-    up.d.cwnd_min = up.d.wnd_min = UINT32_MAX;
     up.start = start;
     up.end = start + chunk_len;
     up.next = start;
@@ -776,6 +902,7 @@ static void upload_begin(uint32_t start, uint64_t now)
     up.rx_len = 0;
     up.progress_us = now;
     up.state = UP_SEND;
+    diag_upload_begin();
 }
 
 /* Reads `n` samples from `up.next`. Any already overwritten (the network
@@ -822,10 +949,7 @@ static int upload_refill(void)
     up.off = 0;
     uint64_t t0 = port_mono_us();
     size_t n = bps_flac_frame(up.buf + 6, up.pcm, want, up.frame++, cfg.sample_rate);
-    uint32_t took = (uint32_t)(port_mono_us() - t0);
-    up.d.encode_us += took;
-    if (took > up.d.encode_max_us)
-        up.d.encode_max_us = took;
+    diag_upload_encode((uint32_t)(port_mono_us() - t0));
     put_chunk_size(up.buf, n);
     memcpy(up.buf + 6 + n, "\r\n", 2);
     up.len = 6 + n + 2;
@@ -838,10 +962,7 @@ static int upload_refill(void)
 
 static void upload_pump(uint64_t now)
 {
-    upload_sample_tcp();
-    uint32_t behind = (uint32_t)bps_idx_diff(bps_ring_written(&ring), up.next);
-    if (behind > up.d.behind_max)
-        up.d.behind_max = behind;
+    diag_upload_pump();
     for (int i = 0; i < 16; i++) {
         if (up.off == up.len) {
             if (up.next == up.end) {
@@ -860,9 +981,7 @@ static void upload_pump(uint64_t now)
         }
         uint64_t t0 = port_mono_us();
         int n = port_tcp_write(up.h, up.buf + up.off, up.len - up.off);
-        uint64_t t1 = port_mono_us();
-        if (t1 - t0 > up.d.write_max_us)
-            up.d.write_max_us = t1 - t0;
+        diag_upload_write(port_mono_us() - t0);
         if (n < 0) {
             upload_abort("connection lost");
             return;
@@ -871,11 +990,7 @@ static void upload_pump(uint64_t now)
             break;
         up.off += (size_t)n;
         up.d.bytes += (uint64_t)n;
-        uint64_t gap = now - up.progress_us;
-        if (gap > up.d.stall_max_us)
-            up.d.stall_max_us = gap;
-        if (gap > UPLOAD_STALL_LOG_US)
-            up.d.stalls++;
+        diag_upload_progress(now - up.progress_us);
         up.progress_us = now;
     }
     if (now - up.progress_us > UPLOAD_STALL_US)
@@ -982,53 +1097,6 @@ static void update_led(uint64_t now)
     }
 }
 
-/* Runs one part of the loop, noting the slowest: it holds up everything else. */
-static void run_part(const char *what, void (*part)(uint64_t), uint64_t now)
-{
-    uint64_t t0 = port_mono_us();
-    part(now);
-    uint64_t us = port_mono_us() - t0;
-    if (us > net.part_max_us) {
-        net.part_max_us = us;
-        net.part_max = what;
-    }
-    if (us >= LOOP_SLOW_US)
-        port_log("loop: %s took %lu ms", what, (unsigned long)(us / 1000));
-}
-
-/* "min/median/max ms (count)" of round trips in tenths of a ms. */
-static const char *rtt_summary(char *buf, size_t cap, uint16_t *v, uint32_t n)
-{
-    if (n == 0) {
-        snprintf(buf, cap, "none");
-        return buf;
-    }
-    for (uint32_t i = 1; i < n; i++)
-        for (uint32_t j = i; j > 0 && v[j - 1] > v[j]; j--) {
-            uint16_t t = v[j];
-            v[j] = v[j - 1];
-            v[j - 1] = t;
-        }
-    snprintf(buf, cap, "%u.%u/%u.%u/%u.%u ms (%lu)", v[0] / 10, v[0] % 10, v[n / 2] / 10,
-             v[n / 2] % 10, v[n - 1] / 10, v[n - 1] % 10, (unsigned long)n);
-    return buf;
-}
-
-static void log_net(void)
-{
-    char idle[48], uploading[48], wifi[128];
-    port_log("net: time sync round trips idle %s, during uploads %s; %lu picked up after the %lu "
-             "ms wait, %lu unanswered; slowest loop part %s %lu ms",
-             rtt_summary(idle, sizeof idle, net.rtt_idle, net.n_idle),
-             rtt_summary(uploading, sizeof uploading, net.rtt_up, net.n_up),
-             (unsigned long)net.late, (unsigned long)(TIMESYNC_SPIN_US / 1000),
-             (unsigned long)net.timeouts, net.part_max ? net.part_max : "-",
-             (unsigned long)(net.part_max_us / 1000));
-    port_wifi_diag(wifi, sizeof wifi);
-    port_log("wifi: %s, %d dBm", wifi, port_wifi_rssi());
-    memset(&net, 0, sizeof net);
-}
-
 static void log_status(uint64_t now)
 {
     /* The lowest free heap seen, sampled once a second (a falling value means a leak). */
@@ -1064,7 +1132,7 @@ static void log_status(uint64_t now)
              (unsigned long)dropouts_total(), (unsigned long)port_free_heap(),
              (unsigned long)heap_low);
     if (state == ST_RUN)
-        log_net();
+        diag_log_net();
 }
 
 /* ---- Entry points ---- */
@@ -1116,10 +1184,15 @@ void bps_client_loop(void)
         register_poll(now);
         break;
     case ST_RUN:
-        run_part("time sync", timesync_poll, now);
-        run_part("heartbeat", heartbeat_poll, now);
-        run_part("positioning", position_poll, now);
-        run_part("upload", upload_poll, now);
+        diag_loop_start();
+        timesync_poll(now);
+        diag_loop_part("time sync");
+        heartbeat_poll(now);
+        diag_loop_part("heartbeat");
+        position_poll(now);
+        diag_loop_part("positioning");
+        upload_poll(now);
+        diag_loop_part("upload");
         count_gated();
         if (need_register) {
             need_register = false;

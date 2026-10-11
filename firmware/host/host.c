@@ -141,12 +141,14 @@ void port_tcp_close(int h)
         close(h);
 }
 
+#ifdef BPS_NET_DEBUG
 bool port_tcp_get_stats(int h, port_tcp_stats *out)
 {
     (void)h;
     (void)out;
     return false;
 }
+#endif
 
 int port_udp_open(const char *host, uint16_t port)
 {

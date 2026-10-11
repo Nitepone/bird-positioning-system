@@ -138,12 +138,14 @@ extern "C" void port_tcp_close(int h)
         close(h);
 }
 
+#ifdef BPS_NET_DEBUG
 extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
 {
     (void)h;
     (void)out;
     return false; // lwIP's internals belong to its own task here
 }
+#endif
 
 extern "C" int port_udp_open(const char *host, uint16_t port)
 {
