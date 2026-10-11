@@ -12,9 +12,12 @@
 
 /* ---- HTTP ---- */
 
+/* `content_len` for a body sent in chunks (Transfer-Encoding: chunked). */
+#define BPS_HTTP_CHUNKED ((size_t)-1)
+
 /* Writes a request head (with `Connection: close`) for a body of
- * `content_len` bytes; `extra` is NULL or more header lines, each ending in
- * "\r\n". Returns its length, or 0 if it did not fit. */
+ * `content_len` bytes, or BPS_HTTP_CHUNKED; `extra` is NULL or more header
+ * lines, each ending in "\r\n". Returns its length, or 0 if it did not fit. */
 size_t bps_http_head(char *out, size_t cap, const char *method, const char *host, uint16_t port,
                      const char *path, const char *content_type, size_t content_len,
                      const char *extra);
@@ -47,6 +50,8 @@ void bps_json_bool(bps_json *j, bool v);
 
 /* The number stored under `"key"` anywhere in `json` (keys must be unique). */
 bool bps_json_number(const char *json, size_t len, const char *key, double *out);
+/* The boolean stored under `"key"`, likewise. */
+bool bps_json_flag(const char *json, size_t len, const char *key, bool *out);
 
 /* ---- WAV ---- */
 

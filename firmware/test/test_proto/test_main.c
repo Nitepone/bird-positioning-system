@@ -23,6 +23,22 @@ static void test_http_head(void)
                              "Content-Length: 0\r\n\r\n",
                              b);
     TEST_ASSERT_EQUAL_size_t(0, bps_http_head(b, 20, "POST", "h", 1, "/p", NULL, 0, NULL));
+    n = bps_http_head(b, sizeof b, "POST", "h", 1, "/p", "audio/flac", BPS_HTTP_CHUNKED, NULL);
+    TEST_ASSERT_EQUAL_STRING("POST /p HTTP/1.1\r\nHost: h:1\r\nConnection: close\r\n"
+                             "Content-Type: audio/flac\r\nTransfer-Encoding: chunked\r\n\r\n",
+                             b);
+}
+
+static void test_json_flag(void)
+{
+    const char *j = "{\"udp_timesync_port\": 2474, \"flac_uploads\":true, \"other\": false}";
+    bool v = false;
+    TEST_ASSERT_TRUE(bps_json_flag(j, strlen(j), "flac_uploads", &v));
+    TEST_ASSERT_TRUE(v);
+    TEST_ASSERT_TRUE(bps_json_flag(j, strlen(j), "other", &v));
+    TEST_ASSERT_FALSE(v);
+    TEST_ASSERT_FALSE(bps_json_flag(j, strlen(j), "udp_timesync_port", &v)); // not a boolean
+    TEST_ASSERT_FALSE(bps_json_flag(j, strlen(j), "missing", &v));
 }
 
 static void test_http_parse(void)
@@ -126,6 +142,7 @@ int main(void)
     RUN_TEST(test_http_parse);
     RUN_TEST(test_json_writer);
     RUN_TEST(test_json_number);
+    RUN_TEST(test_json_flag);
     RUN_TEST(test_wav_header);
     RUN_TEST(test_uuids);
     return UNITY_END();

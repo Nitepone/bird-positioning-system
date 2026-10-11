@@ -1,6 +1,7 @@
 //! Endpoints used by client devices.
 
 use super::{ApiError, ApiResult};
+use crate::clip_audio;
 use crate::clock_history::ClockReport;
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
@@ -9,7 +10,7 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use bsp_core::audio::{self, AudioSample};
+use bsp_core::audio::AudioSample;
 use bsp_proto::{
     AudioAccepted, ClientId, HEADER_START_NS, Heartbeat, NANOS_PER_SEC, RegisterRequest,
     RegisterResponse, now_ns,
@@ -47,6 +48,7 @@ async fn register(
         heartbeat_interval_s: d.heartbeat_interval_s,
         chunk_secs: d.chunk_secs,
         gate: d.gate.clone(),
+        flac_uploads: true,
     }))
 }
 
@@ -134,7 +136,8 @@ async fn upload_audio(
         return Err(ApiError::not_found("client"));
     }
     let bytes = body.len();
-    let (sample_rate, pcm) = tokio::task::spawn_blocking(move || audio::decode_wav(&body))
+    // WAV, or FLAC from clients that compress (sent with chunked encoding).
+    let (sample_rate, pcm) = tokio::task::spawn_blocking(move || clip_audio::decode(&body))
         .await?
         .map_err(ApiError::bad_request)?;
     let sample = AudioSample {

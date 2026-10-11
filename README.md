@@ -390,9 +390,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 **APIs:**
 
 - Client endpoints, under `/api/v1/client`:
-  - `POST /register`
+  - `POST /register`: the response's `flac_uploads` says whether the server takes FLAC uploads
   - `POST /{id}/heartbeat`
-  - `POST /{id}/audio`: WAV body plus an `x-bsp-start-ns` header
+  - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
+    client sends FLAC, about a quarter the size, with chunked encoding when the server allows it)
   - `POST /{id}/position-request`
   - `GET /timesync`: WebSocket carrying the UDP clock-measurement packets (for browser clients)
 - Clock measurement: UDP on port 2473.

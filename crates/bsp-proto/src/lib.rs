@@ -83,6 +83,10 @@ pub struct RegisterResponse {
     pub heartbeat_interval_s: u32,
     pub chunk_secs: f32,
     pub gate: GateConfig,
+    /// The server accepts audio uploads as FLAC as well as WAV. Older
+    /// servers leave it out, and clients then send WAV.
+    #[serde(default)]
+    pub flac_uploads: bool,
 }
 
 /// Result of the client's clock measurement against the server.

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "capture.h"
+#include "flac.h"
 #include "port.h"
 #include "proto.h"
 #include "ring.h"
@@ -71,6 +72,7 @@ static bool capturing;
 
 /* From the latest registration. */
 static uint16_t udp_port;
+static bool flac_uploads; /* the server takes FLAC */
 static uint64_t hb_interval_us;
 static uint32_t chunk_len, lookback;
 static bps_gate_config gate_cfg;
@@ -92,10 +94,13 @@ static struct {
     uint32_t start, end, next, segs;
     bool has_prev;
     uint32_t prev_end;
-    union { /* samples are read from the ring straight into the send buffer */
-        uint8_t buf[1460];
-        int16_t pcm[730];
-    };
+    bool flac;
+    uint32_t frame; /* FLAC frames sent */
+    int16_t pcm[BPS_FLAC_BLOCK];
+    /* The request head, or a FLAC frame as one HTTP chunk: size line, frame,
+     * CRLF, and after the last frame the closing empty chunk. */
+    uint8_t buf[6 + BPS_FLAC_MAX_FRAME + 2 + 5];
+    const uint8_t *src; /* what is being sent: `buf`, or WAV samples in `pcm` */
     size_t len, off;
     char rx[256];
     size_t rx_len;
@@ -109,6 +114,9 @@ static struct {
         uint32_t behind_start, behind_max; /* samples between the next to send and the newest */
         uint64_t stall_max_us, write_max_us;
         uint32_t stalls;
+        uint64_t bytes;        /* written to the connection */
+        uint64_t encode_us;    /* FLAC encoding, in all */
+        uint32_t encode_max_us; /* the slowest frame */
         bool tcp_seen;
         uint32_t retransmits, nrtx, rto_max_ms, cwnd_min, wnd_min, wnd_zero;
     } d;
@@ -344,6 +352,8 @@ static bool apply_registration(void)
         return false;
     udp_port = (uint16_t)port;
     hb_interval_us = (uint64_t)(hb < 1 ? 1 : hb) * 1000000;
+    bool flac = false;
+    flac_uploads = bps_json_flag(body, len, "flac_uploads", &flac) && flac;
     /* The gate settings and chunk length apply from the first registration on. */
     if (!capturing) {
         chunk_len = (uint32_t)(chunk * cfg.sample_rate);
@@ -405,7 +415,8 @@ static void register_poll(uint64_t now)
     int status = reg_txn.state == TXN_DONE ? reg_txn.resp.status : 0;
     txn_reset(&reg_txn);
     if (ok) {
-        port_log("registered with %s:%u as %s", cfg.server_host, (unsigned)cfg.server_port, id_str);
+        port_log("registered with %s:%u as %s; uploads as %s", cfg.server_host,
+                 (unsigned)cfg.server_port, id_str, flac_uploads ? "FLAC" : "WAV");
         reg_delay_us = 1000000;
         start_run(now);
         return;
@@ -657,20 +668,29 @@ static void upload_report(uint64_t now, const char *outcome)
 {
     uint32_t sent = up.next - up.start;
     uint64_t send_us = (up.d.sent_us ? up.d.sent_us : now) - up.d.begun_us;
-    unsigned long kb_s = send_us ? (unsigned long)((uint64_t)sent * 2000 / send_us) : 0;
-    char answer[32] = "-";
+    unsigned long kb_s = send_us ? (unsigned long)(up.d.bytes * 1000 / send_us) : 0;
+    char answer[32] = "-", format[32] = "WAV", ratio[16];
     if (up.d.sent_us)
         snprintf(answer, sizeof answer, "%lu ms", (unsigned long)((now - up.d.sent_us) / 1000));
-    port_log("upload: %s: %lu of %lu ms of audio in %lu ms (%lu KB/s; real time is %lu), %lu ms "
-             "lost; connect %lu ms, server answered in %s",
+    if (up.flac)
+        snprintf(format, sizeof format, "FLAC %s:1",
+                 centi(ratio, sizeof ratio,
+                       up.d.bytes ? (int32_t)((uint64_t)sent * 200 / up.d.bytes) : 0));
+    port_log("upload: %s: %lu of %lu ms of audio in %lu ms (%lu KB/s sent, real time is %lu; %s), "
+             "%lu ms lost; connect %lu ms, server answered in %s",
              outcome, samples_ms(sent), samples_ms(chunk_len), (unsigned long)(send_us / 1000), kb_s,
-             (unsigned long)(cfg.sample_rate * 2 / 1000), samples_ms(up.lost),
+             (unsigned long)(cfg.sample_rate * 2 / 1000), format, samples_ms(up.lost),
              (unsigned long)up.d.connect_ms, answer);
+    char encode[64] = "";
+    if (up.flac)
+        snprintf(encode, sizeof encode, "; encoding %lu ms (slowest frame %lu us)",
+                 (unsigned long)(up.d.encode_us / 1000), (unsigned long)up.d.encode_max_us);
     port_log("upload:   behind %lu ms at start, %lu at most; %lu stalls over %lu ms, longest %lu "
-             "ms; slowest write call %lu ms",
+             "ms; slowest write call %lu ms%s",
              samples_ms(up.d.behind_start), samples_ms(up.d.behind_max),
              (unsigned long)up.d.stalls, (unsigned long)(UPLOAD_STALL_LOG_US / 1000),
-             (unsigned long)(up.d.stall_max_us / 1000), (unsigned long)(up.d.write_max_us / 1000));
+             (unsigned long)(up.d.stall_max_us / 1000), (unsigned long)(up.d.write_max_us / 1000),
+             encode);
     if (up.d.tcp_seen)
         port_log("upload:   tcp: %lu retransmits, timeout up to %lu ms, cwnd down to %lu B, server "
                  "window down to %lu B (0 seen %lu times)",
@@ -696,6 +716,17 @@ static void upload_abort(const char *why)
     upload_report(now, outcome);
     up.prev_end = up.next;
     upload_finish();
+}
+
+/* An HTTP chunk's size line, always 6 bytes ("%04X\r\n"; leading zeros are
+ * allowed), so it can go in front of data already in place. */
+static void put_chunk_size(uint8_t *out, size_t n)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 4; i++)
+        out[i] = (uint8_t)hex[(n >> (12 - 4 * i)) & 0xf];
+    out[4] = '\r';
+    out[5] = '\n';
 }
 
 /* Starts uploading `chunk_len` samples from ring index `start`. */
@@ -729,14 +760,28 @@ static void upload_begin(uint32_t start, uint64_t now)
     bps_json_i64(&x, start_ns);
     bps_json_raw(&x, "\r\n");
     path_for(path, sizeof path, "audio");
-    size_t head = bps_http_head((char *)up.buf, sizeof up.buf - BPS_WAV_HEADER_LEN, "POST",
-                                cfg.server_host, cfg.server_port, path, "audio/wav",
-                                BPS_WAV_HEADER_LEN + 2 * (size_t)chunk_len, extra);
+    /* FLAC's size is not known ahead: send it in chunks, one per frame. */
+    up.flac = flac_uploads;
+    size_t room = sizeof up.buf - (up.flac ? 6 + BPS_FLAC_HEADER_LEN + 2 : BPS_WAV_HEADER_LEN);
+    size_t head = bps_http_head((char *)up.buf, room, "POST", cfg.server_host, cfg.server_port,
+                                path, up.flac ? "audio/flac" : "audio/wav",
+                                up.flac ? BPS_HTTP_CHUNKED
+                                        : BPS_WAV_HEADER_LEN + 2 * (size_t)chunk_len,
+                                extra);
     if (!head)
         return;
-    bps_wav_header(up.buf + head, cfg.sample_rate, chunk_len);
-    up.len = head + BPS_WAV_HEADER_LEN;
+    if (up.flac) {
+        put_chunk_size(up.buf + head, BPS_FLAC_HEADER_LEN);
+        bps_flac_header(up.buf + head + 6, cfg.sample_rate, chunk_len);
+        memcpy(up.buf + head + 6 + BPS_FLAC_HEADER_LEN, "\r\n", 2);
+        up.len = head + 6 + BPS_FLAC_HEADER_LEN + 2;
+    } else {
+        bps_wav_header(up.buf + head, cfg.sample_rate, chunk_len);
+        up.len = head + BPS_WAV_HEADER_LEN;
+    }
+    up.src = up.buf;
     up.off = 0;
+    up.frame = 0;
     uint64_t t0 = port_mono_us();
     up.h = connect_server("an upload");
     if (up.h < 0) {
@@ -759,6 +804,75 @@ static void upload_begin(uint32_t start, uint64_t now)
     up.state = UP_SEND;
 }
 
+/* Reads `n` samples from `up.next`. Any already overwritten (the network
+ * stalled for longer than the ring holds) are sent as silence: the chunk keeps
+ * its length and every later sample its exact time (the server zero-fills
+ * gaps in a client's audio the same way). False if the capture core kept
+ * overtaking the read. */
+static bool upload_read(int16_t *out, uint32_t n)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        int32_t gone = bps_idx_diff(bps_ring_oldest(&ring), up.next);
+        uint32_t zeros = gone <= 0 ? 0 : (uint32_t)gone < n ? (uint32_t)gone : n;
+        if (zeros == n || bps_ring_read(&ring, up.next + zeros, out + zeros, n - zeros)) {
+            memset(out, 0, zeros * sizeof *out);
+            up.lost += zeros;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Puts the next piece of audio in the send buffer: 1 if it did, 0 if the
+ * audio is not captured yet, -1 if the upload was aborted. */
+static int upload_refill(void)
+{
+    uint32_t left = up.end - up.next;
+    uint32_t want = left < BPS_FLAC_BLOCK ? left : BPS_FLAC_BLOCK;
+    int32_t avail = bps_idx_diff(bps_ring_written(&ring), up.next);
+    /* A FLAC frame needs all its samples; WAV sends what there is. */
+    if (avail <= 0 || (up.flac && (uint32_t)avail < want))
+        return 0;
+    if (!up.flac && (uint32_t)avail < want)
+        want = (uint32_t)avail;
+    if (LOAD(&ring.n_segs) != up.segs) {
+        int64_t t;
+        bool has_next;
+        uint32_t nx;
+        if (!bps_ring_locate(&ring, up.start, &t, &has_next, &nx) ||
+            (has_next && bps_idx_diff(nx, up.end) < 0)) {
+            upload_abort("capture timeline jumped");
+            return -1;
+        }
+        up.segs = LOAD(&ring.n_segs);
+    }
+    if (!upload_read(up.pcm, want))
+        return 0;
+    up.next += want;
+    up.off = 0;
+    if (!up.flac) {
+        /* WAV is little-endian, like every chip this runs on. */
+        up.src = (const uint8_t *)up.pcm;
+        up.len = 2 * (size_t)want;
+        return 1;
+    }
+    uint64_t t0 = port_mono_us();
+    size_t n = bps_flac_frame(up.buf + 6, up.pcm, want, up.frame++, cfg.sample_rate);
+    uint32_t took = (uint32_t)(port_mono_us() - t0);
+    up.d.encode_us += took;
+    if (took > up.d.encode_max_us)
+        up.d.encode_max_us = took;
+    put_chunk_size(up.buf, n);
+    memcpy(up.buf + 6 + n, "\r\n", 2);
+    up.len = 6 + n + 2;
+    if (up.next == up.end) {
+        memcpy(up.buf + up.len, "0\r\n\r\n", 5); /* the body ends */
+        up.len += 5;
+    }
+    up.src = up.buf;
+    return 1;
+}
+
 static void upload_pump(uint64_t now)
 {
     upload_sample_tcp();
@@ -775,45 +889,14 @@ static void upload_pump(uint64_t now)
                 up.deadline_us = now + TXN_TIMEOUT_US;
                 return;
             }
-            int32_t avail = bps_idx_diff(bps_ring_written(&ring), up.next);
-            if (avail <= 0)
+            int r = upload_refill();
+            if (r < 0)
+                return;
+            if (r == 0)
                 break;
-            uint32_t k = sizeof up.buf / 2;
-            if ((uint32_t)avail < k)
-                k = (uint32_t)avail;
-            if (up.end - up.next < k)
-                k = up.end - up.next;
-            if (LOAD(&ring.n_segs) != up.segs) {
-                int64_t t;
-                bool has_next;
-                uint32_t nx;
-                if (!bps_ring_locate(&ring, up.start, &t, &has_next, &nx) ||
-                    (has_next && bps_idx_diff(nx, up.end) < 0)) {
-                    upload_abort("capture timeline jumped");
-                    return;
-                }
-                up.segs = LOAD(&ring.n_segs);
-            }
-            /* WAV is little-endian, like every chip this runs on. */
-            if (!bps_ring_read(&ring, up.next, up.pcm, k)) {
-                /* The network stalled for longer than the ring holds. Send
-                 * the lost stretch as silence: the chunk keeps its length and
-                 * every later sample its exact time (the server zero-fills
-                 * gaps in a client's audio the same way). */
-                int32_t lost = bps_idx_diff(bps_ring_oldest(&ring), up.next);
-                if (lost <= 0)
-                    break; /* raced the capture core; try again */
-                if ((uint32_t)lost < k)
-                    k = (uint32_t)lost;
-                memset(up.pcm, 0, k * sizeof up.pcm[0]);
-                up.lost += k;
-            }
-            up.len = 2 * k;
-            up.off = 0;
-            up.next += k;
         }
         uint64_t t0 = port_mono_us();
-        int n = port_tcp_write(up.h, up.buf + up.off, up.len - up.off);
+        int n = port_tcp_write(up.h, up.src + up.off, up.len - up.off);
         uint64_t t1 = port_mono_us();
         if (t1 - t0 > up.d.write_max_us)
             up.d.write_max_us = t1 - t0;
@@ -824,6 +907,7 @@ static void upload_pump(uint64_t now)
         if (n == 0)
             break;
         up.off += (size_t)n;
+        up.d.bytes += (uint64_t)n;
         uint64_t gap = now - up.progress_us;
         if (gap > up.d.stall_max_us)
             up.d.stall_max_us = gap;

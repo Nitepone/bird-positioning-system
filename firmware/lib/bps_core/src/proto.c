@@ -11,12 +11,17 @@ size_t bps_http_head(char *out, size_t cap, const char *method, const char *host
                      const char *path, const char *content_type, size_t content_len,
                      const char *extra)
 {
+    char length[40];
+    if (content_len == BPS_HTTP_CHUNKED)
+        snprintf(length, sizeof length, "Transfer-Encoding: chunked\r\n");
+    else
+        snprintf(length, sizeof length, "Content-Length: %lu\r\n", (unsigned long)content_len);
     int n = snprintf(out, cap,
                      "%s %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\n"
-                     "%s%s%sContent-Length: %lu\r\n%s\r\n",
+                     "%s%s%s%s%s\r\n",
                      method, path, host, (unsigned)port, content_type ? "Content-Type: " : "",
-                     content_type ? content_type : "", content_type ? "\r\n" : "",
-                     (unsigned long)content_len, extra ? extra : "");
+                     content_type ? content_type : "", content_type ? "\r\n" : "", length,
+                     extra ? extra : "");
     return n > 0 && (size_t)n < cap ? (size_t)n : 0;
 }
 
@@ -184,6 +189,28 @@ bool bps_json_number(const char *json, size_t len, const char *key, double *out)
         char *end;
         *out = strtod(num, &end);
         return end != num;
+    }
+    return false;
+}
+
+bool bps_json_flag(const char *json, size_t len, const char *key, bool *out)
+{
+    size_t klen = strlen(key);
+    for (size_t i = 0; i + klen + 2 <= len; i++) {
+        if (json[i] != '"' || memcmp(json + i + 1, key, klen) != 0 || json[i + klen + 1] != '"')
+            continue;
+        size_t p = i + klen + 2;
+        while (p < len && (json[p] == ' ' || json[p] == ':'))
+            p++;
+        if (p + 4 <= len && memcmp(json + p, "true", 4) == 0) {
+            *out = true;
+            return true;
+        }
+        if (p + 5 <= len && memcmp(json + p, "false", 5) == 0) {
+            *out = false;
+            return true;
+        }
+        return false;
     }
     return false;
 }
