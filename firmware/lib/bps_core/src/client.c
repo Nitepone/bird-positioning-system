@@ -970,7 +970,10 @@ static void upload_poll(uint64_t now)
     upload_begin(start, now);
 }
 
-/* Silent stretches count as gated chunks, so the stats compare with bsp-client's. */
+/* Silent stretches count as gated chunks, so the stats compare with bsp-client's.
+ * Each is corrected too, as bsp-client corrects before gating: the clock status
+ * then describes the latest chunk, not one sent hours ago, which the current
+ * fit (a minute of measurements) cannot be extrapolated back to. */
 static void count_gated(void)
 {
     if (up.state != UP_IDLE || chunk_len == 0) {
@@ -979,6 +982,12 @@ static void count_gated(void)
     }
     uint32_t w = bps_ring_written(&ring);
     while (bps_idx_diff(w, stats.idle_mark) >= (int32_t)chunk_len) {
+        int64_t mono_ts;
+        bool has_next;
+        uint32_t next_idx;
+        if (bps_ring_locate(&ring, stats.idle_mark, &mono_ts, &has_next, &next_idx))
+            bps_clock_correct(&clk, mono_ts + epoch_ns,
+                              bps_samples_to_ns(chunk_len, cfg.sample_rate));
         stats.chunks_gated++;
         stats.idle_mark += chunk_len;
     }
