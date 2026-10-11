@@ -169,6 +169,15 @@ find_bootsel_drive() {
     for d in /media/"$USER"/{RPI-RP2,RP2350} /run/media/"$USER"/{RPI-RP2,RP2350}; do
         [[ -d $d ]] && { echo "$d"; return; }
     done
+    # Without a desktop, nothing mounts the drive: do it here.
+    local label dev
+    for label in RPI-RP2 RP2350; do
+        dev=/dev/disk/by-label/$label
+        if [[ -e $dev ]] && command -v udisksctl >/dev/null; then
+            udisksctl mount -b "$dev" >/dev/null 2>&1 || true
+            d=$(findmnt -nro TARGET "$dev") && { echo "$d"; return; }
+        fi
+    done
     return 1
 }
 
