@@ -28,9 +28,10 @@ static void on_frame(void *ctx, size_t end, const bps_gate_frame *f)
     STORE(&c->pass_count, c->pass_count + 1);
 }
 
-static int32_t to_cdb(double sum, uint32_t n)
+/* Level of `n` 16-bit samples whose squares add up to `sum`. */
+static int32_t to_cdb(uint64_t sum, uint32_t n)
 {
-    double rms = sqrt(sum / (n ? n : 1));
+    double rms = sqrt((double)sum / (n ? n : 1)) / 32768.0;
     return (int32_t)lround(2000.0 * log10(rms > 1e-9 ? rms : 1e-9));
 }
 
@@ -60,10 +61,11 @@ static void process(bps_capture *c, const int32_t *lr, size_t frames, uint64_t r
     }
     c->frames += frames;
     if (c->level_frames < 2 * c->sample_rate) {
+        /* In integers (the RP2040 has no FPU), from the top 16 bits as uploaded. */
         for (size_t i = 0; i < frames; i++)
             for (int ch = 0; ch < 2; ch++) {
-                double x = lr[2 * i + ch] / 2147483648.0;
-                c->level_sum[ch] += x * x;
+                int32_t x = lr[2 * i + ch] >> 16;
+                c->level_sum[ch] += (uint32_t)(x * x);
             }
         c->level_frames += (uint32_t)frames;
         if (c->level_frames >= 2 * c->sample_rate) {

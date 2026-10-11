@@ -324,7 +324,7 @@ static bool apply_registration(void)
         !bps_json_number(body, len, "chunk_secs", &chunk))
         return false;
     udp_port = (uint16_t)port;
-    hb_interval_us = (uint64_t)(hb < 1 ? 1 : hb) * 1000000;
+    hb_interval_us = (uint64_t)((hb < 1 ? 1 : hb) * 1e6);
     /* The gate settings and chunk length apply from the first registration on. */
     if (!capturing) {
         chunk_len = (uint32_t)(chunk * cfg.sample_rate);

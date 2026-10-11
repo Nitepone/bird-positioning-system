@@ -34,7 +34,7 @@ typedef struct {
     bool started;
     int64_t first_est;
     uint64_t frames;
-    double level_sum[2];
+    uint64_t level_sum[2]; /* squares of the top 16 bits */
     uint32_t level_frames;
     uint32_t block_start; /* ring index of the block being gated */
     int16_t pcm[BPS_CAPTURE_MAX_FRAMES]; /* not on core 1's 2 KB stack */
