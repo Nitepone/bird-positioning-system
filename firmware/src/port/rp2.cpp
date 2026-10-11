@@ -6,12 +6,17 @@
 #include <I2S.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <lwip/priv/tcp_priv.h>
+#include <lwip/tcp.h>
+#include <lwip_wrap.h>
 #include <pico/unique_id.h>
 
 #include <stdarg.h>
 #include <stdio.h>
 
 extern "C" {
+#include <cyw43.h>
+
 #include "capture.h"
 #include "port.h"
 }
@@ -64,6 +69,22 @@ extern "C" bool port_wifi_up(void)
 
 extern "C" int port_wifi_rssi(void) { return (int)WiFi.RSSI(); }
 
+extern "C" void port_wifi_diag(char *out, size_t cap)
+{
+    // Five ioctls to the radio (some ms each): call it rarely.
+    uint32_t pm = 0;
+    const char *mode = "unknown";
+    if (cyw43_wifi_get_pm(&cyw43_state, &pm) == 0)
+        mode = (pm & 0xf) == CYW43_NO_POWERSAVE_MODE ? "off"
+               : (pm & 0xf) == CYW43_PM1_POWERSAVE_MODE ? "ON (PM1)"
+                                                         : "ON (PM2)";
+    uint8_t b[6] = {0};
+    WiFi.BSSID(b);
+    snprintf(out, cap, "ip %s, power saving %s, access point %02x:%02x:%02x:%02x:%02x:%02x channel %ld",
+             WiFi.localIP().toString().c_str(), mode, b[0], b[1], b[2], b[3], b[4], b[5],
+             (long)WiFi.channel());
+}
+
 // ---- TCP ----
 
 #define MAX_TCP 4
@@ -112,6 +133,28 @@ extern "C" void port_tcp_close(int h)
         return;
     tcp[h].stop();
     tcp_used[h] = false;
+}
+
+// WiFiClient hides its lwIP connection; find it by local port.
+extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
+{
+    if (h < 0 || h >= MAX_TCP || !tcp_used[h])
+        return false;
+    uint16_t local = tcp[h].localPort();
+    if (local == 0)
+        return false;
+    LWIPMutex lock; // lwIP also runs from the radio's interrupt
+    for (struct tcp_pcb *p = tcp_active_pcbs; p; p = p->next) {
+        if (p->local_port != local)
+            continue;
+        out->retransmits = p->nrtx;
+        out->rto_ms = (uint32_t)p->rto * TCP_SLOW_INTERVAL;
+        out->cwnd = p->cwnd;
+        out->peer_wnd = p->snd_wnd;
+        out->unacked = p->snd_nxt - p->lastack;
+        return true;
+    }
+    return false;
 }
 
 // ---- UDP (one socket is all the client needs) ----

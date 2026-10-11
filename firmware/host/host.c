@@ -64,6 +64,12 @@ bool port_wifi_up(void) { return true; }
 
 int port_wifi_rssi(void) { return 0; }
 
+void port_wifi_diag(char *out, size_t cap)
+{
+    if (cap)
+        out[0] = 0;
+}
+
 static bool resolve(const char *host, uint16_t port, int type, struct sockaddr_in *out)
 {
     struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = type}, *res = NULL;
@@ -133,6 +139,13 @@ void port_tcp_close(int h)
 {
     if (h >= 0)
         close(h);
+}
+
+bool port_tcp_get_stats(int h, port_tcp_stats *out)
+{
+    (void)h;
+    (void)out;
+    return false;
 }
 
 int port_udp_open(const char *host, uint16_t port)

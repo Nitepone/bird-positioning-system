@@ -31,6 +31,9 @@ void port_wifi_begin(const char *ssid, const char *password, const char *hostnam
 bool port_wifi_up(void);
 /* Signal strength of the access point, dBm (0 if unknown). */
 int port_wifi_rssi(void);
+/* A short description of the Wi-Fi link for the log (power saving, access
+ * point); empty if the board has nothing to add. */
+void port_wifi_diag(char *out, size_t cap);
 
 int port_tcp_connect(const char *host, uint16_t port);
 /* Bytes accepted (0 when the send buffer is full), or -1. */
@@ -38,6 +41,17 @@ int port_tcp_write(int h, const void *buf, size_t len);
 /* Bytes read (0 when none yet), or -1 once closed or failed. */
 int port_tcp_read(int h, void *buf, size_t len);
 void port_tcp_close(int h);
+
+/* A TCP connection's state, for diagnosing slow uploads. */
+typedef struct {
+    uint32_t retransmits; /* of the oldest unacknowledged segment */
+    uint32_t rto_ms;      /* retransmission timeout */
+    uint32_t cwnd;        /* congestion window, bytes */
+    uint32_t peer_wnd;    /* receive window the server advertises, bytes */
+    uint32_t unacked;     /* bytes sent, not yet acknowledged */
+} port_tcp_stats;
+/* False where the board cannot tell. */
+bool port_tcp_get_stats(int h, port_tcp_stats *out);
 
 int port_udp_open(const char *host, uint16_t port);
 int port_udp_send(int h, const void *buf, size_t len);

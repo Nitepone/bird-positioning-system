@@ -59,6 +59,13 @@ extern "C" bool port_wifi_up(void) { return WiFi.status() == WL_CONNECTED; }
 
 extern "C" int port_wifi_rssi(void) { return (int)WiFi.RSSI(); }
 
+extern "C" void port_wifi_diag(char *out, size_t cap)
+{
+    snprintf(out, cap, "ip %s, power saving %s, access point %s channel %ld",
+             WiFi.localIP().toString().c_str(), WiFi.getSleep() ? "ON" : "off",
+             WiFi.BSSIDstr().c_str(), (long)WiFi.channel());
+}
+
 // ---- Sockets ----
 
 static bool resolve(const char *host, uint16_t port, int type, struct sockaddr_in *out)
@@ -129,6 +136,13 @@ extern "C" void port_tcp_close(int h)
 {
     if (h >= 0)
         close(h);
+}
+
+extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
+{
+    (void)h;
+    (void)out;
+    return false; // lwIP's internals belong to its own task here
 }
 
 extern "C" int port_udp_open(const char *host, uint16_t port)
