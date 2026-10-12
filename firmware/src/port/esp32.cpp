@@ -45,8 +45,31 @@ extern "C" void port_log(const char *fmt, ...)
     Serial.printf("[%10lu] %s\r\n", (unsigned long)millis(), buf);
 }
 
+// Logs why joining failed, once per distinct reason (auto-reconnect repeats it).
+static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
+{
+    static uint8_t last_reason;
+    if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+        last_reason = 0;
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        uint8_t r = info.wifi_sta_disconnected.reason;
+        if (r != last_reason)
+            port_log("wifi: not connected: %s (reason %u)",
+                     WiFi.disconnectReasonName((wifi_err_reason_t)r), r);
+        last_reason = r;
+    }
+}
+
 extern "C" void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
 {
+    static bool started;
+    if (started) {
+        // A retry: stop the attempt in progress, or begin() cannot set the config.
+        WiFi.disconnect();
+    } else {
+        WiFi.onEvent(on_wifi_event);
+        started = true;
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
     // Power saving delays packets by tens of ms, which ruins clock measurement.
