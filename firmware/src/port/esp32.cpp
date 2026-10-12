@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
+#include <esp_wifi.h>
 #include <fcntl.h>
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
@@ -64,12 +65,18 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
 {
     static bool started;
     if (started) {
-        // A retry: stop the attempt in progress, or begin() cannot set the config.
-        WiFi.disconnect();
-    } else {
-        WiFi.onEvent(on_wifi_event);
-        started = true;
+        // A retry. Arduino's auto-reconnect retries after almost every failure
+        // by itself, and begin() would collide with it; only restart the
+        // driver in case it gave up. While it is still trying, the driver
+        // just logs "sta is connecting", so quiet that.
+        esp_log_level_t level = esp_log_level_get("wifi");
+        esp_log_level_set("wifi", ESP_LOG_NONE);
+        esp_wifi_connect();
+        esp_log_level_set("wifi", level);
+        return;
     }
+    WiFi.onEvent(on_wifi_event);
+    started = true;
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
     // Power saving delays packets by tens of ms, which ruins clock measurement.
