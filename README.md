@@ -87,7 +87,7 @@ Browser clients are less precise than `bsp-client` for positioning:
 - Some input latency is invisible to a web page. Chrome reports it and the page compensates. Other
   browsers may leave a constant offset of a few milliseconds per device.
 
-**Or use a microcontroller as a client:** a Raspberry Pi Pico W, Pico 2 W or classic ESP32 with an
+**Or use a microcontroller as a client:** a Raspberry Pi Pico W, Pico 2 W, classic ESP32 or Seeed XIAO ESP32S3 with an
 I2S microphone such as the Adafruit ICS-43434 makes a cheap, always-on client. See
 [Microcontroller clients](#microcontroller-clients-pico-w-esp32).
 
@@ -175,22 +175,25 @@ or placements, or to screenshot a client's sync for a bug report.
 
 ### Microcontroller clients (Pico W / ESP32)
 
-The firmware in `firmware/` turns a Raspberry Pi Pico W, Pico 2 W or classic ESP32 (e.g.
-ESP32-DevKitC) with an I2S microphone into a client. It uses the same client API as `bsp-client`,
+The firmware in `firmware/` turns a Raspberry Pi Pico W, Pico 2 W, classic ESP32 (e.g.
+ESP32-DevKitC) or Seeed XIAO ESP32S3 (or XIAO ESP32S3 Plus) with an I2S microphone into a client. It uses the same client API as `bsp-client`,
 so to the server it is just another client: it appears in the **Clients** table, is measured on the
 **Clocks** page and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
 (any I2S microphone with 24-bit samples in 32-bit slots should work).
 
 **Wiring** (defaults; `./configure.sh` lets you choose other pins):
 
-| ICS-43434 | Pico W / Pico 2 W | ESP32 |
-|---|---|---|
-| 3V | 3V3 (pin 36) | 3V3 |
-| GND | GND | GND |
-| BCLK | GP18 | GPIO 26 |
-| LRCL (word select) | GP19 (must be BCLK + 1) | GPIO 25 |
-| DOUT | GP20 | GPIO 33 |
-| SEL | GND or unconnected (left channel) | GND or unconnected |
+| ICS-43434 | Pico W / Pico 2 W | ESP32 | XIAO ESP32S3 (Plus) |
+|---|---|---|---|
+| 3V | 3V3 (pin 36) | 3V3 | 3V3 |
+| GND | GND | GND | GND |
+| BCLK | GP18 | GPIO 26 | D8 (GPIO 7) |
+| LRCL (word select) | GP19 (must be BCLK + 1) | GPIO 25 | D9 (GPIO 8) |
+| DOUT | GP20 | GPIO 33 | D10 (GPIO 9) |
+| SEL | GND or unconnected (left channel) | GND or unconnected | GND or unconnected |
+
+On the XIAO, those pins sit in a row with 3V3 and GND. Its antenna must be attached for Wi-Fi to
+work.
 
 **Configure, build and flash.** Two scripts in `firmware/` do it:
 
@@ -239,7 +242,7 @@ default.
 
 **How it differs from `bsp-client`.**
 
-- **Noise gate and look-back.** A 9 s chunk is 864 KB, far more than these boards' RAM, so they
+- **Noise gate and look-back.** A 9 s chunk is 864 KB, more than most of these boards' RAM, so they
   cannot record a chunk and then decide whether to send it. Instead, they run the noise gate on
   the live audio and keep the last second or so in a ring buffer. When a sound passes the gate,
   they stream a 9 s chunk that starts that **look-back** before the sound. If it is still going
@@ -262,6 +265,7 @@ default.
 | Pico W (RP2040) | 264 KB | about 1.4 s | 0.75 s |
 | Pico 2 W (RP2350) | 520 KB | about 4 s | 2.5 s |
 | ESP32 (classic) | 520 KB, about half free | about 1.5–2 s | 1 s |
+| XIAO ESP32S3 (Plus) | 512 KB + 8 MB PSRAM | about 10.9 s (in PSRAM) | 2.5 s |
 
 The board takes what `RING_KB` asks for, as long as 32 KB of heap stays free for the network
 stack. At startup it logs what it got and the look-back it can keep. It also logs the
@@ -277,7 +281,7 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
-| Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
+| Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 boards only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
 | Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
 | "upload: the network stalled; … sent as silence" | Wi-Fi stalled for longer than the ring buffer holds: check the `Wi-Fi … dBm` in the status line, move the board or access point, or lower `LOOKBACK_MS` for more slack |
 | Microcontroller stays **NOT synced** | Its status line's *best round trip*: the error bound includes half of it, so above about 4 ms it cannot get under the default 2 ms. Improve the Wi-Fi path (signal, a less busy channel, no router between board and server), or raise `max_clock_offset_us` if looser positioning is acceptable |
@@ -370,7 +374,7 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 - `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement,
   `Timestamper` and noise gate, plus the ring buffer and the client's state machines.
   `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
-  `esp32.cpp` (Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
+  `esp32.cpp` (ESP32 and ESP32-S3: Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
   `host/` is a Linux board layer for testing.
 - `scripts/bps_config.py` holds the board defaults and the config validation, used by both
   `./configure.sh` and the build. `./build.sh` drives PlatformIO, locally or in Docker.

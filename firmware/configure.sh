@@ -144,7 +144,7 @@ edit() {
                 fi
             fi
             ;;
-        WIFI_SSID) input WIFI_SSID "Wi-Fi" "Network name (SSID). The Pico W and ESP32 only use 2.4 GHz networks:" ;;
+        WIFI_SSID) input WIFI_SSID "Wi-Fi" "Network name (SSID). The Pico W and ESP32 boards only use 2.4 GHz networks:" ;;
         WIFI_PASSWORD)
             v=$(ask --title "Wi-Fi" --passwordbox \
                 "Password for \"$WIFI_SSID\" (empty for an open network). It is compiled into the firmware:" \
@@ -176,7 +176,7 @@ edit() {
             ;;
         BUTTON_PIN) input BUTTON_PIN "Positioning button" "GPIO of a push button to GND that requests positioning (as Enter does on bsp-client), or \"none\":" ;;
         LED_PIN)
-            if pico; then
+            if [[ $BOARD != esp32 ]]; then
                 input LED_PIN "Status LED" "GPIO of a status LED, \"builtin\" for the onboard LED, or \"none\":"
             else
                 input LED_PIN "Status LED" "GPIO of a status LED (2 on most ESP32 dev boards), or \"none\":"

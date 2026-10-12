@@ -2,7 +2,7 @@
 # to write it by hand, copy it to bps.conf and fill it in. Empty settings take
 # the board's defaults (see scripts/bps_config.py).
 
-BOARD=pico_w                # pico_w, pico2_w or esp32
+BOARD=pico_w                # pico_w, pico2_w, esp32, xiao_esp32s3 or xiao_esp32s3_plus
 WIFI_SSID='My network'
 WIFI_PASSWORD='change me!'  # empty for an open network
 SERVER_HOST=192.168.1.10    # the bps server
@@ -14,6 +14,6 @@ I2S_DATA=20
 MIC_CHANNEL=left            # left: SEL to GND or unconnected; right: SEL to 3V
 
 BUTTON_PIN=none             # GPIO of a positioning button to GND
-LED_PIN=builtin             # status LED: a GPIO, none, or builtin (Pico)
+LED_PIN=builtin             # status LED: a GPIO, none, or builtin (Pico, XIAO)
 LOOKBACK_MS=750             # audio kept before the sound that opened the gate
 RING_KB=160                 # RAM asked for the ring buffer

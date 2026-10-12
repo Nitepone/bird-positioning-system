@@ -1,4 +1,4 @@
-// Board layer for the classic ESP32 (Arduino core 3.x on ESP-IDF 5).
+// Board layer for the ESP32 and ESP32-S3 (Arduino core 3.x on ESP-IDF 5).
 // Wi-Fi comes from the Arduino core; I2S, timer and sockets are IDF/lwIP C
 // APIs. Capture runs in its own high-priority task.
 #if defined(ARDUINO_ARCH_ESP32)
@@ -236,7 +236,11 @@ extern "C" void port_audio_start(uint32_t sample_rate)
     // ICS-43434: Philips I2S, two 32-bit slots (64 bit clocks per frame),
     // 24-bit data left-aligned. Both slots are read; the core picks one.
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
+#if SOC_I2S_SUPPORTS_APLL
     clk.clk_src = I2S_CLK_SRC_APLL; // exact 48 kHz from the audio PLL
+#endif
+    // Without one (ESP32-S3), the default 160 MHz PLL: its fractional divider
+    // gives exactly 48 kHz on average (160 MHz / 12.288 MHz = 13 + 1/48).
     i2s_std_slot_config_t slot =
         I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
     i2s_std_config_t sc = {};
@@ -257,10 +261,18 @@ extern "C" void port_audio_start(uint32_t sample_rate)
 
 // ---- LED and button ----
 
+#if BPS_LED_PIN == BPS_LED_BUILTIN
+#define LED_GPIO LED_BUILTIN
+#define LED_ON LOW // the XIAO ESP32S3's user LED is wired to 3V3
+#elif BPS_LED_PIN >= 0
+#define LED_GPIO BPS_LED_PIN
+#define LED_ON HIGH
+#endif
+
 extern "C" void port_led(bool on)
 {
-#if BPS_LED_PIN >= 0
-    digitalWrite(BPS_LED_PIN, on ? HIGH : LOW);
+#ifdef LED_GPIO
+    digitalWrite(LED_GPIO, on ? LED_ON : !LED_ON);
 #else
     (void)on;
 #endif
@@ -278,8 +290,9 @@ extern "C" bool port_button(void)
 extern "C" void port_board_init(void)
 {
     Serial.begin(115200);
-#if BPS_LED_PIN >= 0
-    pinMode(BPS_LED_PIN, OUTPUT);
+#ifdef LED_GPIO
+    pinMode(LED_GPIO, OUTPUT);
+    port_led(false);
 #endif
 #if BPS_BUTTON_PIN >= 0
     pinMode(BPS_BUTTON_PIN, INPUT_PULLUP);

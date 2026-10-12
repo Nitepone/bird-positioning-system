@@ -23,12 +23,16 @@ SAMPLE_RATE = 48000
 PICO_PINS = set(range(0, 23)) | {26, 27, 28}  # GP23-25 and GP29 belong to the radio
 ESP32_OUT_PINS = {0, 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}
 ESP32_IN_PINS = ESP32_OUT_PINS | {34, 35, 36, 39}
+# XIAO ESP32S3: the header's D0-D10, plus the BOOT button (GPIO 0) and the user LED (GPIO 21).
+XIAO_S3_PINS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 43, 44}
+XIAO_S3_PLUS_PINS = XIAO_S3_PINS | {10, 11, 12, 13, 38, 39, 40, 41, 42}  # D11-D19 underneath
 
 BOARDS = {
     "pico_w": {
         "title": "Raspberry Pi Pico W (RP2040)",
         "short": "picow",
         "family": "rp2",
+        "out_pins": PICO_PINS, "in_pins": PICO_PINS, "builtin_led": True,
         "defaults": {"I2S_BCLK": "18", "I2S_DATA": "20", "LED_PIN": "builtin",
                      "BUTTON_PIN": "none", "RING_KB": "160", "LOOKBACK_MS": "750"},
     },
@@ -36,6 +40,7 @@ BOARDS = {
         "title": "Raspberry Pi Pico 2 W (RP2350)",
         "short": "pico2w",
         "family": "rp2",
+        "out_pins": PICO_PINS, "in_pins": PICO_PINS, "builtin_led": True,
         "defaults": {"I2S_BCLK": "18", "I2S_DATA": "20", "LED_PIN": "builtin",
                      "BUTTON_PIN": "none", "RING_KB": "400", "LOOKBACK_MS": "2500"},
     },
@@ -43,8 +48,25 @@ BOARDS = {
         "title": "ESP32 (classic, e.g. ESP32-DevKitC)",
         "short": "esp32",
         "family": "esp32",
+        "out_pins": ESP32_OUT_PINS, "in_pins": ESP32_IN_PINS, "builtin_led": False,
         "defaults": {"I2S_BCLK": "26", "I2S_WS": "25", "I2S_DATA": "33", "LED_PIN": "2",
                      "BUTTON_PIN": "0", "RING_KB": "192", "LOOKBACK_MS": "1000"},
+    },
+    "xiao_esp32s3": {
+        "title": "Seeed XIAO ESP32S3 (8 MB PSRAM)",
+        "short": "xiao-esp32s3",
+        "family": "esp32",
+        "out_pins": XIAO_S3_PINS, "in_pins": XIAO_S3_PINS | {0}, "builtin_led": True,
+        "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
+                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "2500"},
+    },
+    "xiao_esp32s3_plus": {
+        "title": "Seeed XIAO ESP32S3 Plus (8 MB PSRAM)",
+        "short": "xiao-esp32s3-plus",
+        "family": "esp32",
+        "out_pins": XIAO_S3_PLUS_PINS, "in_pins": XIAO_S3_PLUS_PINS | {0}, "builtin_led": True,
+        "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
+                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "2500"},
     },
 }
 
@@ -126,7 +148,7 @@ def validate(cfg):
     if board not in BOARDS:
         errors.append(f"BOARD must be one of {', '.join(BOARDS)}")
         return errors
-    family = BOARDS[board]["family"]
+    b = BOARDS[board]
 
     ssid = cfg.get("WIFI_SSID", "")
     if not ssid or len(ssid.encode()) > 32:
@@ -155,11 +177,10 @@ def validate(cfg):
             return None
         return int(v)
 
-    out_pins = PICO_PINS if family == "rp2" else ESP32_OUT_PINS
-    in_pins = PICO_PINS if family == "rp2" else ESP32_IN_PINS
+    out_pins, in_pins = b["out_pins"], b["in_pins"]
     used = [pin("I2S_BCLK", out_pins), pin("I2S_WS", out_pins), pin("I2S_DATA", in_pins)]
     button = pin("BUTTON_PIN", in_pins, ("none",))
-    led = pin("LED_PIN", out_pins, ("none", "builtin") if family == "rp2" else ("none",))
+    led = pin("LED_PIN", out_pins, ("none", "builtin") if b["builtin_led"] else ("none",))
     used += [p for p in (button, led) if isinstance(p, int)]
     nums = [p for p in used if isinstance(p, int)]
     if len(nums) != len(set(nums)):

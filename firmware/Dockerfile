@@ -1,5 +1,5 @@
 # Build environment for the bps microcontroller client firmware: PlatformIO with
-# the Pico W, Pico 2 W and ESP32 toolchains installed, so builds work offline.
+# the Pico W, Pico 2 W, ESP32 and ESP32-S3 toolchains installed, so builds work offline.
 # ./build.sh builds and uses this image when PlatformIO is not installed (or
 # with --docker); it can also be used directly:
 #
@@ -36,11 +36,11 @@ ENV PLATFORMIO_LIBDEPS_DIR=/opt/platformio/libdeps
 WORKDIR /opt/bps-firmware
 COPY platformio.ini ./
 COPY scripts/bps_config.py scripts/
-RUN pio pkg install -e pico_w -e pico2_w -e esp32 \
+RUN pio pkg install -e pico_w -e pico2_w -e esp32 -e xiao_esp32s3 -e xiao_esp32s3_plus \
     && mkdir -p src test/test_stub \
     && printf '#include <Arduino.h>\nvoid setup() {}\nvoid loop() {}\n' > src/main.cpp \
     && printf '#include <unity.h>\nvoid setUp(void) {}\nvoid tearDown(void) {}\nint main(void) { UNITY_BEGIN(); return UNITY_END(); }\n' > test/test_stub/test_main.c \
-    && for board in pico_w pico2_w esp32; do \
+    && for board in pico_w pico2_w esp32 xiao_esp32s3 xiao_esp32s3_plus; do \
         BPS_SET_BOARD=$board BPS_SET_WIFI_SSID=stub BPS_SET_SERVER_HOST=127.0.0.1 \
             python3 scripts/bps_config.py write /tmp/stub.conf \
         && BPS_CONF=/tmp/stub.conf pio run -e $board || exit 1; \
