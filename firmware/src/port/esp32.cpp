@@ -46,6 +46,115 @@ extern "C" void port_log(const char *fmt, ...)
     Serial.printf("[%10lu] %s\r\n", (unsigned long)millis(), buf);
 }
 
+#ifdef BPS_BEACON_LOG
+#include <esp_private/wifi.h>
+
+// Beacon sync experiment: logs every beacon of this network's access points
+// (on any channel the radio visits) with the TSF it carries and two arrival
+// times: the radio's (rx_ctrl.timestamp, 32-bit us) and esp_timer's when the
+// callback ran. scripts/beacon_jitter.py compares two boards' logs.
+struct beacon_obs {
+    uint8_t bssid[6];
+    uint16_t seq;
+    int8_t rssi;
+    uint8_t channel;
+    uint64_t tsf;
+    uint32_t rx_us;
+    int64_t cb_us;
+};
+
+static QueueHandle_t beacon_q;
+static char beacon_ssid[33];
+static size_t beacon_ssid_len;
+static uint32_t beacon_dropped; // written by the Wi-Fi task, read by the log task
+
+static void beacon_rx(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    int64_t now = esp_timer_get_time();
+    if (type != WIFI_PKT_MGMT)
+        return;
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *f = p->payload;
+    // Beacon: 24-byte header, TSF (8), interval (2), capabilities (2), then
+    // the SSID element first.
+    size_t n = p->rx_ctrl.sig_len;
+    if (n < 38 || f[0] != 0x80 || f[36] != 0 || f[37] != beacon_ssid_len ||
+        n < 38 + beacon_ssid_len || memcmp(f + 38, beacon_ssid, beacon_ssid_len) != 0)
+        return;
+    beacon_obs o;
+    memcpy(o.bssid, f + 16, 6);
+    o.seq = (uint16_t)((f[22] | f[23] << 8) >> 4);
+    o.tsf = 0;
+    for (int i = 7; i >= 0; i--)
+        o.tsf = o.tsf << 8 | f[24 + i];
+    o.rssi = (int8_t)p->rx_ctrl.rssi;
+    o.channel = (uint8_t)p->rx_ctrl.channel;
+    o.rx_us = p->rx_ctrl.timestamp;
+    o.cb_us = now;
+    if (xQueueSend(beacon_q, &o, 0) != pdTRUE)
+        __atomic_fetch_add(&beacon_dropped, 1, __ATOMIC_RELAXED);
+}
+
+// Links the radio's clock (that of rx_ctrl.timestamp) to esp_timer: the
+// tightest of 16 reads between two esp_timer reads.
+static void log_mac_clock(void)
+{
+    int64_t best_mid = 0, best_width = INT64_MAX;
+    uint32_t best_mac = 0;
+    for (int i = 0; i < 16; i++) {
+        int64_t t0 = esp_timer_get_time();
+        uint32_t mac = esp_wifi_internal_get_mac_clock_time();
+        int64_t t1 = esp_timer_get_time();
+        if (t1 - t0 < best_width) {
+            best_width = t1 - t0;
+            best_mid = t0 + (t1 - t0) / 2;
+            best_mac = mac;
+        }
+    }
+    port_log("macclk esp %lld mac %lu width %lld", (long long)best_mid, (unsigned long)best_mac,
+             (long long)best_width);
+}
+
+static void beacon_log_task(void *)
+{
+    beacon_obs o;
+    uint32_t dropped = 0;
+    int64_t next_clock = 0;
+    for (;;) {
+        if (esp_timer_get_time() >= next_clock) {
+            log_mac_clock();
+            next_clock = esp_timer_get_time() + 1000000;
+        }
+        if (xQueueReceive(beacon_q, &o, pdMS_TO_TICKS(100)) != pdTRUE)
+            continue;
+        port_log("beacon %02x:%02x:%02x:%02x:%02x:%02x ch %u seq %u tsf %llu rx %lu cb %lld rssi %d",
+                 o.bssid[0], o.bssid[1], o.bssid[2], o.bssid[3], o.bssid[4], o.bssid[5],
+                 o.channel, o.seq, (unsigned long long)o.tsf, (unsigned long)o.rx_us,
+                 (long long)o.cb_us, o.rssi);
+        if (__atomic_load_n(&beacon_dropped, __ATOMIC_RELAXED) != dropped) {
+            dropped = __atomic_load_n(&beacon_dropped, __ATOMIC_RELAXED);
+            port_log("beacon: %lu dropped (log too slow)", (unsigned long)dropped);
+        }
+    }
+}
+
+static void beacon_log_start(const char *ssid)
+{
+    beacon_ssid_len = strnlen(ssid, 32);
+    memcpy(beacon_ssid, ssid, beacon_ssid_len);
+    beacon_q = xQueueCreate(64, sizeof(beacon_obs));
+    xTaskCreatePinnedToCore(beacon_log_task, "beacons", 4096, nullptr, 1, nullptr, 0);
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(beacon_rx);
+    if (esp_wifi_set_promiscuous(true) == ESP_OK)
+        port_log("beacon: logging the beacons of \"%s\"", ssid);
+    else
+        port_log("beacon: cannot turn on promiscuous mode");
+}
+#endif
+
 // Logs why joining failed, once per distinct reason (auto-reconnect repeats it).
 static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
 {
@@ -83,6 +192,10 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid, password);
+#ifdef BPS_BEACON_LOG
+    if (!beacon_q)
+        beacon_log_start(ssid);
+#endif
 }
 
 extern "C" bool port_wifi_up(void) { return WiFi.status() == WL_CONNECTED; }
