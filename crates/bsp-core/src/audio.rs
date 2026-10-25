@@ -13,11 +13,22 @@ pub struct AudioSample {
     pub start: Timestamp,
     pub sample_rate: u32,
     pub pcm: Arc<[f32]>,
+    /// How far the sample clock was off `sample_rate`, in parts per billion
+    /// of the sample period (positive: samples further apart than nominal).
+    /// No sample clock is exact; tens of ppm add up to a fraction of a
+    /// millisecond over a chunk.
+    pub clock_ppb: i64,
 }
 
 impl AudioSample {
+    /// Nanoseconds from the first sample to the `index`-th.
+    fn offset_ns(&self, index: usize) -> i64 {
+        let nominal = index as i128 * NANOS_PER_SEC as i128 / self.sample_rate as i128;
+        (nominal + nominal * self.clock_ppb as i128 / 1_000_000_000) as i64
+    }
+
     pub fn duration_ns(&self) -> i64 {
-        self.pcm.len() as i64 * NANOS_PER_SEC / self.sample_rate as i64
+        self.offset_ns(self.pcm.len())
     }
 
     pub fn end(&self) -> Timestamp {
@@ -26,12 +37,30 @@ impl AudioSample {
 
     /// Timestamp of the sample at `index`.
     pub fn time_at(&self, index: usize) -> Timestamp {
-        self.start + index as i64 * NANOS_PER_SEC / self.sample_rate as i64
+        self.start + self.offset_ns(index)
     }
 
     /// Fractional sample index of `ts` (may be out of range).
     pub fn index_of(&self, ts: Timestamp) -> f64 {
-        (ts - self.start) as f64 * self.sample_rate as f64 / NANOS_PER_SEC as f64
+        (ts - self.start) as f64 * self.sample_rate as f64
+            / NANOS_PER_SEC as f64
+            / (1.0 + self.clock_ppb as f64 * 1e-9)
+    }
+
+    /// The clock error that makes `len` samples at `sample_rate` span
+    /// `start..end`, if it is believable (within 1000 ppm).
+    pub fn clock_ppb_from(
+        sample_rate: u32,
+        len: usize,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Option<i64> {
+        let nominal = len as i128 * NANOS_PER_SEC as i128 / sample_rate as i128;
+        if nominal == 0 {
+            return None;
+        }
+        let ppb = ((end - start) as i128 - nominal) * 1_000_000_000 / nominal;
+        (ppb.abs() <= 1_000_000).then_some(ppb as i64)
     }
 }
 

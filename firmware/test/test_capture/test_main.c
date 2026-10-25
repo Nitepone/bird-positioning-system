@@ -1,4 +1,4 @@
-// Timestamper (mirrors bsp-client's capture.rs test), noise gate (mirrors
+// Timestamper, noise gate (mirrors
 // gate.rs tests, continuous) and the audio ring.
 #include <unity.h>
 
@@ -12,27 +12,44 @@
 void setUp(void) {}
 void tearDown(void) {}
 
-static void test_timestamper_ignores_jitter_and_tracks_jumps(void)
+// A sample clock 30 ppm slow; each block's estimate 5 us late plus jitter of
+// up to 50 us, now and then 2 ms; 50 ms of audio lost 40 s in.
+static int64_t truth_at(uint64_t idx, int64_t lost)
 {
-    const uint32_t sr = 48000, block = 480; // 10 ms
+    return 1000 * BPS_NANOS_PER_SEC + lost +
+           (int64_t)llround((double)idx * 1e9 / 48000 * (1 + 30e-6));
+}
+
+static int64_t late_by(uint64_t i)
+{
+    if (i % 997 == 500)
+        return 2 * BPS_NANOS_PER_MS;
+    return 5000 + (int64_t)((i * 7919) % 50) * 1000;
+}
+
+static void test_timestamper_follows_offset_rate_and_jumps(void)
+{
+    const uint32_t sr = 48000, block = 256;
     bps_timestamper t;
     bps_timestamper_init(&t, sr);
-    int64_t t0 = 1000 * BPS_NANOS_PER_SEC;
-    int dropouts = 0;
-    for (uint64_t i = 0; i < 1000; i++) {
-        int64_t truth = t0 + (int64_t)i * 10 * BPS_NANOS_PER_MS;
-        // Late by 0..3 ms of scheduling jitter, plus a 50 ms dropout after 5 s.
-        int64_t jitter = (int64_t)((i * 7919) % 30) * BPS_NANOS_PER_MS / 10;
-        int64_t gap = i >= 500 ? 50 * BPS_NANOS_PER_MS : 0;
-        bool dropout;
-        int64_t stamp = bps_timestamper_push(&t, truth + gap + jitter, block, &dropout);
-        dropouts += dropout;
-        if (i < 500)
-            TEST_ASSERT_TRUE(bps_abs64(stamp - truth) <= 3 * BPS_NANOS_PER_MS);
-        if (i > 800)
-            TEST_ASSERT_TRUE(bps_abs64(stamp - truth - gap) <= BPS_NANOS_PER_MS);
+    int news = 0;
+    for (uint64_t i = 0; i < 60 * sr / block; i++) {
+        uint64_t idx = i * block;
+        int64_t lost = idx >= 40 * sr ? 50 * BPS_NANOS_PER_MS : 0;
+        int r = bps_timestamper_push(&t, (uint32_t)idx, truth_at(idx, lost) + late_by(i), block);
+        news += r == BPS_TS_NEW;
+        double secs = (double)idx / sr;
+        // Once settled, the timeline is the truth plus the smallest delay (5 us).
+        if ((secs > 10 && secs < 40) || secs > 52) {
+            int64_t err = bps_timeline_at(bps_timestamper_model(&t), (uint32_t)idx, sr) -
+                          truth_at(idx, lost) - 5000;
+            TEST_ASSERT_TRUE_MESSAGE(bps_abs64(err) <= 2000, "timeline off");
+            TEST_ASSERT_INT32_WITHIN(500, 30000, t.model.ppb);
+        }
     }
-    TEST_ASSERT_EQUAL_INT(1, dropouts);
+    TEST_ASSERT_EQUAL_INT(2, news); // the start, and the lost audio
+    TEST_ASSERT_TRUE(t.seg_start > 40 * sr && t.seg_start <= 42 * sr);
+    TEST_ASSERT_TRUE(t.scatter_ns < 2000);
 }
 
 // ---- gate ----
@@ -126,14 +143,22 @@ static void fill(int16_t *p, size_t n, int16_t from)
         p[i] = (int16_t)(from + (int16_t)i);
 }
 
+static bps_timeline line(uint32_t idx, int64_t ts, int32_t ppb)
+{
+    bps_timeline m = {idx, ts, ppb};
+    return m;
+}
+
 static void test_ring_reads_back_and_detects_overwrite(void)
 {
     TEST_ASSERT_EQUAL_UINT32(3 * BPS_RING_BLOCK, bps_ring_alloc(&ring, 48000, 3 * BPS_RING_BLOCK + 5));
     static int16_t in[1000], out[1000];
     int64_t ts = 5 * BPS_NANOS_PER_SEC;
+    bps_timeline m = line(0, ts, 0);
+    bps_ring_timeline(&ring, &m, true, 0);
     for (int k = 0; k < 40; k++) { // 40000 samples, more than the 24576 kept
         fill(in, 1000, (int16_t)(k * 1000));
-        bps_ring_write(&ring, in, 1000, ts + (int64_t)k * 1000 * BPS_NANOS_PER_SEC / 48000);
+        bps_ring_write(&ring, in, 1000);
     }
     TEST_ASSERT_EQUAL_UINT32(40000, bps_ring_written(&ring));
     TEST_ASSERT_TRUE(bps_ring_read(&ring, 39000, out, 1000));
@@ -149,6 +174,12 @@ static void test_ring_reads_back_and_detects_overwrite(void)
     TEST_ASSERT_TRUE(bps_ring_locate(&ring, 24000, &t, &has_next, &next));
     TEST_ASSERT_FALSE(has_next);
     TEST_ASSERT_TRUE(t == ts + 500 * BPS_NANOS_PER_MS);
+    // Refining the timeline in place retimes the samples already written.
+    m = line(36000, ts + 750 * BPS_NANOS_PER_MS + 3000, 20000);
+    bps_ring_timeline(&ring, &m, false, 0);
+    TEST_ASSERT_TRUE(bps_ring_locate(&ring, 24000, &t, &has_next, &next));
+    TEST_ASSERT_FALSE(has_next);
+    TEST_ASSERT_TRUE(t == ts + 500 * BPS_NANOS_PER_MS + 3000 - 5000); // 250 ms * 20 ppm
 }
 
 static void test_ring_starts_a_segment_at_a_timeline_jump(void)
@@ -156,11 +187,13 @@ static void test_ring_starts_a_segment_at_a_timeline_jump(void)
     bps_ring_alloc(&ring, 48000, 2 * BPS_RING_BLOCK);
     static int16_t in[480];
     int64_t ts = BPS_NANOS_PER_SEC;
-    for (int k = 0; k < 10; k++)
-        bps_ring_write(&ring, in, 480, ts + k * 10 * BPS_NANOS_PER_MS);
-    // 0.4 ms off: still the same segment; 1 ms off: a new one.
-    bps_ring_write(&ring, in, 480, ts + 100 * BPS_NANOS_PER_MS + 400000);
-    bps_ring_write(&ring, in, 480, ts + 111 * BPS_NANOS_PER_MS);
+    bps_timeline m = line(0, ts, 0);
+    bps_ring_timeline(&ring, &m, true, 0);
+    for (int k = 0; k < 12; k++)
+        bps_ring_write(&ring, in, 480);
+    // A jump found once 5760 samples are in, which started at 5280.
+    m = line(5280, ts + 111 * BPS_NANOS_PER_MS, 0);
+    bps_ring_timeline(&ring, &m, true, 5280);
     int64_t t;
     bool has_next;
     uint32_t next;
@@ -176,12 +209,14 @@ static void test_ring_survives_index_wrap(void)
 {
     bps_ring_alloc(&ring, 48000, 2 * BPS_RING_BLOCK);
     ring.written = UINT32_MAX - 1500; // as after ~25 hours
+    uint32_t first = UINT32_MAX - 1500;
+    bps_timeline m = line(first, BPS_NANOS_PER_SEC, 0);
+    bps_ring_timeline(&ring, &m, true, first);
     static int16_t in[1000], out[3000];
     for (int k = 0; k < 3; k++) {
         fill(in, 1000, (int16_t)(k * 1000));
-        bps_ring_write(&ring, in, 1000, BPS_NANOS_PER_SEC + (int64_t)k * 1000 * BPS_NANOS_PER_SEC / 48000);
+        bps_ring_write(&ring, in, 1000);
     }
-    uint32_t first = UINT32_MAX - 1500;
     TEST_ASSERT_TRUE(bps_ring_read(&ring, first, out, 3000));
     for (int i = 0; i < 3000; i++)
         TEST_ASSERT_EQUAL_INT16((int16_t)i, out[i]);
@@ -196,7 +231,7 @@ static void test_ring_survives_index_wrap(void)
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_timestamper_ignores_jitter_and_tracks_jumps);
+    RUN_TEST(test_timestamper_follows_offset_rate_and_jumps);
     RUN_TEST(test_passes_tone_burst_not_noise);
     RUN_TEST(test_ignores_low_frequency_rumble);
     RUN_TEST(test_reports_frame_ends);

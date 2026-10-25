@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
                     measured_at: now_ns(),
                     error_ns: Some(100_000),
                     detail: None,
+                    beacon: None,
                 }),
                 uptime_s: 0,
                 chunks_sent: round as u64,

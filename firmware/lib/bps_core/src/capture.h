@@ -27,13 +27,13 @@ typedef struct {
     uint32_t last_pass_end; /* ring index just past the newest passing frame */
     uint32_t dropouts;      /* capture timeline jumps */
     int32_t rate_err_ppb;   /* sample rate vs. the monotonic clock, parts per billion */
+    int32_t scatter_ns;     /* how far the timeline's points lie from it (RMS) */
+    int32_t predict_ns;     /* how far the latest point lay from the timeline before it */
     int32_t level_cdb[2];   /* first seconds' level per channel, centi-dBFS */
     uint32_t levels_ready;
 
     /* Capture-side bookkeeping. */
     bool started;
-    int64_t first_est;
-    uint64_t frames;
     uint64_t level_sum[2]; /* squares of the top 16 bits */
     uint32_t level_frames;
     uint32_t block_start; /* ring index of the block being gated */

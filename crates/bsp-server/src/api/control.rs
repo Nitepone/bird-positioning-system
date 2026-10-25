@@ -1,6 +1,7 @@
 //! Configuration and monitoring endpoints used by the web UI.
 
 use super::{ApiError, ApiResult};
+use crate::beacon_clock::TsfLine;
 use crate::clip_audio;
 use crate::clock_history::{self, ClockReport};
 use crate::db::{ClientRecord, DetectionFilter, Event, SpeciesSeen};
@@ -47,9 +48,18 @@ struct ClientView {
     #[serde(flatten)]
     record: ClientRecord,
     active: bool,
+    /// Usable for positioning: synced to the server clock, or to its access
+    /// point's other clients.
     synced: bool,
+    synced_to_server: bool,
     /// Worst-case error of the client's audio timestamps (ns).
     clock_error_ns: Option<i64>,
+    /// The same against the other clients of its access point, when it
+    /// follows one that others follow too.
+    ap_error_ns: Option<i64>,
+    /// The line converting the clock of the access point the client
+    /// follows, when it follows one.
+    beacon_line: Option<TsfLine>,
     positioning_requested: bool,
 }
 
@@ -58,7 +68,10 @@ fn view(state: &SharedState, record: ClientRecord, now: Timestamp) -> ClientView
     ClientView {
         active: state.is_active(&record, now),
         synced: state.is_synced(&record, now),
-        clock_error_ns: record.clock.map(|k| k.error_bound_ns()),
+        synced_to_server: state.is_synced_to_server(&record, now),
+        clock_error_ns: state.clock_error_ns(&record),
+        ap_error_ns: state.ap_error_ns(&record).map(|(_, e)| e),
+        beacon_line: state.beacon_line(&record),
         positioning_requested: req.is_some_and(|r| r.client_id == record.id),
         record,
     }
@@ -78,6 +91,9 @@ async fn status(State(state): State<SharedState>) -> ApiResult<Json<serde_json::
         "clients_synced": clients.iter().filter(|c| state.is_synced(c, now)).count(),
         "max_call_skew_ms": state.cfg.max_call_skew_ms,
         "max_clock_offset_us": state.cfg.max_clock_offset_us,
+        "access_points": state.beacon_clocks.lines().into_iter()
+            .map(|(bssid, line)| json!({ "bssid": bssid, "line": line }))
+            .collect::<Vec<_>>(),
     })))
 }
 
@@ -184,7 +200,7 @@ async fn client_clock(
         .since(id, now - span_ns)
         .into_iter()
         .map(|report| ClockReportView {
-            error_ns: report.clock.map(|k| k.error_bound_ns()),
+            error_ns: report.clock.map(|k| state.status_error_ns(&k)),
             report,
         })
         .collect();

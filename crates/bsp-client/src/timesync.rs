@@ -105,6 +105,7 @@ impl Clock {
                 rtt_median_ns: sorted.get(sorted.len() / 2).copied(),
                 rtt_max_ns: sorted.last().copied(),
             }),
+            beacon: None,
         })
     }
 }

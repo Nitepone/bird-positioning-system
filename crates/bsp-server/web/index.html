@@ -1565,8 +1565,11 @@ function clockLimitNs() { return (clockData?.max_clock_offset_us ?? 2000) * 1000
 
 function clockState(c) {
   if (!c.active) return { cls: "muted", text: "inactive" };
+  if (c.synced && !c.synced_to_server) return { cls: "ok", text: "synced with its access point's clients" };
   return c.synced ? { cls: "ok", text: "synced" } : { cls: "bad", text: "NOT synced" };
 }
+
+function fmtNsUs(ns) { return ns == null ? "-" : (ns / 1e3).toFixed(1) + " µs"; }
 
 function correctsText(d) {
   if (!d) return "unknown (older client)";
@@ -1587,13 +1590,16 @@ function renderClockTable() {
   document.getElementById("clock-intro").textContent =
     "Direction finding needs every client's audio timestamps on the server's clock. Timestamp error is the worst " +
     `case left in them; clients over the limit (±${fmtNsMs(clockLimitNs(), 1)}) are left out of positioning. ` +
+    "Clients that follow their Wi-Fi access point's clock by its beacons (ESP32 boards) also line up with that " +
+    "AP's other clients to microseconds, and can be used with them even when over the limit. " +
     "Replies, drift and round trips are from each client's latest heartbeat.";
   document.querySelector("#clock-clients tbody").innerHTML = clients.map(c => {
     const k = c.clock, d = k?.detail, st = clockState(c);
     return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
       <td><a href="#/clock?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
       <td class="${st.cls}">${st.text}</td>
-      <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}</td>
+      <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}${c.ap_error_ns != null
+        ? `<br><span class="muted" title="against the other clients of access point ${esc(k.beacon.bssid)}">&plusmn;${fmtNsUs(c.ap_error_ns)} within its AP</span>` : ""}</td>
       <td class="num">${fmtNsMs(d?.clock_offset_ns)}</td>
       <td class="num">${d ? d.drift_ppm.toFixed(2) + " ppm" : "-"}</td>
       <td class="num">${fmtNsMs(k?.rtt_ns)}</td>
@@ -1653,6 +1659,11 @@ function renderClockDetail() {
       medians.length ? `median ${fmtNsMs(percentile(medians, 0.5))} over the range` : "-"),
     tile("Replies", requests ? (100 * replies / requests).toFixed(1) + "%" : "-",
       requests ? `${replies} of ${requests} measurements answered` : "-"),
+    k?.beacon ? tile("Access point clock", `<span class="mono">${esc(k.beacon.bssid)}</span>`,
+      `follows its beacons to ${fmtNsUs(k.beacon.scatter_ns)} RMS (${k.beacon.beacons} beacons, drift ` +
+      `${k.beacon.drift_ppm.toFixed(2)} ppm against it)` + (c.beacon_line
+        ? `; the AP's line: ${c.beacon_line.clients} client(s), &plusmn;${fmtNsMs(c.beacon_line.error_ns)} to the server clock`
+        : "; the server has no line for this AP yet")) : "",
   ].join("");
   document.getElementById("clock-foot").textContent =
     `${reports.length} reports from ${fmtTime(data.from)} to ${fmtTime(data.server_time)}. ` +

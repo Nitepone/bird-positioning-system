@@ -7,7 +7,7 @@ use crate::state::SharedState;
 use bsp_core::detection::Detection;
 use bsp_core::identifier::Call;
 use bsp_core::locator::{Locator, LocatorInput, MIN_MICS};
-use bsp_proto::{NANOS_PER_MS, NANOS_PER_SEC, Timestamp, Uuid, now_ns};
+use bsp_proto::{Bssid, NANOS_PER_MS, NANOS_PER_SEC, Timestamp, Uuid, now_ns};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,6 +107,37 @@ pub fn take_ready_groups(
     groups
 }
 
+/// The largest set of microphones whose timestamps line up: those synced to
+/// the server clock, or those of one access point, which share its clock
+/// (however far that is from the server's). An access point's wins a tie, its
+/// timestamps being the more precise.
+fn usable_together<T>(items: impl IntoIterator<Item = (T, bool, Option<Bssid>)>) -> Vec<T> {
+    let items: Vec<_> = items.into_iter().collect();
+    let mut best: Vec<usize> = (0..items.len()).filter(|&i| items[i].1).collect();
+    let mut aps: Vec<(Bssid, Vec<usize>)> = Vec::new();
+    for (i, (_, _, ap)) in items.iter().enumerate() {
+        let Some(ap) = ap else { continue };
+        match aps.iter_mut().find(|(b, _)| b == ap) {
+            Some((_, set)) => set.push(i),
+            None => aps.push((*ap, vec![i])),
+        }
+    }
+    aps.sort_by_key(|(b, _)| *b);
+    let mut best_is_ap = false;
+    for (_, set) in aps {
+        if set.len() > best.len() || (set.len() == best.len() && !best_is_ap) {
+            best = set;
+            best_is_ap = true;
+        }
+    }
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| best.contains(i))
+        .map(|(_, (item, _, _))| item)
+        .collect()
+}
+
 /// Saves each client's audio around its call, for playback in the web UI.
 fn store_clips(state: &SharedState, d: &Detection) {
     for call in &d.calls {
@@ -141,14 +172,18 @@ async fn build_detection(
         }
     };
 
-    let inputs: Vec<LocatorInput> = calls
-        .iter()
-        .filter_map(|call| {
-            let client = clients.get(&call.client_id)?;
-            let position = client.position?;
-            if !state.is_synced(client, now) {
-                return None;
-            }
+    let positioned = calls.iter().filter_map(|call| {
+        let client = clients.get(&call.client_id)?;
+        let position = client.position?;
+        Some((
+            (call, position),
+            state.is_synced_to_server(client, now),
+            state.synced_ap(client, now),
+        ))
+    });
+    let inputs: Vec<LocatorInput> = usable_together(positioned)
+        .into_iter()
+        .filter_map(|(call, position)| {
             let (start, sample_rate, pcm) = state.audio.extract(
                 call.client_id,
                 time - LOCATOR_CONTEXT_NS,
@@ -236,6 +271,33 @@ mod tests {
             .collect();
         assert_eq!(summary, vec![vec![1, 2, 3], vec![2], vec![4]]);
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn locates_with_the_largest_set_that_lines_up() {
+        let (x, y) = (Bssid([2, 0, 0, 0, 0, 1]), Bssid([2, 0, 0, 0, 0, 2]));
+        // Three synced to the server clock (one on AP x) beat two of AP y alone.
+        let picked = usable_together([
+            (1, true, None),
+            (2, true, Some(x)),
+            (3, true, None),
+            (4, false, Some(y)),
+            (5, false, Some(y)),
+        ]);
+        assert_eq!(picked, vec![1, 2, 3]);
+        // Three of AP y beat two synced to the server clock.
+        let picked = usable_together([
+            (1, true, None),
+            (2, false, Some(y)),
+            (3, true, Some(y)),
+            (4, false, Some(y)),
+            (5, false, None),
+        ]);
+        assert_eq!(picked, vec![2, 3, 4]);
+        // A tie goes to the access point; nothing synced, nothing picked.
+        let picked = usable_together([(1, true, Some(x)), (2, true, Some(x)), (3, false, None)]);
+        assert_eq!(picked, vec![1, 2]);
+        assert!(usable_together([(1, false, None)]).is_empty());
     }
 
     #[test]

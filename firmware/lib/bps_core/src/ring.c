@@ -27,24 +27,28 @@ uint32_t bps_ring_alloc(bps_ring *r, uint32_t sample_rate, uint32_t max_samples)
     return r->capacity;
 }
 
-void bps_ring_write(bps_ring *r, const int16_t *pcm, size_t n, int64_t ts)
+void bps_ring_timeline(bps_ring *r, const bps_timeline *tl, bool start_new, uint32_t start)
+{
+    STORE(&r->tseq, r->tseq + 1);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    uint32_t n = r->n_segs;
+    if (start_new && (n == 0 || r->segs[(n - 1) % BPS_RING_SEGMENTS].idx != start)) {
+        bps_ring_segment *s = &r->segs[n % BPS_RING_SEGMENTS];
+        s->idx = start;
+        s->tl = *tl;
+        STORE(&r->n_segs, n + 1);
+    } else if (n > 0) {
+        r->segs[(n - 1) % BPS_RING_SEGMENTS].tl = *tl;
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    STORE(&r->tseq, r->tseq + 1);
+}
+
+void bps_ring_write(bps_ring *r, const int16_t *pcm, size_t n)
 {
     if (r->capacity == 0 || n == 0)
         return;
     uint32_t w = r->written;
-    /* New segment if the timeline does not continue the current one. */
-    bool fresh = r->n_segs == 0;
-    if (!fresh) {
-        const bps_ring_segment *s = &r->segs[(r->n_segs - 1) % BPS_RING_SEGMENTS];
-        int64_t expected = s->ts + bps_samples_to_ns(w - s->idx, r->sample_rate);
-        fresh = bps_abs64(ts - expected) > BPS_NANOS_PER_SEC / 2000;
-    }
-    if (fresh) {
-        bps_ring_segment *s = &r->segs[r->n_segs % BPS_RING_SEGMENTS];
-        s->idx = w;
-        s->ts = ts;
-        STORE(&r->n_segs, r->n_segs + 1);
-    }
     uint32_t pos = r->wpos;
     for (size_t i = 0; i < n;) {
         uint32_t off = pos % BPS_RING_BLOCK;
@@ -111,10 +115,13 @@ bool bps_ring_locate(const bps_ring *r, uint32_t idx, int64_t *ts, bool *has_nex
                      uint32_t *next_idx)
 {
     for (;;) {
+        uint32_t q = LOAD(&r->tseq);
+        if (q & 1)
+            continue;
         uint32_t n = LOAD(&r->n_segs);
         uint32_t avail = n < BPS_RING_SEGMENTS ? n : BPS_RING_SEGMENTS;
         bool found = false;
-        bps_ring_segment seg = {0, 0}, next = {0, 0};
+        bps_ring_segment seg = {0}, next = {0};
         bool nxt = false;
         for (uint32_t k = 0; k < avail; k++) {
             bps_ring_segment s = r->segs[(n - 1 - k) % BPS_RING_SEGMENTS];
@@ -126,12 +133,13 @@ bool bps_ring_locate(const bps_ring *r, uint32_t idx, int64_t *ts, bool *has_nex
             next = s;
             nxt = true;
         }
-        /* Retry if segments were added (and possibly overwritten) meanwhile. */
-        if (LOAD(&r->n_segs) != n)
+        /* Retry if the segments changed meanwhile. */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (LOAD(&r->tseq) != q)
             continue;
         if (!found)
             return false;
-        *ts = seg.ts + bps_samples_to_ns(idx - seg.idx, r->sample_rate);
+        *ts = bps_timeline_at(&seg.tl, idx, r->sample_rate);
         *has_next = nxt;
         *next_idx = next.idx;
         return true;

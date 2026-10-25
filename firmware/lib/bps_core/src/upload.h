@@ -5,6 +5,7 @@
 #ifndef BPS_UPLOAD_H
 #define BPS_UPLOAD_H
 
+#include "beacon.h"
 #include "bps_common.h"
 #include "capture.h"
 #include "client.h"
@@ -21,7 +22,8 @@ typedef struct {
     const bps_ring *ring;
     const bps_capture *cap;
     bps_clock *clk;
-    const int64_t *epoch_ns; /* local time is monotonic time plus this */
+    const bps_beacon *beacon; /* the access point's clock, when it is followed */
+    const int64_t *epoch_ns;  /* local time is monotonic time plus this */
     const bool *epoch_set;
     uint32_t chunk_len, lookback; /* samples */
     uint64_t *chunks_sent;

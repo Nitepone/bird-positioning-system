@@ -88,6 +88,7 @@ mod tests {
             start: 0,
             sample_rate: sr,
             pcm: pcm.into(),
+            clock_ppb: 0,
         };
         let calls = MockIdentifier::default().identify(&sample).unwrap();
         assert_eq!(calls.len(), 2, "{calls:?}");
@@ -103,6 +104,7 @@ mod tests {
             start: 0,
             sample_rate: 48000,
             pcm: pcm.into(),
+            clock_ppb: 0,
         };
         assert!(
             MockIdentifier::default()

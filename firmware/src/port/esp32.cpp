@@ -9,6 +9,7 @@
 #include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
+#include <esp_private/wifi.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <fcntl.h>
@@ -46,27 +47,30 @@ extern "C" void port_log(const char *fmt, ...)
     Serial.printf("[%10lu] %s\r\n", (unsigned long)millis(), buf);
 }
 
-#ifdef BPS_BEACON_LOG
-#include <esp_private/wifi.h>
+// ---- Beacons ----
+//
+// In promiscuous mode alongside the normal connection, every beacon of the
+// connected access point is kept with the TSF it carries and the radio's
+// arrival timestamp (rx_ctrl.timestamp). That timestamp is on the radio's own
+// 32-bit microsecond clock, so once a second the radio's clock is read
+// between two esp_timer reads; the median of the last few such links
+// converts arrivals to the monotonic clock. Built with -DBPS_BEACON_LOG, every
+// beacon and link is also logged, for scripts/beacon_jitter.py.
 
-// Beacon sync experiment: logs every beacon of this network's access points
-// (on any channel the radio visits) with the TSF it carries and two arrival
-// times: the radio's (rx_ctrl.timestamp, 32-bit us) and esp_timer's when the
-// callback ran. scripts/beacon_jitter.py compares two boards' logs.
 struct beacon_obs {
     uint8_t bssid[6];
-    uint16_t seq;
-    int8_t rssi;
-    uint8_t channel;
     uint64_t tsf;
     uint32_t rx_us;
     int64_t cb_us;
 };
 
+#define LINKS 9
+
 static QueueHandle_t beacon_q;
-static char beacon_ssid[33];
-static size_t beacon_ssid_len;
-static uint32_t beacon_dropped; // written by the Wi-Fi task, read by the log task
+static uint8_t ap_bssid[6]; // the connected access point, all zero if none
+static int32_t link_off[LINKS]; // esp_timer - radio clock, mod 2^32
+static uint32_t n_links;
+static int64_t next_link_us;
 
 static void beacon_rx(void *buf, wifi_promiscuous_pkt_type_t type)
 {
@@ -75,29 +79,21 @@ static void beacon_rx(void *buf, wifi_promiscuous_pkt_type_t type)
         return;
     const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
     const uint8_t *f = p->payload;
-    // Beacon: 24-byte header, TSF (8), interval (2), capabilities (2), then
-    // the SSID element first.
-    size_t n = p->rx_ctrl.sig_len;
-    if (n < 38 || f[0] != 0x80 || f[36] != 0 || f[37] != beacon_ssid_len ||
-        n < 38 + beacon_ssid_len || memcmp(f + 38, beacon_ssid, beacon_ssid_len) != 0)
+    // Beacon: 24-byte header (BSSID at 16), then the TSF.
+    if (p->rx_ctrl.sig_len < 36 || f[0] != 0x80 || memcmp(f + 16, ap_bssid, 6) != 0)
         return;
     beacon_obs o;
     memcpy(o.bssid, f + 16, 6);
-    o.seq = (uint16_t)((f[22] | f[23] << 8) >> 4);
     o.tsf = 0;
     for (int i = 7; i >= 0; i--)
         o.tsf = o.tsf << 8 | f[24 + i];
-    o.rssi = (int8_t)p->rx_ctrl.rssi;
-    o.channel = (uint8_t)p->rx_ctrl.channel;
     o.rx_us = p->rx_ctrl.timestamp;
     o.cb_us = now;
-    if (xQueueSend(beacon_q, &o, 0) != pdTRUE)
-        __atomic_fetch_add(&beacon_dropped, 1, __ATOMIC_RELAXED);
+    xQueueSend(beacon_q, &o, 0);
 }
 
-// Links the radio's clock (that of rx_ctrl.timestamp) to esp_timer: the
-// tightest of 16 reads between two esp_timer reads.
-static void log_mac_clock(void)
+// The tightest of 16 reads of the radio's clock between two esp_timer reads.
+static void link_clocks(void)
 {
     int64_t best_mid = 0, best_width = INT64_MAX;
     uint32_t best_mac = 0;
@@ -111,49 +107,62 @@ static void log_mac_clock(void)
             best_mac = mac;
         }
     }
+    link_off[n_links++ % LINKS] = (int32_t)((uint32_t)best_mid - best_mac);
+#ifdef BPS_BEACON_LOG
     port_log("macclk esp %lld mac %lu width %lld", (long long)best_mid, (unsigned long)best_mac,
              (long long)best_width);
+#endif
 }
 
-static void beacon_log_task(void *)
+static int32_t link_offset(void)
 {
-    beacon_obs o;
-    uint32_t dropped = 0;
-    int64_t next_clock = 0;
-    for (;;) {
-        if (esp_timer_get_time() >= next_clock) {
-            log_mac_clock();
-            next_clock = esp_timer_get_time() + 1000000;
-        }
-        if (xQueueReceive(beacon_q, &o, pdMS_TO_TICKS(100)) != pdTRUE)
-            continue;
-        port_log("beacon %02x:%02x:%02x:%02x:%02x:%02x ch %u seq %u tsf %llu rx %lu cb %lld rssi %d",
-                 o.bssid[0], o.bssid[1], o.bssid[2], o.bssid[3], o.bssid[4], o.bssid[5],
-                 o.channel, o.seq, (unsigned long long)o.tsf, (unsigned long)o.rx_us,
-                 (long long)o.cb_us, o.rssi);
-        if (__atomic_load_n(&beacon_dropped, __ATOMIC_RELAXED) != dropped) {
-            dropped = __atomic_load_n(&beacon_dropped, __ATOMIC_RELAXED);
-            port_log("beacon: %lu dropped (log too slow)", (unsigned long)dropped);
-        }
+    uint32_t n = n_links < LINKS ? n_links : LINKS;
+    int32_t s[LINKS];
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t j = i;
+        for (; j > 0 && s[j - 1] > link_off[i]; j--)
+            s[j] = s[j - 1];
+        s[j] = link_off[i];
     }
+    return s[n / 2];
 }
 
-static void beacon_log_start(const char *ssid)
+static void beacons_start(void)
 {
-    beacon_ssid_len = strnlen(ssid, 32);
-    memcpy(beacon_ssid, ssid, beacon_ssid_len);
-    beacon_q = xQueueCreate(64, sizeof(beacon_obs));
-    xTaskCreatePinnedToCore(beacon_log_task, "beacons", 4096, nullptr, 1, nullptr, 0);
+    beacon_q = xQueueCreate(32, sizeof(beacon_obs));
     wifi_promiscuous_filter_t filter = {};
     filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(beacon_rx);
-    if (esp_wifi_set_promiscuous(true) == ESP_OK)
-        port_log("beacon: logging the beacons of \"%s\"", ssid);
-    else
-        port_log("beacon: cannot turn on promiscuous mode");
+    if (esp_wifi_set_promiscuous(true) != ESP_OK)
+        port_log("beacons: cannot turn on promiscuous mode");
 }
+
+extern "C" bool port_beacon_take(port_beacon *out)
+{
+    if (!beacon_q)
+        return false;
+    int64_t now = esp_timer_get_time();
+    if (now >= next_link_us) {
+        link_clocks();
+        next_link_us = now + 1000000;
+    }
+    beacon_obs o;
+    if (n_links == 0 || xQueueReceive(beacon_q, &o, 0) != pdTRUE)
+        return false;
+    // Arrival on esp_timer: the radio's time plus the link, unwrapped near now.
+    uint32_t rx_esp = o.rx_us + (uint32_t)link_offset();
+    int64_t esp = now - (int64_t)(uint32_t)((uint32_t)now - rx_esp);
+#ifdef BPS_BEACON_LOG
+    port_log("beacon %02x:%02x:%02x:%02x:%02x:%02x ch %u seq %u tsf %llu rx %lu cb %lld rssi %d",
+             o.bssid[0], o.bssid[1], o.bssid[2], o.bssid[3], o.bssid[4], o.bssid[5], 0u, 0u,
+             (unsigned long long)o.tsf, (unsigned long)o.rx_us, (long long)o.cb_us, 0);
 #endif
+    memcpy(out->bssid, o.bssid, 6);
+    out->tsf_us = o.tsf;
+    out->mono_ns = esp * 1000;
+    return true;
+}
 
 // Logs why joining failed, once per distinct reason (auto-reconnect repeats it).
 static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
@@ -161,7 +170,9 @@ static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
     static uint8_t last_reason;
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
         last_reason = 0;
+        memcpy(ap_bssid, info.wifi_sta_connected.bssid, 6);
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        memset(ap_bssid, 0, 6);
         uint8_t r = info.wifi_sta_disconnected.reason;
         if (r != last_reason)
             port_log("wifi: not connected: %s (reason %u)",
@@ -192,10 +203,7 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid, password);
-#ifdef BPS_BEACON_LOG
-    if (!beacon_q)
-        beacon_log_start(ssid);
-#endif
+    beacons_start();
 }
 
 extern "C" bool port_wifi_up(void) { return WiFi.status() == WL_CONNECTED; }
@@ -328,26 +336,59 @@ extern "C" void port_udp_close(int h)
 // ---- Capture task ----
 
 #define DMA_FRAMES 256
+#define DMA_DESCS 8
 
 static i2s_chan_handle_t rx;
 
+// When each DMA buffer completed, stamped in the I2S interrupt: far less
+// delayed than the capture task's wake-up. The driver hands buffers to reads
+// in order and drops the oldest unread one when its queue is full, so the
+// n-th buffer read completed (n + buffers dropped so far)-th, or later if a
+// drop raced the read; a later stamp is only a later estimate, which the
+// timestamper ignores.
+#define STAMPS 16
+static int64_t isr_stamp[STAMPS];
+static uint32_t isr_done, isr_dropped;
+
+static bool IRAM_ATTR on_recv(i2s_chan_handle_t, i2s_event_data_t *, void *)
+{
+    uint32_t n = isr_done;
+    isr_stamp[n % STAMPS] = esp_timer_get_time();
+    __atomic_store_n(&isr_done, n + 1, __ATOMIC_RELEASE);
+    return false;
+}
+
+static bool IRAM_ATTR on_recv_q_ovf(i2s_chan_handle_t, i2s_event_data_t *, void *)
+{
+    __atomic_store_n(&isr_dropped, isr_dropped + 1, __ATOMIC_RELEASE);
+    return false;
+}
+
 static void capture_task(void *)
 {
-    static int32_t lr[2 * DMA_FRAMES];
+    static int32_t lr[2 * DMA_FRAMES]; // exactly one DMA buffer
+    uint32_t reads = 0;
     for (;;) {
         size_t got = 0;
         if (i2s_channel_read(rx, lr, sizeof lr, &got, portMAX_DELAY) != ESP_OK || got < 8)
             continue;
-        // Blocks until a DMA buffer completes and this task has the highest
-        // priority, so the read returns right after its last frame.
-        bps_capture_frames(lr, got / 8, port_mono_us());
+        uint64_t t = port_mono_us();
+        uint32_t k = reads++ + __atomic_load_n(&isr_dropped, __ATOMIC_ACQUIRE);
+        uint32_t done = __atomic_load_n(&isr_done, __ATOMIC_ACQUIRE);
+        if (got == sizeof lr && (int32_t)(done - k) > 0 && done - k < STAMPS) {
+            int64_t s = isr_stamp[k % STAMPS];
+            // Unless the stamp was overwritten while being read.
+            if (__atomic_load_n(&isr_done, __ATOMIC_ACQUIRE) - k < STAMPS && (uint64_t)s <= t)
+                t = (uint64_t)s;
+        }
+        bps_capture_frames(lr, got / 8, t);
     }
 }
 
 extern "C" void port_audio_start(uint32_t sample_rate)
 {
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    cc.dma_desc_num = 8;
+    cc.dma_desc_num = DMA_DESCS;
     cc.dma_frame_num = DMA_FRAMES;
     if (i2s_new_channel(&cc, nullptr, &rx) != ESP_OK) {
         port_log("audio: cannot create the I2S channel");
@@ -371,7 +412,12 @@ extern "C" void port_audio_start(uint32_t sample_rate)
     sc.gpio_cfg.ws = (gpio_num_t)BPS_I2S_WS;
     sc.gpio_cfg.dout = I2S_GPIO_UNUSED;
     sc.gpio_cfg.din = (gpio_num_t)BPS_I2S_DATA;
-    if (i2s_channel_init_std_mode(rx, &sc) != ESP_OK || i2s_channel_enable(rx) != ESP_OK) {
+    i2s_event_callbacks_t cbs = {};
+    cbs.on_recv = on_recv;
+    cbs.on_recv_q_ovf = on_recv_q_ovf;
+    if (i2s_channel_init_std_mode(rx, &sc) != ESP_OK ||
+        i2s_channel_register_event_callback(rx, &cbs, nullptr) != ESP_OK ||
+        i2s_channel_enable(rx) != ESP_OK) {
         port_log("audio: I2S failed to start");
         return;
     }

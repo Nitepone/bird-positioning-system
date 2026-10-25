@@ -207,15 +207,34 @@ static void upload_begin(uint32_t start, uint64_t now)
             break;
         start = next_idx;
     }
-    int64_t len_ns = bps_samples_to_ns(c.chunk_len, c.cfg->sample_rate);
-    int64_t start_ns = bps_clock_correct(c.clk, mono_ts + *c.epoch_ns, len_ns);
+    /* The chunk's end is still to be captured: its time comes from the timeline. */
+    int64_t mono_end;
+    if (!bps_ring_locate(c.ring, start + c.chunk_len, &mono_end, &has_next, &next_idx))
+        mono_end = mono_ts + bps_samples_to_ns(c.chunk_len, c.cfg->sample_rate);
+    /* Recorded for the status; the times sent are corrected at each end. */
+    bps_clock_correct(c.clk, mono_ts + *c.epoch_ns, mono_end - mono_ts);
+    int64_t start_ns = bps_clock_at(c.clk, mono_ts + *c.epoch_ns);
+    int64_t end_ns = bps_clock_at(c.clk, mono_end + *c.epoch_ns);
 
-    char extra[64], path[96];
+    char extra[192], path[96];
     bps_json x;
     bps_json_init(&x, extra, sizeof extra);
     bps_json_raw(&x, BPS_HEADER_START_NS ": ");
     bps_json_i64(&x, start_ns);
+    bps_json_raw(&x, "\r\n" BPS_HEADER_END_NS ": ");
+    bps_json_i64(&x, end_ns);
     bps_json_raw(&x, "\r\n");
+    if (bps_beacon_ready(c.beacon, (int64_t)now * 1000)) {
+        char bssid[18];
+        bps_beacon_bssid(c.beacon, bssid);
+        bps_json_raw(&x, BPS_HEADER_TSF ": ");
+        bps_json_raw(&x, bssid);
+        bps_json_raw(&x, " ");
+        bps_json_i64(&x, bps_beacon_tsf_at(c.beacon, mono_ts));
+        bps_json_raw(&x, " ");
+        bps_json_i64(&x, bps_beacon_tsf_at(c.beacon, mono_end));
+        bps_json_raw(&x, "\r\n");
+    }
     c.path_for(path, sizeof path, "audio");
     /* FLAC's size is not known ahead: send it in chunks, one per frame. */
     size_t head = bps_http_head((char *)up.buf, sizeof up.buf - (6 + BPS_FLAC_HEADER_LEN + 2),

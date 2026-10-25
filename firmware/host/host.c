@@ -5,9 +5,11 @@
  * stands in for the positioning button.
  *
  *   make -C firmware/host
- *   firmware/host/bps-host-client -s 192.168.1.10 -w birds.wav [-p 2473] [-n "Name"] [-i UUID]
+ *   firmware/host/bps-host-client -s 192.168.1.10 -w birds.wav [-p 2473] [-n "Name"] [-i UUID] [-b]
  *
  * -S MS blocks every TCP write for MS ms every 15 s, to test Wi-Fi stalls.
+ * -b hears beacons of a pretend access point whose clock (TSF) is this
+ * computer's real-time clock, so host clients on one computer share it.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -265,6 +267,30 @@ void port_audio_start(uint32_t sample_rate)
     pthread_create(&t, NULL, audio_thread, (void *)(uintptr_t)sample_rate);
 }
 
+static bool fake_beacons;
+
+bool port_beacon_take(port_beacon *out)
+{
+    static uint64_t last_tbtt;
+    if (!fake_beacons)
+        return false;
+    struct timespec rt, mono;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    /* The AP's TSF counts microseconds since 2023; it beacons every 102.4 ms. */
+    int64_t tsf_ns = ((int64_t)rt.tv_sec - 1672531200) * BPS_NANOS_PER_SEC + rt.tv_nsec;
+    uint64_t tbtt = (uint64_t)(tsf_ns / 1000) / 102400 * 102400;
+    if (tbtt <= last_tbtt)
+        return false;
+    last_tbtt = tbtt;
+    static const uint8_t bssid[6] = {0x02, 0, 0, 0, 0, 0x01};
+    memcpy(out->bssid, bssid, 6);
+    out->tsf_us = tbtt;
+    out->mono_ns = (int64_t)mono.tv_sec * BPS_NANOS_PER_SEC + mono.tv_nsec -
+                   (tsf_ns - (int64_t)tbtt * 1000);
+    return true;
+}
+
 void port_led(bool on) { (void)on; }
 
 static volatile uint64_t enter_until;
@@ -300,7 +326,7 @@ int main(int argc, char **argv)
     };
     const char *wav_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:b")) != -1) {
         switch (opt) {
         case 's': s.server_host = optarg; break;
         case 'p': s.server_port = (uint16_t)atoi(optarg); break;
@@ -310,9 +336,10 @@ int main(int argc, char **argv)
         case 'r': s.ring_bytes = (uint32_t)atoi(optarg) * 1024; break;
         case 'l': s.lookback_ms = (uint32_t)atoi(optarg); break;
         case 'S': stall_ms = (unsigned)atoi(optarg); break;
+        case 'b': fake_beacons = true; break;
         default:
             fprintf(stderr, "usage: %s -s SERVER -w FILE.wav [-p PORT] [-n NAME] [-i UUID] "
-                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS]\n", argv[0]);
+                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS] [-b]\n", argv[0]);
             return 2;
         }
     }

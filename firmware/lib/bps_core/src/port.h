@@ -61,6 +61,17 @@ int port_udp_send(int h, const void *buf, size_t len);
 int port_udp_recv(int h, void *buf, size_t len);
 void port_udp_close(int h);
 
+/* A beacon of the access point the board is connected to: the TSF (the AP's
+ * clock) it carries, and when it arrived on the monotonic clock. */
+typedef struct {
+    uint8_t bssid[6];
+    uint64_t tsf_us;
+    int64_t mono_ns;
+} port_beacon;
+/* Takes the next beacon heard, if any. Boards whose radio cannot timestamp
+ * beacons (the Pico W's) never have one. */
+bool port_beacon_take(port_beacon *out);
+
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);
 

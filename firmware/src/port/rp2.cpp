@@ -246,6 +246,13 @@ void loop1()
         lr[0] = lr[total - 1];
 }
 
+// The CYW43 driver has no monitor mode, so no beacon timestamps.
+extern "C" bool port_beacon_take(port_beacon *out)
+{
+    (void)out;
+    return false;
+}
+
 // ---- LED and button ----
 
 extern "C" void port_led(bool on)

@@ -123,6 +123,8 @@ void bps_clock_init(bps_clock *c, bool corrects);
 /* The timestamp to send for audio captured from client time `start` for
  * `len_ns`: on the server's clock, evaluated at the chunk's midpoint. */
 int64_t bps_clock_correct(bps_clock *c, int64_t start, int64_t len_ns);
+/* Client time `t` on the server's clock: corrected by the fit, if it corrects. */
+int64_t bps_clock_at(const bps_clock *c, int64_t t);
 /* Counts a request once it was answered or timed out. */
 void bps_clock_count_request(bps_clock *c);
 void bps_clock_add_sample(bps_clock *c, bps_ts_sample s);

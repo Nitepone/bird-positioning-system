@@ -1,8 +1,10 @@
 #include "client.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "beacon.h"
 #include "capture.h"
 #include "port.h"
 #include "proto.h"
@@ -56,6 +58,8 @@ static bps_clock clk;
 
 static bps_ring ring;
 static bps_capture cap;
+/* The connected access point's clock, from its beacons (where the radio can). */
+static bps_beacon beacon;
 static bool capturing;
 
 /* From the latest registration. */
@@ -282,7 +286,7 @@ static void start_capture(void)
              (unsigned long)port_free_heap());
     bps_capture_init(&cap, &ring, cfg.sample_rate, cfg.mic_channel, &gate_cfg);
     bps_upload_ctx u = {
-        .cfg = &cfg, .ring = &ring, .cap = &cap, .clk = &clk,
+        .cfg = &cfg, .ring = &ring, .cap = &cap, .clk = &clk, .beacon = &beacon,
         .epoch_ns = &epoch_ns, .epoch_set = &epoch_set,
         .chunk_len = chunk_len, .lookback = lookback,
         .chunks_sent = &stats.chunks_sent, .overruns = &stats.overruns,
@@ -554,7 +558,7 @@ static uint32_t dropouts_total(void) { return LOAD(&cap.dropouts) + stats.overru
 
 static void start_heartbeat(uint64_t now)
 {
-    static char body[768];
+    static char body[1024];
     char path[96];
     bps_json j;
     bps_json_init(&j, body, sizeof body);
@@ -594,7 +598,33 @@ static void start_heartbeat(uint64_t now)
             else
                 bps_json_raw(&j, "null");
         }
-        bps_json_raw(&j, "}}");
+        bps_json_raw(&j, "}");
+        /* The access point's clock against the server's, both now: what the
+         * server pools across the AP's clients to convert its TSF. */
+        const bps_ts_fit *f = bps_est_fit(&clk.est);
+        int64_t mono = (int64_t)now * 1000;
+        if (f && clk.corrects && bps_beacon_ready(&beacon, mono)) {
+            char bssid[18];
+            bps_beacon_bssid(&beacon, bssid);
+            bps_json_key(&j, "beacon");
+            bps_json_raw(&j, "{");
+            bps_json_key(&j, "bssid");
+            bps_json_str(&j, bssid);
+            bps_json_key(&j, "tsf_ns");
+            bps_json_i64(&j, bps_beacon_tsf_at(&beacon, mono));
+            bps_json_key(&j, "server_ns");
+            bps_json_i64(&j, bps_clock_at(&clk, mono + epoch_ns));
+            bps_json_key(&j, "server_error_ns");
+            bps_json_i64(&j, f->error_ns);
+            bps_json_key(&j, "scatter_ns");
+            bps_json_i64(&j, beacon.scatter_ns);
+            bps_json_key(&j, "drift_ppm");
+            bps_json_fixed(&j, beacon.rate * -1e6, 4);
+            bps_json_key(&j, "beacons");
+            bps_json_i64(&j, beacon.fit_points);
+            bps_json_raw(&j, "}");
+        }
+        bps_json_raw(&j, "}");
     } else {
         bps_json_raw(&j, "null");
     }
@@ -748,16 +778,26 @@ static void log_status(uint64_t now)
     const bps_ts_fit *f = bps_est_fit(&clk.est);
     /* The error is half the best round trip plus the scatter around the fit. */
     port_log("status: %s, clock error %ld us (best round trip %ld us, scatter %ld us), drift %s "
-             "ppm, sample rate %s ppm, %lu sent, %lu gated, %lu dropouts, %lu bytes free "
-             "(lowest %lu)",
+             "ppm, sample rate %s ppm (timeline scatter %ld ns, last point %ld ns off), %lu sent, "
+             "%lu gated, %lu dropouts, %lu bytes free (lowest %lu)",
              synced() ? "synced" : "not synced", f ? (long)(f->error_ns / 1000) : -1L,
              f ? (long)(f->rtt_ns / 1000) : -1L,
              f ? (long)((f->error_ns - f->rtt_ns / 2) / 1000) : -1L,
              centi(a, sizeof a, f ? (int32_t)(bps_fit_drift_ppm(f) * 100) : 0),
-             centi(b, sizeof b, LOAD(&cap.rate_err_ppb) / 10000),
+             centi(b, sizeof b, LOAD(&cap.rate_err_ppb) / 10000), (long)LOAD(&cap.scatter_ns),
+             (long)LOAD(&cap.predict_ns),
              (unsigned long)stats.chunks_sent, (unsigned long)stats.chunks_gated,
              (unsigned long)dropouts_total(), (unsigned long)port_free_heap(),
              (unsigned long)heap_low);
+    if (bps_beacon_ready(&beacon, (int64_t)now * 1000)) {
+        char bssid[18];
+        bps_beacon_bssid(&beacon, bssid);
+        port_log("beacons: following %s, %lu in the line, scatter %ld ns, drift %s ppm against "
+                 "it, %lu restarts",
+                 bssid, (unsigned long)beacon.fit_points, (long)beacon.scatter_ns,
+                 centi(a, sizeof a, (int32_t)lround(beacon.rate * -1e8)),
+                 (unsigned long)beacon.restarts);
+    }
     if (state == ST_RUN)
         diag_log_net();
 }
@@ -787,6 +827,9 @@ void bps_client_setup(const bps_settings *s)
 void bps_client_loop(void)
 {
     uint64_t now = port_mono_us();
+    port_beacon pb;
+    for (int i = 0; i < 16 && port_beacon_take(&pb); i++)
+        bps_beacon_push(&beacon, pb.bssid, pb.tsf_us, pb.mono_ns);
     if (state != ST_WIFI && !port_wifi_up()) {
         port_log("wifi: disconnected");
         drop_connections();

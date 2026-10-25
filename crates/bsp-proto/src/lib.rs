@@ -24,6 +24,19 @@ pub const CLIENT_API_PREFIX: &str = "/api/v1/client";
 /// Header carrying the timestamp of the first sample of an uploaded WAV chunk.
 pub const HEADER_START_NS: &str = "x-bsp-start-ns";
 
+/// Optional header: when the sample after the chunk's last was captured, on
+/// the same clock as [`HEADER_START_NS`]. With the start it gives the chunk's
+/// actual duration, which differs from the nominal one by the sample clock's
+/// error.
+pub const HEADER_END_NS: &str = "x-bps-end-ns";
+
+/// Optional header from clients that follow their Wi-Fi access point's clock
+/// (TSF) by its beacons: `<bssid> <start> <end>`, the chunk's start and end
+/// as [`HEADER_START_NS`] and [`HEADER_END_NS`] but on that clock (ns). All
+/// clients of one access point share it to microseconds; the server converts
+/// it to its own clock (see [`BeaconSync`]).
+pub const HEADER_TSF: &str = "x-bps-tsf";
+
 /// Current wall-clock time.
 pub fn now_ns() -> Timestamp {
     let d = SystemTime::now()
@@ -106,6 +119,24 @@ pub struct ClockStatus {
     pub error_ns: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<SyncDetail>,
+    /// Present while the client follows its access point's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beacon: Option<BeaconSync>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bssids_round_trip() {
+        let b: Bssid = "04:f4:1c:07:93:52".parse().unwrap();
+        assert_eq!(b.0, [4, 0xf4, 0x1c, 7, 0x93, 0x52]);
+        assert_eq!(serde_json::to_string(&b).unwrap(), "\"04:f4:1c:07:93:52\"");
+        assert!("04:f4:1c:07:93".parse::<Bssid>().is_err());
+        assert!("04:f4:1c:07:93:52:00".parse::<Bssid>().is_err());
+        assert!("04:f4:1c:07:93:zz".parse::<Bssid>().is_err());
+    }
 }
 
 impl ClockStatus {
@@ -115,6 +146,74 @@ impl ClockStatus {
     pub fn error_bound_ns(&self) -> i64 {
         self.error_ns
             .unwrap_or(self.offset_ns.abs() + self.rtt_ns / 2)
+    }
+}
+
+/// A client's view of its Wi-Fi access point's clock (TSF), which it follows
+/// by the AP's beacons, and of the server's clock at the same instant. The
+/// server pools these across the AP's clients to convert its TSF.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BeaconSync {
+    /// The access point.
+    pub bssid: Bssid,
+    /// Its TSF (ns), now.
+    pub tsf_ns: i64,
+    /// The server clock at the same instant, by the client's measurement.
+    pub server_ns: Timestamp,
+    /// Worst-case error of `server_ns` (ns).
+    pub server_error_ns: i64,
+    /// RMS distance of the beacons' arrivals from the client's line through
+    /// them (ns): how precisely the client follows the TSF.
+    pub scatter_ns: i64,
+    /// Client clock rate relative to the access point's, parts per million.
+    pub drift_ppm: f64,
+    /// Beacons the line is fitted through.
+    pub beacons: u32,
+}
+
+/// A Wi-Fi access point's address, written `aa:bb:cc:dd:ee:ff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Bssid(pub [u8; 6]);
+
+impl std::fmt::Display for Bssid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = self.0;
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
+    }
+}
+
+impl std::str::FromStr for Bssid {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut out = [0u8; 6];
+        let mut parts = s.split(':');
+        for b in &mut out {
+            let p = parts.next().filter(|p| p.len() == 2);
+            *b = p
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(|| format!("not a BSSID: {s:?}"))?;
+        }
+        if parts.next().is_some() {
+            return Err(format!("not a BSSID: {s:?}"));
+        }
+        Ok(Bssid(out))
+    }
+}
+
+impl Serialize for Bssid {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bssid {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 

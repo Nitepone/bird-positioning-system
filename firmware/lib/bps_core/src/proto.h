@@ -9,6 +9,12 @@
 
 #define BPS_CLIENT_API_PREFIX "/api/v1/client"
 #define BPS_HEADER_START_NS "x-bsp-start-ns"
+/* When the sample after the chunk's last was captured: with the start, the
+ * chunk's actual duration (its sample clock is never exactly nominal). */
+#define BPS_HEADER_END_NS "x-bps-end-ns"
+/* The same two times on the clock of the access point whose beacons the
+ * client follows: "<bssid> <start TSF ns> <end TSF ns>". */
+#define BPS_HEADER_TSF "x-bps-tsf"
 
 /* ---- HTTP ---- */
 

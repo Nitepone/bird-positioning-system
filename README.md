@@ -168,6 +168,19 @@ line for your network) works well. If clients and server are all disciplined by 
 beats measuring over the network, run `bsp-client --trust-os-clock`: it then sends its OS clock's
 timestamps unchanged and only reports how far off they are.
 
+**Access point clocks (ESP32 boards).** Every Wi-Fi access point broadcasts a beacon about ten
+times a second carrying its own clock (the TSF), and every client connected to it hears the same
+beacons. ESP32 microcontroller clients timestamp each beacon in the radio and fit a line through
+them, so they know the AP's clock to about a microsecond, and send their audio's times on it
+(`x-bps-tsf`). Their heartbeats also report the AP's clock against the server's at one instant.
+The server pools those reports from all of an AP's clients into one line that converts that AP's
+clock to its own: converted audio is as close to the server's clock as that line (usually better
+than any one client's own measurement), and the clients of one AP line up with each other to
+microseconds whatever the line's error. So a client also counts as synced when it follows an AP
+that another client follows too, and positioning then uses either the clients synced to the server
+clock or those of one AP, whichever are more. APs on different channels have unrelated clocks, so
+this works per AP; a Pico W cannot timestamp beacons.
+
 The **Clocks** page shows every client's timestamp error, clock offset, drift, round trips and
 answered measurements, and for one client at a time, charts of the last 15 minutes to an hour
 (kept in the server's memory, so they start afresh when it restarts). Use it to compare networks
@@ -254,11 +267,20 @@ default.
 - **Wi-Fi and sync.** A worst-case clock error includes half the fastest round trip, and a Pico
   W's Wi-Fi round trips are rarely under 4 ms. So on many networks it stays above the server's
   default 2 ms limit (**NOT synced**: identified, but left out of positioning). Its status line
-  shows the best round trip and the signal strength.
+  shows the best round trip and the signal strength. ESP32 boards also follow their access
+  point's clock by its beacons (see [Keep client clocks accurate](#keep-client-clocks-accurate)): with two or more on one AP, they
+  are synced with each other to microseconds even where Wi-Fi round trips are slow. Their log's
+  `beacons:` line names the AP and how closely they follow it.
 - **Clock.** The boards have no clock of their own beyond a timer from boot. They set their
   clock from the server once, then measure and correct it over UDP exactly like `bsp-client`. The
   I2S sample clock runs off the same crystal as that timer. Wi-Fi power saving is turned off,
   because it delays packets.
+- **Audio timestamps.** Each I2S buffer is timestamped as it completes (on the ESP32, in the I2S
+  interrupt). Every second, the least delayed of that second's timestamps is taken, and a line
+  through the last 32 gives each sample's capture time and the sample clock's rate. The status
+  line's *timeline scatter* is how far those points lie from the line; on an ESP32 it is well
+  under a microsecond. Each upload carries its exact start and end, so the server knows its
+  real duration rather than assuming exactly 48 kHz.
 
 | Board | RAM | Ring buffer | Default look-back |
 |---|---|---|---|
@@ -364,6 +386,10 @@ make -C firmware/host
 firmware/host/bps-host-client -s SERVER -w birds.wav -n "Host test"   # 16-bit PCM WAV, loops
 ```
 
+With `-b` it also hears beacons of a pretend access point whose clock is the computer's real-time
+clock, so several host clients on one computer (each with its own `-i UUID`) share an AP, as ESP32
+boards on one access point do.
+
 ## Developer notes
 
 **Crates:** `bsp-proto` (wire types), `bsp-core` (audio helpers, `Identifier`, `Locator`,
@@ -371,8 +397,9 @@ firmware/host/bps-host-client -s SERVER -w birds.wav -n "Host test"   # 16-bit P
 firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 
 **Firmware** (`firmware/`, PlatformIO):
-- `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement,
-  `Timestamper` and noise gate, plus the ring buffer and the client's state machines.
+- `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement
+  and noise gate, plus the audio timestamper, the access point clock (`beacon.c`), the ring
+  buffer and the client's state machines.
   `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
   `esp32.cpp` (ESP32 and ESP32-S3: Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
   `host/` is a Linux board layer for testing.
@@ -397,7 +424,9 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `POST /register`: the response's `flac_uploads` says whether the server takes FLAC uploads
   - `POST /{id}/heartbeat`
   - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
-    client always sends FLAC, about a quarter the size, with chunked encoding)
+    client always sends FLAC, about a quarter the size, with chunked encoding). Optional:
+    `x-bps-end-ns`, when the sample after the last was captured (the chunk's real duration), and
+    `x-bps-tsf: <bssid> <start> <end>`, the same two times on the access point's clock
   - `POST /{id}/position-request`
   - `GET /timesync`: WebSocket carrying the UDP clock-measurement packets (for browser clients)
 - Clock measurement: UDP on port 2473.

@@ -1,6 +1,7 @@
 //! Endpoints used by client devices.
 
 use super::{ApiError, ApiResult};
+use crate::audio_buffer::TsfStamp;
 use crate::clip_audio;
 use crate::clock_history::ClockReport;
 use crate::state::{PositioningRequest, SharedState};
@@ -12,8 +13,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
-    AudioAccepted, ClientId, HEADER_START_NS, Heartbeat, NANOS_PER_SEC, RegisterRequest,
-    RegisterResponse, now_ns,
+    AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat, NANOS_PER_SEC,
+    RegisterRequest, RegisterResponse, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -52,6 +53,17 @@ async fn register(
     }))
 }
 
+/// `<bssid> <start> <end>` from [`HEADER_TSF`].
+fn parse_tsf(v: &str) -> Option<TsfStamp> {
+    let mut it = v.split_whitespace();
+    let stamp = TsfStamp {
+        bssid: it.next()?.parse().ok()?,
+        start: it.next()?.parse().ok()?,
+        end: it.next()?.parse().ok()?,
+    };
+    (it.next().is_none() && stamp.end > stamp.start).then_some(stamp)
+}
+
 /// Longest suggested name kept, in characters.
 const MAX_NAME_CHARS: usize = 64;
 
@@ -85,6 +97,9 @@ async fn heartbeat(
         .db
         .touch_client(id, &addr.to_string(), hb.clock.as_ref(), now)?;
     state.event(Some(id), "heartbeat", serde_json::to_value(&hb)?);
+    if let Some(b) = hb.clock.and_then(|k| k.beacon) {
+        state.beacon_clocks.push(id, &b, now);
+    }
     state.clock_history.push(
         id,
         ClockReport {
@@ -122,13 +137,15 @@ async fn upload_audio(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<AudioAccepted>)> {
-    let start: i64 = headers
-        .get(HEADER_START_NS)
+    let header = |name: &str| -> Option<i64> { headers.get(name)?.to_str().ok()?.parse().ok() };
+    let start = header(HEADER_START_NS).ok_or_else(|| {
+        ApiError::bad_request(format!("missing or invalid {HEADER_START_NS} header"))
+    })?;
+    let end = header(HEADER_END_NS);
+    let tsf = headers
+        .get(HEADER_TSF)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("missing or invalid {HEADER_START_NS} header"))
-        })?;
+        .and_then(parse_tsf);
     if !state
         .db
         .touch_client(id, &addr.to_string(), None, now_ns())?
@@ -140,18 +157,28 @@ async fn upload_audio(
     let (sample_rate, pcm) = tokio::task::spawn_blocking(move || clip_audio::decode(&body))
         .await?
         .map_err(ApiError::bad_request)?;
+    // Audio stamped on an access point's clock is converted by its line.
+    let (start, end) = match tsf.and_then(|t| Some((t, state.beacon_clocks.line(t.bssid)?))) {
+        Some((t, line)) => (line.server_at(t.start), Some(line.server_at(t.end))),
+        None => (start, end),
+    };
+    let clock_ppb = end
+        .and_then(|end| AudioSample::clock_ppb_from(sample_rate, pcm.len(), start, end))
+        .unwrap_or(0);
     let sample = AudioSample {
         client_id: id,
         start,
         sample_rate,
         pcm: pcm.into(),
+        clock_ppb,
     };
     let duration_s = sample.duration_ns() as f32 / NANOS_PER_SEC as f32;
-    state.audio.push(sample.clone());
+    state.audio.push(sample.clone(), tsf);
     state.event(
         Some(id),
         "audio",
         json!({ "bytes": bytes, "sample_rate": sample_rate, "duration_s": duration_s, "start_ns": start,
+                "clock_ppb": clock_ppb, "tsf": tsf.map(|t| t.bssid.to_string()),
                 "latency_ms": (now_ns() - sample.end()) / 1_000_000 }),
     );
 
@@ -210,12 +237,22 @@ async fn position_request(
 
 #[cfg(test)]
 mod tests {
-    use super::clean_name;
+    use super::{clean_name, parse_tsf};
 
     #[test]
     fn cleans_suggested_names() {
         assert_eq!(clean_name("  North\tfence\n "), "North fence");
         assert_eq!(clean_name(""), "");
         assert_eq!(clean_name(&"é".repeat(100)).chars().count(), 64);
+    }
+
+    #[test]
+    fn parses_tsf_stamps() {
+        let t = parse_tsf("04:f4:1c:07:93:52 19946541465989000 19946550465989000").unwrap();
+        assert_eq!(t.bssid.to_string(), "04:f4:1c:07:93:52");
+        assert_eq!((t.start, t.end), (19946541465989000, 19946550465989000));
+        assert!(parse_tsf("04:f4:1c:07:93:52 5 4").is_none());
+        assert!(parse_tsf("04:f4:1c:07:93:52 5").is_none());
+        assert!(parse_tsf("nope 1 2").is_none());
     }
 }

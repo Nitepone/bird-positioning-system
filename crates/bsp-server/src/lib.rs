@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod audio_buffer;
+pub mod beacon_clock;
 pub mod clip_audio;
 pub mod clock_history;
 pub mod config;
@@ -199,8 +200,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         ..TdoaLocator::default()
     });
 
+    let beacon_clocks = Arc::new(beacon_clock::BeaconClocks::default());
     let state: SharedState = Arc::new(AppState {
-        audio: audio_buffer::AudioBuffers::new(cfg.audio_retention_s),
+        audio: audio_buffer::AudioBuffers::new(cfg.audio_retention_s, beacon_clocks.clone()),
+        beacon_clocks,
         clock_history: Default::default(),
         udp_port: udp.local_addr()?.port(),
         started_at: now_ns(),

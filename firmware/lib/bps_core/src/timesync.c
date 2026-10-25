@@ -274,6 +274,12 @@ int64_t bps_clock_correct(bps_clock *c, int64_t start, int64_t len_ns)
     return start + corr;
 }
 
+int64_t bps_clock_at(const bps_clock *c, int64_t t)
+{
+    const bps_ts_fit *f = c->corrects ? bps_est_fit(&c->est) : NULL;
+    return f ? t + bps_fit_offset_at(f, t) : t;
+}
+
 void bps_clock_count_request(bps_clock *c) { c->requests++; }
 
 void bps_clock_add_sample(bps_clock *c, bps_ts_sample s)

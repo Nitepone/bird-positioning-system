@@ -44,22 +44,25 @@ static void process(bps_capture *c, const int32_t *lr, size_t frames, uint64_t r
     /* The read returned after its last frame was captured, so this estimate
      * of the first frame's capture time can only be late. */
     int64_t est = (int64_t)read_us * 1000 - bps_samples_to_ns(frames, c->sample_rate);
-    bool dropout;
-    int64_t ts = bps_timestamper_push(&c->stamper, est, frames, &dropout);
-    if (dropout)
-        STORE(&c->dropouts, c->dropouts + 1);
+    uint32_t idx = bps_ring_written(c->ring);
+    int r = bps_timestamper_push(&c->stamper, idx, est, frames);
+    if (r != BPS_TS_SAME) {
+        const bps_timestamper *t = &c->stamper;
+        bps_ring_timeline(c->ring, bps_timestamper_model(t), r == BPS_TS_NEW, t->seg_start);
+        if (r == BPS_TS_NEW && c->started)
+            STORE(&c->dropouts, c->dropouts + 1);
+        STORE(&c->rate_err_ppb, -t->model.ppb);
+        STORE(&c->scatter_ns, (int32_t)t->scatter_ns);
+        int64_t p = bps_abs64(t->predict_ns);
+        STORE(&c->predict_ns, (int32_t)(p > INT32_MAX ? INT32_MAX : p));
+    }
 
-    c->block_start = bps_ring_written(c->ring);
-    bps_ring_write(c->ring, pcm, frames, ts);
+    c->block_start = idx;
+    bps_ring_write(c->ring, pcm, frames);
     bps_gate_process(&c->gate, pcm, frames, on_frame, c);
 
-    /* Diagnostics: both channels' level over the first 2 s (which one is the
-     * mic?), and the sample rate measured against the monotonic clock. */
-    if (!c->started) {
-        c->started = true;
-        c->first_est = est;
-    }
-    c->frames += frames;
+    /* Diagnostics: both channels' level over the first 2 s (which one is the mic?). */
+    c->started = true;
     if (c->level_frames < 2 * c->sample_rate) {
         /* In integers (the RP2040 has no FPU), from the top 16 bits as uploaded. */
         for (size_t i = 0; i < frames; i++)
@@ -73,14 +76,6 @@ static void process(bps_capture *c, const int32_t *lr, size_t frames, uint64_t r
             STORE(&c->level_cdb[1], to_cdb(c->level_sum[1], c->level_frames));
             STORE(&c->levels_ready, 1u);
         }
-    }
-    int64_t elapsed = est + bps_samples_to_ns(frames, c->sample_rate) - c->first_est;
-    if (elapsed > 10 * BPS_NANOS_PER_SEC) {
-        double nominal = (double)bps_samples_to_ns(c->frames, c->sample_rate);
-        double ppb = (nominal - (double)elapsed) / (double)elapsed * 1e9;
-        /* Way off means broken capture, not a slow clock: keep it readable. */
-        ppb = ppb > 2e9 ? 2e9 : ppb < -2e9 ? -2e9 : ppb;
-        STORE(&c->rate_err_ppb, (int32_t)lround(ppb));
     }
 }
 
