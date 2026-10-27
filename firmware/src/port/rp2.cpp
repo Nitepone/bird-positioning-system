@@ -253,6 +253,15 @@ extern "C" bool port_beacon_take(port_beacon *out)
     return false;
 }
 
+// ---- Buses and storage: not on the Pico boards yet ----
+
+extern "C" bool port_i2c_begin(int, int, uint32_t) { return false; }
+extern "C" bool port_i2c_xfer(uint8_t, const uint8_t *, size_t, uint8_t *, size_t) { return false; }
+extern "C" bool port_sd_begin(int, int, int, int) { return false; }
+extern "C" void port_sd_info_get(port_sd_info *out) { *out = port_sd_info{}; }
+extern "C" bool port_sd_write(const char *, const void *, size_t, bool) { return false; }
+extern "C" void port_sd_close(void) {}
+
 // ---- LED and button ----
 
 extern "C" void port_led(bool on)

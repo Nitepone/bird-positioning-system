@@ -2,18 +2,24 @@
 # to write it by hand, copy it to bps.conf and fill it in. Empty settings take
 # the board's defaults (see scripts/bps_config.py).
 
-BOARD=pico_w                # pico_w, pico2_w, esp32, xiao_esp32s3 or xiao_esp32s3_plus
+BOARD=pico_w                # pico_w, pico2_w, esp32, xiao_esp32s3, xiao_esp32s3_plus or bps_xiao
 WIFI_SSID='My network'
 WIFI_PASSWORD='change me!'  # empty for an open network
 SERVER_HOST=192.168.1.10    # the bps server
 SERVER_PORT=2473            # its client port (not the web UI port)
 CLIENT_NAME='North fence'   # suggested name (optional)
 
-I2S_BCLK=18                 # Pico: LRCL (word select) goes to BCLK + 1
+I2S_BCLK=18                 # Pico: LRCL (word select) goes to BCLK + 1; bps_xiao: fixed
 I2S_DATA=20
 MIC_CHANNEL=left            # left: SEL to GND or unconnected; right: SEL to 3V
 
 BUTTON_PIN=none             # GPIO of a positioning button to GND
 LED_PIN=builtin             # status LED: a GPIO, none, or builtin (Pico, XIAO)
+I2C_SDA=none                # peripheral buses: ESP32 boards (fixed on bps_xiao)
+I2C_SCL=none
+SPI_SCK=none
+SPI_MISO=none
+SPI_MOSI=none
+DEVICES=none                # e.g. 'max17048@0x36 sd@2' (battery gauge, microSD card)
 LOOKBACK_MS=750             # audio kept before the sound that opened the gate
 RING_KB=160                 # RAM asked for the ring buffer

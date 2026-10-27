@@ -10,6 +10,7 @@
  * -S MS blocks every TCP write for MS ms every 15 s, to test Wi-Fi stalls.
  * -b hears beacons of a pretend access point whose clock (TSF) is this
  * computer's real-time clock, so host clients on one computer share it.
+ * -d DIR stands in a directory for a storage card: recordings are saved there.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -25,6 +26,8 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -291,6 +294,79 @@ bool port_beacon_take(port_beacon *out)
     return true;
 }
 
+/* No I2C devices on a computer. */
+bool port_i2c_begin(int sda, int scl, uint32_t hz)
+{
+    (void)sda, (void)scl, (void)hz;
+    return false;
+}
+
+bool port_i2c_xfer(uint8_t addr, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t rx_len)
+{
+    (void)addr, (void)tx, (void)tx_len, (void)rx, (void)rx_len;
+    return false;
+}
+
+/* The storage card is a directory (-d), written at once. */
+static const char *sd_dir;
+static FILE *sd_file;
+static char sd_path[512];
+static port_sd_info sd_info;
+
+bool port_sd_begin(int sck, int miso, int mosi, int cs)
+{
+    (void)sck, (void)miso, (void)mosi, (void)cs;
+    return sd_dir != NULL;
+}
+
+void port_sd_info_get(port_sd_info *out)
+{
+    struct statvfs v;
+    sd_info.present = sd_dir && statvfs(sd_dir, &v) == 0;
+    if (sd_info.present) {
+        sd_info.total_bytes = (uint64_t)v.f_blocks * v.f_frsize;
+        sd_info.free_bytes = (uint64_t)v.f_bavail * v.f_frsize;
+    }
+    *out = sd_info;
+}
+
+static void make_dirs(char *path)
+{
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = 0;
+        mkdir(path, 0755);
+        *p = '/';
+    }
+}
+
+bool port_sd_write(const char *path, const void *buf, size_t len, bool append)
+{
+    char full[sizeof sd_path];
+    snprintf(full, sizeof full, "%s/%s", sd_dir ? sd_dir : "", path);
+    if (sd_dir && (!sd_file || !append || strcmp(full, sd_path) != 0)) {
+        port_sd_close();
+        make_dirs(full);
+        sd_file = fopen(full, append ? "ab" : "wb");
+        snprintf(sd_path, sizeof sd_path, "%s", full);
+    }
+    if (!sd_file || fwrite(buf, 1, len, sd_file) != len) {
+        sd_info.errors += sd_dir != NULL;
+        sd_info.dropped_bytes += len;
+        return false;
+    }
+    return true;
+}
+
+void port_sd_close(void)
+{
+    if (sd_file)
+        fclose(sd_file);
+    sd_file = NULL;
+    sd_path[0] = 0;
+}
+
 void port_led(bool on) { (void)on; }
 
 static volatile uint64_t enter_until;
@@ -323,10 +399,11 @@ int main(int argc, char **argv)
         .mic_channel = 0,
         .ring_bytes = 160 * 1024,
         .lookback_ms = 1000,
+        .buses = {-1, -1, -1, -1, -1, ""},
     };
     const char *wav_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:b")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:bd:")) != -1) {
         switch (opt) {
         case 's': s.server_host = optarg; break;
         case 'p': s.server_port = (uint16_t)atoi(optarg); break;
@@ -337,9 +414,13 @@ int main(int argc, char **argv)
         case 'l': s.lookback_ms = (uint32_t)atoi(optarg); break;
         case 'S': stall_ms = (unsigned)atoi(optarg); break;
         case 'b': fake_beacons = true; break;
+        case 'd':
+            sd_dir = optarg;
+            s.buses.devices = "sd";
+            break;
         default:
             fprintf(stderr, "usage: %s -s SERVER -w FILE.wav [-p PORT] [-n NAME] [-i UUID] "
-                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS] [-b]\n", argv[0]);
+                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS] [-b] [-d DIR]\n", argv[0]);
             return 2;
         }
     }

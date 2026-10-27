@@ -72,6 +72,39 @@ typedef struct {
  * beacons (the Pico W's) never have one. */
 bool port_beacon_take(port_beacon *out);
 
+/* ---- Buses (see devices.h) ---- */
+
+/* Starts the I2C bus as controller; false where the board has none. */
+bool port_i2c_begin(int sda, int scl, uint32_t hz);
+/* Writes `tx_len` bytes to the device at 7-bit address `addr`, then (with a
+ * repeated start) reads `rx_len`; either may be 0. False if it does not answer. */
+bool port_i2c_xfer(uint8_t addr, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t rx_len);
+
+/* ---- Storage card (microSD over SPI) ---- */
+
+/* Starts looking after the card with chip select `cs`: it is mounted when
+ * found and again whenever it comes back after being pulled out. Card I/O runs
+ * on its own task, so a slow card never holds up the caller. False where the
+ * board cannot have one. */
+bool port_sd_begin(int sck, int miso, int mosi, int cs);
+
+typedef struct {
+    bool present; /* a card is mounted */
+    uint64_t total_bytes, free_bytes;
+    uint32_t errors;        /* failed writes and mounts lost, so far */
+    uint64_t dropped_bytes; /* not written: no card, or the queue to it was full */
+} port_sd_info;
+void port_sd_info_get(port_sd_info *out);
+
+/* Queues `len` bytes for the file at `path` (relative to the card's root;
+ * missing directories are made), replacing the file (`append` false) or added
+ * at its end. Writes happen in order; the file stays open until another file
+ * is written or port_sd_close(). False (and the bytes are dropped) when there
+ * is no card or the queue is full. */
+bool port_sd_write(const char *path, const void *buf, size_t len, bool append);
+/* Queues closing the open file. */
+void port_sd_close(void);
+
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);
 

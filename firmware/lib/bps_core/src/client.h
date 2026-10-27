@@ -8,6 +8,7 @@
 #define BPS_CLIENT_H
 
 #include "bps_common.h"
+#include "devices.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,7 @@ typedef struct {
     int mic_channel; /* 0 = left, 1 = right */
     uint32_t ring_bytes;
     uint32_t lookback_ms;
+    bps_bus_settings buses; /* peripherals: battery gauge, storage card */
 } bps_settings;
 
 void bps_client_setup(const bps_settings *s);

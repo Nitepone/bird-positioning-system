@@ -25,12 +25,16 @@ fi
 backtitle="bps (bird positioning system) - microcontroller client"
 
 keys=(BOARD WIFI_SSID WIFI_PASSWORD SERVER_HOST SERVER_PORT CLIENT_NAME I2S_BCLK I2S_WS I2S_DATA
-    MIC_CHANNEL BUTTON_PIN LED_PIN LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID)
+    MIC_CHANNEL BUTTON_PIN LED_PIN I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI DEVICES
+    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID)
+bus_keys=(I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI)
 declare -A label=(
     [BOARD]="Board" [WIFI_SSID]="Wi-Fi network" [WIFI_PASSWORD]="Wi-Fi password"
     [SERVER_HOST]="Server address" [SERVER_PORT]="Server port" [CLIENT_NAME]="Client name"
     [I2S_BCLK]="Mic BCLK pin" [I2S_WS]="Mic LRCL pin" [I2S_DATA]="Mic DOUT pin"
     [MIC_CHANNEL]="Mic channel" [BUTTON_PIN]="Button pin" [LED_PIN]="Status LED"
+    [I2C_SDA]="I2C SDA pin" [I2C_SCL]="I2C SCL pin" [SPI_SCK]="SPI SCK pin"
+    [SPI_MISO]="SPI MISO pin" [SPI_MOSI]="SPI MOSI pin" [DEVICES]="Devices"
     [LOOKBACK_MS]="Look-back" [RING_KB]="Ring buffer" [DEVICE_NAME]="Mic name"
     [CLIENT_ID]="Client ID"
 )
@@ -46,6 +50,10 @@ ask() { "$ui" --backtitle "$backtitle" "$@" 3>&1 1>&2 2>&3; }
 msg() { "$ui" --backtitle "$backtitle" --title "$1" --msgbox "$2" 16 74 || true; }
 
 pico() { [[ $BOARD == pico* ]]; }
+# Boards whose PDM microphone is wired on the board: its pins are not settings.
+fixed_mic() { [[ $BOARD == bps_xiao ]]; }
+# Boards whose I2C and SPI buses are wired on the board.
+fixed_buses() { [[ $BOARD == bps_xiao ]]; }
 
 # Current settings: the file's, else a new Pico W config.
 for k in "${keys[@]}"; do declare "$k="; done
@@ -72,6 +80,11 @@ use_board_defaults() {
     I2S_BCLK=$DEF_I2S_BCLK I2S_WS=$DEF_I2S_WS I2S_DATA=$DEF_I2S_DATA
     BUTTON_PIN=$DEF_BUTTON_PIN LED_PIN=$DEF_LED_PIN
     LOOKBACK_MS=$DEF_LOOKBACK_MS RING_KB=$DEF_RING_KB
+    local k def
+    for k in "${bus_keys[@]}" DEVICES; do
+        def=DEF_$k
+        printf -v "$k" '%s' "${!def}"
+    done
 }
 
 fill_defaults
@@ -108,9 +121,22 @@ show() {
         WIFI_PASSWORD) if [[ -z $v ]]; then echo "(none: open network)"; else echo "set (${#v} characters)"; fi ;;
         CLIENT_NAME) echo "${v:-(none)}" ;;
         CLIENT_ID) echo "${v:-(derived from the chip)}" ;;
-        I2S_BCLK | I2S_DATA | BUTTON_PIN | LED_PIN) pin_text "$v" ;;
-        I2S_WS) if pico; then echo "$(pin_text "$v") (always BCLK + 1)"; else pin_text "$v"; fi ;;
-        MIC_CHANNEL) if [[ $v == right ]]; then echo "right (SEL to 3V)"; else echo "left (SEL to GND or unconnected)"; fi ;;
+        I2S_BCLK) if fixed_mic; then echo "$(pin_text "$v"), D2 (PDM clock, on the board)"; else pin_text "$v"; fi ;;
+        I2S_DATA) if fixed_mic; then echo "$(pin_text "$v"), D3 (PDM data, on the board)"; else pin_text "$v"; fi ;;
+        BUTTON_PIN | LED_PIN) pin_text "$v" ;;
+        I2C_SDA | I2C_SCL | SPI_SCK | SPI_MISO | SPI_MOSI)
+            if fixed_buses; then echo "$(pin_text "$v") (on the board)"; else pin_text "$v"; fi ;;
+        DEVICES) if [[ -z $v || $v == none ]]; then echo "none"; else echo "$v"; fi ;;
+        I2S_WS)
+            if fixed_mic; then echo "none (PDM mic)"
+            elif pico; then echo "$(pin_text "$v") (always BCLK + 1)"
+            else pin_text "$v"; fi
+            ;;
+        MIC_CHANNEL)
+            if fixed_mic; then echo "$v (the startup log shows which has the mic)"
+            elif [[ $v == right ]]; then echo "right (SEL to 3V)"
+            else echo "left (SEL to GND or unconnected)"; fi
+            ;;
         LOOKBACK_MS) echo "${v:-?} ms (at most $("${cfgpy[@]}" max-lookback "${RING_KB:-0}" 2>/dev/null || echo ?) ms)" ;;
         RING_KB) echo "${v:-?} KB" ;;
         *) echo "${v:-(not set)}" ;;
@@ -153,6 +179,10 @@ edit() {
         SERVER_HOST) input SERVER_HOST "Server" "IP address or host name of the bps server:" ;;
         SERVER_PORT) input SERVER_PORT "Server" "The server's client port: 2473 unless changed in bsp-server.toml (not the web UI port):" ;;
         CLIENT_NAME) input CLIENT_NAME "Client name" "Name to suggest for this client, e.g. \"North fence\" (optional; a name set in the web UI takes precedence):" ;;
+        I2S_BCLK | I2S_WS | I2S_DATA) if fixed_mic; then
+            msg "Microphone" "The ${board_title[$BOARD]} has its PDM microphone wired on the board: clock on D2 (GPIO 3), data on D3 (GPIO 4)."
+            return 0
+        fi ;;&
         I2S_BCLK)
             if pico; then
                 input I2S_BCLK "Microphone" "GPIO for BCLK. LRCL (word select) is wired to the next GPIO up:"
@@ -174,13 +204,34 @@ edit() {
                 "Which channel does the mic use? Its SEL pin decides. (The board's log shows both channels' levels at startup.)" \
                 13 74 2 left "SEL to GND or unconnected" right "SEL to 3V") && MIC_CHANNEL=$v
             ;;
-        BUTTON_PIN) input BUTTON_PIN "Positioning button" "GPIO of a push button to GND that requests positioning (as Enter does on bsp-client), or \"none\":" ;;
+        BUTTON_PIN)
+            if fixed_mic; then
+                input BUTTON_PIN "Positioning button" "0 for the XIAO's BOOT button, which requests positioning (as Enter does on bsp-client), or \"none\". The board's other pins are all in use:"
+            else
+                input BUTTON_PIN "Positioning button" "GPIO of a push button to GND that requests positioning (as Enter does on bsp-client), or \"none\":"
+            fi
+            ;;
         LED_PIN)
             if [[ $BOARD != esp32 ]]; then
                 input LED_PIN "Status LED" "GPIO of a status LED, \"builtin\" for the onboard LED, or \"none\":"
             else
                 input LED_PIN "Status LED" "GPIO of a status LED (2 on most ESP32 dev boards), or \"none\":"
             fi
+            ;;
+        I2C_SDA | I2C_SCL | SPI_SCK | SPI_MISO | SPI_MOSI)
+            if fixed_buses; then
+                msg "Buses" "The ${board_title[$BOARD]} has its I2C bus on D4 (SDA, GPIO 5) and D5 (SCL, GPIO 6) and its SPI bus on D8 (SCK, GPIO 7), D9 (MISO, GPIO 8) and D10 (MOSI, GPIO 9), wired on the board."
+            elif pico; then
+                msg "Buses" "The Pico boards do not support I2C or SPI devices yet."
+            else
+                input "$1" "Buses" "GPIO for ${label[$1]%% pin}, or \"none\" (all of a bus's pins, or none of them):"
+            fi
+            ;;
+        DEVICES)
+            local kinds
+            kinds=$("${cfgpy[@]}" drivers | awk -F'\t' '{printf "  %s (%s): %s\n", $1, toupper($2), $3}')
+            v=$(ask --title "Devices" --inputbox "Peripherals on the I2C and SPI buses, separated by spaces: kind@address for I2C (e.g. max17048@0x36; the usual address if left out), kind@chip-select-pin for SPI (e.g. sd@2), or \"none\". Known kinds:\n$kinds" \
+                18 78 "$DEVICES") && DEVICES=$v
             ;;
         LOOKBACK_MS) input LOOKBACK_MS "Look-back" "How much audio from before the sound that opened the noise gate each upload starts with, in ms. With a ${RING_KB} KB ring buffer, at most $("${cfgpy[@]}" max-lookback "${RING_KB:-0}" 2>/dev/null || echo "?") ms:" ;;
         RING_KB) input RING_KB "Ring buffer" "RAM asked for recent audio, in KB (used in 16 KB blocks; 94 KB holds a second). The board takes what fits while keeping 32 KB free, and logs what it got:" ;;

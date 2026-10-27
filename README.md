@@ -15,8 +15,8 @@ sudo setcap cap_net_bind_service=+ep target/release/bsp-server   # allow ports 8
 ```
 
 Open the web UI at `https://SERVER/` (plain `http://` redirects there). Its pages are
-**Dashboard** and **Detections** (what was heard), **Config** (clients and settings), **Clocks**
-(each client's clock synchronisation) and **Logs** (raw events).
+**Dashboard** and **Detections** (what was heard), **Config** (clients and settings), **Clients**
+(each client's clock synchronisation, battery and SD card) and **Logs** (raw events).
 
 On first start the server creates a self-signed certificate in `tls/`, so your browser warns
 once; accept it to continue. To use a real certificate, put it at `tls/cert.pem` and its key at
@@ -88,7 +88,7 @@ Browser clients are less precise than `bsp-client` for positioning:
   browsers may leave a constant offset of a few milliseconds per device.
 
 **Or use a microcontroller as a client:** a Raspberry Pi Pico W, Pico 2 W, classic ESP32 or Seeed XIAO ESP32S3 with an
-I2S microphone such as the Adafruit ICS-43434 makes a cheap, always-on client. See
+I2S microphone such as the Adafruit ICS-43434, or the bps XIAO board, makes a cheap, always-on client. See
 [Microcontroller clients](#microcontroller-clients-pico-w-esp32).
 
 ### 4. Set each client's name and position
@@ -181,17 +181,23 @@ that another client follows too, and positioning then uses either the clients sy
 clock or those of one AP, whichever are more. APs on different channels have unrelated clocks, so
 this works per AP; a Pico W cannot timestamp beacons.
 
-The **Clocks** page shows every client's timestamp error, clock offset, drift, round trips and
-answered measurements, and for one client at a time, charts of the last 15 minutes to an hour
-(kept in the server's memory, so they start afresh when it restarts). Use it to compare networks
-or placements, or to screenshot a client's sync for a bug report.
+The **Clients** page lists every client with its sync status, timestamp error, best round trip,
+battery, SD card, uptime and when it was last heard. Select one for its details: its health (battery
+charge, voltage and trend; the SD card's free space and the recordings saved; chunks sent and
+gated; its I2C and SPI devices and whether each answers), then its clock offset, drift, round trips
+and answered measurements, with charts of the last 15 minutes to an hour (kept in the server's
+memory, so they start afresh when it restarts). Health comes from the latest heartbeat and is kept
+in the database, so a client that went quiet still shows how it was, e.g. a flat battery. Use the
+page to compare networks or placements, or to screenshot a client for a bug report. The **Logs**
+page also gets `battery_low` (under 20%), `storage_inserted`, `storage_removed` and `storage_low`
+(under 1 GB free) events.
 
 ### Microcontroller clients (Pico W / ESP32)
 
 The firmware in `firmware/` turns a Raspberry Pi Pico W, Pico 2 W, classic ESP32 (e.g.
 ESP32-DevKitC) or Seeed XIAO ESP32S3 (or XIAO ESP32S3 Plus) with an I2S microphone into a client. It uses the same client API as `bsp-client`,
 so to the server it is just another client: it appears in the **Clients** table, is measured on the
-**Clocks** page and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
+**Clients** page and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
 (any I2S microphone with 24-bit samples in 32-bit slots should work).
 
 **Wiring** (defaults; `./configure.sh` lets you choose other pins):
@@ -207,6 +213,34 @@ so to the server it is just another client: it appears in the **Clients** table,
 
 On the XIAO, those pins sit in a row with 3V3 and GND. Its antenna must be attached for Wi-Fi to
 work.
+
+**The bps XIAO board** (`BOARD=bps_xiao`) carries a XIAO ESP32S3 in a socket, an Infineon
+IM73D122 PDM microphone, a battery charger and power switch, and connectors for GPS, I2C and a
+microSD card. Its microphone and buses are wired on the board (mic clock on D2 and data on D3;
+I2C on D4/D5; SPI on D8-D10), so there are no pins to choose. The positioning button is the XIAO's
+BOOT button and the status LED is the XIAO's own. Since the mic's LR pin is tied to GND,
+`MIC_CHANNEL=left` should be right. Check the levels in the startup log the first time. Its
+devices default to `DEVICES=max17048@0x36 sd@2`: the MAX17048 battery gauge, whose charge,
+voltage and trend go to the server with every heartbeat (it is powered by the battery, so it only
+answers while one is connected), and the microSD card (chip select D1).
+
+**Devices on I2C and SPI.** `DEVICES` lists a board's peripherals as `kind@address` for I2C (the
+usual address if left out) and `kind@chip-select-pin` for SPI, separated by spaces, or `none`.
+The bus pins are `I2C_SDA`/`I2C_SCL` and `SPI_SCK`/`SPI_MISO`/`SPI_MOSI` (fixed on the bps XIAO
+board, settable on other ESP32 boards; not yet supported on the Picos). Kinds so far: `max17048`
+(battery gauge) and `sd` (microSD card). Each device's state is in the status line of the log
+every minute, and the heartbeat says which answer.
+
+**Recordings on the SD card.** While a card is in, the board keeps a copy of every chunk it
+uploads, as the same FLAC stream the server gets, in `recordings/YYYY-MM-DD/HHMMSS.mmm.flac` (UTC,
+the chunk's start on the server's clock). Each day's `index.jsonl` has a line per chunk with its
+exact `start_ns` and `end_ns`, its access point clock times (`tsf`), the samples lost to network
+stalls (sent as silence), and how its upload went (`"upload": "sent"`, or why not). A chunk whose
+upload is aborted keeps what was sent; recording pauses below 16 MB free. The card is written
+from its own task, so a slow card never holds up the network; it can be pulled out and put back
+while the board runs (with no card-detect pin, the board notices within a few seconds). Use a
+FAT32-formatted card. The heartbeat reports whether a card is in, its free space,
+and the recordings saved since the board started.
 
 **Configure, build and flash.** Two scripts in `firmware/` do it:
 
@@ -287,7 +321,7 @@ default.
 | Pico W (RP2040) | 264 KB | about 1.4 s | 0.75 s |
 | Pico 2 W (RP2350) | 520 KB | about 4 s | 2.5 s |
 | ESP32 (classic) | 520 KB, about half free | about 1.5–2 s | 1 s |
-| XIAO ESP32S3 (Plus) | 512 KB + 8 MB PSRAM | about 10.9 s (in PSRAM) | 2.5 s |
+| XIAO ESP32S3 (Plus), bps XIAO board | 512 KB + 8 MB PSRAM | about 10.9 s (in PSRAM) | 2.5 s |
 
 The board takes what `RING_KB` asks for, as long as 32 KB of heap stays free for the network
 stack. At startup it logs what it got and the look-back it can keep. It also logs the
@@ -299,12 +333,14 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Symptom | Check |
 |---|---|
 | Client never appears | Client's `-s` URL uses port 2473 (not the web port); TCP 2473 reachable |
-| Client never becomes synced | UDP 2473 reachable; **Clocks** page: low *Replies* means lost packets, a large *Best RTT* a slow or busy network |
+| Client never becomes synced | UDP 2473 reachable; **Clients** page: low *Replies* means lost packets, a large *Best RTT* a slow or busy network |
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
 | Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 boards only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
 | Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
+| SD card shows "no card" | Is it FAT32? The log says `sd: card mounted` once it is found; the board retries every 5 s |
+| Battery shows "no reading" | The gauge is powered by the battery: is one connected (one only: the 18650 holder or the LiPo connector)? |
 | "upload: the network stalled; … sent as silence" | Wi-Fi stalled for longer than the ring buffer holds: check the `Wi-Fi … dBm` in the status line, move the board or access point, or lower `LOOKBACK_MS` for more slack |
 | Microcontroller stays **NOT synced** | Its status line's *best round trip*: the error bound includes half of it, so above about 4 ms it cannot get under the default 2 ms. Improve the Wi-Fi path (signal, a less busy channel, no router between board and server), or raise `max_clock_offset_us` if looser positioning is acceptable |
 
@@ -388,7 +424,8 @@ firmware/host/bps-host-client -s SERVER -w birds.wav -n "Host test"   # 16-bit P
 
 With `-b` it also hears beacons of a pretend access point whose clock is the computer's real-time
 clock, so several host clients on one computer (each with its own `-i UUID`) share an AP, as ESP32
-boards on one access point do.
+boards on one access point do. With `-d DIR` a directory stands in for an SD card: recordings are
+saved there as on a board, and taking the directory away and back acts as pulling the card.
 
 ## Developer notes
 
@@ -399,7 +436,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 **Firmware** (`firmware/`, PlatformIO):
 - `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement
   and noise gate, plus the audio timestamper, the access point clock (`beacon.c`), the ring
-  buffer and the client's state machines.
+  buffer, the client's state machines, the I2C/SPI devices (`devices.c`, with a driver per kind:
+  `dev_max17048.c`, `dev_sd.c`) and the copy of recordings on the card (`record.c`). A new kind of
+  device is a driver, a line in the table in `devices.c` and its entry in `DRIVERS` in
+  `scripts/bps_config.py`.
   `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
   `esp32.cpp` (ESP32 and ESP32-S3: Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
   `host/` is a Linux board layer for testing.
@@ -422,7 +462,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 
 - Client endpoints, under `/api/v1/client`:
   - `POST /register`: the response's `flac_uploads` says whether the server takes FLAC uploads
-  - `POST /{id}/heartbeat`
+  - `POST /{id}/heartbeat`: clock status and counts, and from boards that have them `battery`
+    (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
+    `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`) and `devices` (`kind`, `bus`,
+    `address`, `present`)
   - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
     client always sends FLAC, about a quarter the size, with chunked encoding). Optional:
     `x-bps-end-ns`, when the sample after the last was captured (the chunk's real duration), and

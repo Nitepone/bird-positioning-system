@@ -4,6 +4,7 @@ use super::{ApiError, ApiResult};
 use crate::audio_buffer::TsfStamp;
 use crate::clip_audio;
 use crate::clock_history::ClockReport;
+use crate::db::ClientHealth;
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
 use axum::Router;
@@ -64,6 +65,50 @@ fn parse_tsf(v: &str) -> Option<TsfStamp> {
     (it.next().is_none() && stamp.end > stamp.start).then_some(stamp)
 }
 
+/// Below this the battery counts as low (percent).
+const BATTERY_LOW_PCT: f32 = 20.0;
+/// Below this a storage card counts as nearly full (bytes).
+const STORAGE_LOW_BYTES: u64 = 1 << 30;
+
+/// Events for changes in a client's health between two heartbeats: its
+/// storage card put in or taken out, or running out of room, and its battery
+/// running low.
+fn health_events(
+    before: Option<&ClientHealth>,
+    now: &ClientHealth,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut events = Vec::new();
+    let card = |h: Option<&ClientHealth>| h.and_then(|h| h.storage);
+    let present = |h| card(h).is_some_and(|s| s.present);
+    // A first report of an empty slot says nothing new.
+    if card(Some(now)).is_some() && present(before) != present(Some(now)) {
+        let kind = if present(Some(now)) {
+            "storage_inserted"
+        } else {
+            "storage_removed"
+        };
+        if present(Some(now)) || card(before).is_some() {
+            events.push((kind, json!({ "storage": now.storage })));
+        }
+    }
+    let low_room = |h| {
+        card(h)
+            .and_then(|s| s.free_bytes)
+            .is_some_and(|f| f < STORAGE_LOW_BYTES)
+    };
+    if low_room(Some(now)) && !low_room(before) {
+        events.push(("storage_low", json!({ "storage": now.storage })));
+    }
+    let low = |h: Option<&ClientHealth>| {
+        h.and_then(|h| h.battery)
+            .is_some_and(|b| b.percent < BATTERY_LOW_PCT)
+    };
+    if low(Some(now)) && !low(before) {
+        events.push(("battery_low", json!({ "battery": now.battery })));
+    }
+    events
+}
+
 /// Longest suggested name kept, in characters.
 const MAX_NAME_CHARS: usize = 64;
 
@@ -93,10 +138,14 @@ async fn heartbeat(
         .db
         .get_client(id)?
         .ok_or_else(|| ApiError::not_found("client"))?;
+    let health = ClientHealth::of(&hb, now);
     state
         .db
-        .touch_client(id, &addr.to_string(), hb.clock.as_ref(), now)?;
+        .record_heartbeat(id, &addr.to_string(), hb.clock.as_ref(), &health)?;
     state.event(Some(id), "heartbeat", serde_json::to_value(&hb)?);
+    for (kind, detail) in health_events(before.health.as_ref(), &health) {
+        state.event(Some(id), kind, detail);
+    }
     if let Some(b) = hb.clock.and_then(|k| k.beacon) {
         state.beacon_clocks.push(id, &b, now);
     }
@@ -146,10 +195,7 @@ async fn upload_audio(
         .get(HEADER_TSF)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_tsf);
-    if !state
-        .db
-        .touch_client(id, &addr.to_string(), None, now_ns())?
-    {
+    if !state.db.touch_client(id, &addr.to_string(), now_ns())? {
         return Err(ApiError::not_found("client"));
     }
     let bytes = body.len();
@@ -237,7 +283,64 @@ async fn position_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_name, parse_tsf};
+    use super::{clean_name, health_events, parse_tsf};
+    use crate::db::ClientHealth;
+    use bsp_proto::{BatteryStatus, StorageStatus};
+
+    fn health(battery: Option<f32>, card: Option<(bool, u64)>) -> ClientHealth {
+        ClientHealth {
+            at: 0,
+            uptime_s: 0,
+            chunks_sent: 0,
+            chunks_gated: 0,
+            battery: battery.map(|percent| BatteryStatus {
+                percent,
+                voltage_v: 3.7,
+                rate_pct_per_h: None,
+            }),
+            storage: card.map(|(present, free)| StorageStatus {
+                present,
+                total_bytes: present.then_some(32 << 30),
+                free_bytes: present.then_some(free),
+                recordings: 0,
+                recorded_bytes: 0,
+                errors: 0,
+                dropped_bytes: 0,
+            }),
+            devices: Vec::new(),
+        }
+    }
+
+    fn kinds(before: Option<&ClientHealth>, now: &ClientHealth) -> Vec<&'static str> {
+        health_events(before, now)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn reports_changes_in_health() {
+        let roomy = Some((true, 8 << 30));
+        let fine = health(Some(80.0), roomy);
+        assert!(kinds(None, &fine).contains(&"storage_inserted"));
+        assert!(kinds(Some(&fine), &fine).is_empty());
+        // An empty slot at first is not news; a card taken out is.
+        assert!(kinds(None, &health(Some(80.0), Some((false, 0)))).is_empty());
+        assert_eq!(
+            kinds(Some(&fine), &health(Some(80.0), Some((false, 0)))),
+            ["storage_removed"]
+        );
+        assert_eq!(
+            kinds(Some(&fine), &health(Some(80.0), Some((true, 1 << 20)))),
+            ["storage_low"]
+        );
+        // Low once, on the way down.
+        let low = health(Some(19.5), roomy);
+        assert_eq!(kinds(Some(&fine), &low), ["battery_low"]);
+        assert!(kinds(Some(&low), &health(Some(18.0), roomy)).is_empty());
+        // No gauge, no card: nothing.
+        assert!(kinds(None, &health(None, None)).is_empty());
+    }
 
     #[test]
     fn cleans_suggested_names() {

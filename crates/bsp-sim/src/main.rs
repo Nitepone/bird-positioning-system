@@ -182,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
                 chunks_gated: 0,
                 queue_len: 0,
                 capture_dropouts: 0,
+                battery: None,
+                storage: None,
+                devices: Vec::new(),
             };
             http.post(format!("{base}{CLIENT_API_PREFIX}/{id}/heartbeat"))
                 .json(&hb)

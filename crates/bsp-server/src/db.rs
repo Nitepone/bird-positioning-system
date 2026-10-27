@@ -4,9 +4,12 @@
 
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
-use bsp_proto::{Capabilities, ClientId, ClockStatus, RegisterRequest, Timestamp, Uuid};
+use bsp_proto::{
+    BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, RegisterRequest,
+    StorageStatus, Timestamp, Uuid,
+};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -29,6 +32,40 @@ pub struct ClientRecord {
     pub last_seen: Timestamp,
     pub last_addr: String,
     pub clock: Option<ClockStatus>,
+    /// From the latest heartbeat.
+    pub health: Option<ClientHealth>,
+}
+
+/// What a client's latest heartbeat said about the client itself (its clock
+/// is kept apart, in [`ClientRecord::clock`]). Kept, so that a client that has
+/// gone quiet still shows how it was, e.g. its battery running down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientHealth {
+    /// When the heartbeat arrived.
+    pub at: Timestamp,
+    pub uptime_s: u64,
+    pub chunks_sent: u64,
+    pub chunks_gated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<BatteryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageStatus>,
+    #[serde(default)]
+    pub devices: Vec<DeviceStatus>,
+}
+
+impl ClientHealth {
+    pub fn of(hb: &Heartbeat, at: Timestamp) -> Self {
+        Self {
+            at,
+            uptime_s: hb.uptime_s,
+            chunks_sent: hb.chunks_sent,
+            chunks_gated: hb.chunks_gated,
+            battery: hb.battery,
+            storage: hb.storage,
+            devices: hb.devices.clone(),
+        }
+    }
 }
 
 /// Detection search criteria; every field is optional.
@@ -96,7 +133,8 @@ CREATE TABLE IF NOT EXISTS clients (
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
     last_addr TEXT NOT NULL DEFAULT '',
-    clock TEXT
+    clock TEXT,
+    health TEXT
 );
 CREATE TABLE IF NOT EXISTS detections (
     id TEXT PRIMARY KEY,
@@ -154,6 +192,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
         (r.get("x")?, r.get("y")?, r.get("z")?);
     let caps: Option<String> = r.get("capabilities")?;
     let clock: Option<String> = r.get("clock")?;
+    let health: Option<String> = r.get("health")?;
     Ok(ClientRecord {
         id: id.parse().unwrap_or_default(),
         name: r.get("name")?,
@@ -169,6 +208,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
         last_seen: r.get("last_seen")?,
         last_addr: r.get("last_addr")?,
         clock: clock.and_then(|c| serde_json::from_str(&c).ok()),
+        health: health.and_then(|h| serde_json::from_str(&h).ok()),
     })
 }
 
@@ -194,6 +234,7 @@ impl Db {
             "suggested_name",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        add_column_if_missing(&conn, "clients", "health", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -238,24 +279,37 @@ impl Db {
     }
 
     /// Updates liveness. Returns false if the client is unknown.
-    pub fn touch_client(
+    pub fn touch_client(&self, id: ClientId, addr: &str, now: Timestamp) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE clients SET last_seen = ?2, last_addr = ?3 WHERE id = ?1",
+            params![id.to_string(), now, addr],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Records a heartbeat: liveness, the clock and the client's health.
+    /// Returns false if the client is unknown.
+    pub fn record_heartbeat(
         &self,
         id: ClientId,
         addr: &str,
         clock: Option<&ClockStatus>,
-        now: Timestamp,
+        health: &ClientHealth,
     ) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let n = match clock {
-            Some(c) => conn.execute(
-                "UPDATE clients SET last_seen = ?2, last_addr = ?3, clock = ?4 WHERE id = ?1",
-                params![id.to_string(), now, addr, json(c)],
-            )?,
-            None => conn.execute(
-                "UPDATE clients SET last_seen = ?2, last_addr = ?3 WHERE id = ?1",
-                params![id.to_string(), now, addr],
-            )?,
-        };
+        let n = conn.execute(
+            "UPDATE clients SET last_seen = ?2, last_addr = ?3, clock = COALESCE(?4, clock),
+                                health = ?5
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                health.at,
+                addr,
+                clock.map(json),
+                json(health)
+            ],
+        )?;
         Ok(n > 0)
     }
 
@@ -622,6 +676,71 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_latest_heartbeats_health() {
+        let db = Db::in_memory().unwrap();
+        let id = Uuid::from_u128(1);
+        db.register_client(&register_request(id), "", "addr", 1)
+            .unwrap();
+        assert!(db.get_client(id).unwrap().unwrap().health.is_none());
+        let clock = ClockStatus {
+            offset_ns: 0,
+            rtt_ns: 1,
+            measured_at: 2,
+            error_ns: Some(3),
+            detail: None,
+            beacon: None,
+        };
+        let health = ClientHealth {
+            at: 10,
+            uptime_s: 60,
+            chunks_sent: 4,
+            chunks_gated: 5,
+            battery: Some(BatteryStatus {
+                percent: 87.5,
+                voltage_v: 4.0,
+                rate_pct_per_h: Some(-1.04),
+            }),
+            storage: Some(StorageStatus {
+                present: true,
+                total_bytes: Some(32 << 30),
+                free_bytes: Some(1 << 30),
+                recordings: 2,
+                recorded_bytes: 400_000,
+                errors: 0,
+                dropped_bytes: 0,
+            }),
+            devices: vec![DeviceStatus {
+                kind: "max17048".into(),
+                bus: "i2c".into(),
+                address: 0x36,
+                present: true,
+            }],
+        };
+        assert!(
+            db.record_heartbeat(id, "addr2", Some(&clock), &health)
+                .unwrap()
+        );
+        let c = db.get_client(id).unwrap().unwrap();
+        assert_eq!((c.last_seen, c.last_addr.as_str()), (10, "addr2"));
+        assert_eq!(c.health.as_ref(), Some(&health));
+        assert_eq!(c.clock.unwrap().rtt_ns, 1);
+        // A heartbeat without a clock measurement keeps the last one.
+        let later = ClientHealth {
+            at: 20,
+            battery: None,
+            ..health.clone()
+        };
+        db.record_heartbeat(id, "addr2", None, &later).unwrap();
+        let c = db.get_client(id).unwrap().unwrap();
+        assert_eq!(c.health, Some(later));
+        assert!(c.clock.is_some());
+        assert!(
+            !db.record_heartbeat(Uuid::from_u128(2), "a", None, &health)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn upgrades_clients_table_without_suggested_name() {
         let path = std::env::temp_dir().join(format!("bsp-upgrade-{}.db", Uuid::new_v4()));
         {
@@ -640,6 +759,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let c = db.get_client(Uuid::from_u128(1)).unwrap().unwrap();
         assert_eq!((c.name.as_str(), c.suggested_name.as_str()), ("Old", ""));
+        assert!(c.health.is_none());
         drop(db);
         // Opening again finds the column already there.
         Db::open(&path).unwrap();

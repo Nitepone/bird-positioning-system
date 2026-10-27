@@ -167,6 +167,9 @@ pub async fn heartbeat_loop(
             chunks_gated: stats.chunks_gated.load(Ordering::Relaxed),
             queue_len: stats.queue_len.load(Ordering::Relaxed),
             capture_dropouts: stats.dropouts.swap(0, Ordering::Relaxed),
+            battery: None,
+            storage: None,
+            devices: Vec::new(),
         };
         if let Err(e) = session.heartbeat(&hb).await {
             stats

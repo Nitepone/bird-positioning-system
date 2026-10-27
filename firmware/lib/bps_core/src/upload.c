@@ -5,6 +5,7 @@
 
 #include "flac.h"
 #include "port.h"
+#include "record.h"
 
 #define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 
@@ -142,6 +143,7 @@ static inline void diag_upload_report(void) {}
 static void upload_report(uint64_t now, const char *outcome)
 {
     uint32_t sent = up.next - up.start;
+    bps_record_end(sent, up.lost, outcome);
     uint64_t send_us = (up.d.sent_us ? up.d.sent_us : now) - up.d.begun_us;
     unsigned long kb_s = send_us ? (unsigned long)(up.d.bytes * 1000 / send_us) : 0;
     char answer[32] = "-", ratio[16];
@@ -224,15 +226,15 @@ static void upload_begin(uint32_t start, uint64_t now)
     bps_json_raw(&x, "\r\n" BPS_HEADER_END_NS ": ");
     bps_json_i64(&x, end_ns);
     bps_json_raw(&x, "\r\n");
+    char tsf[80] = "";
     if (bps_beacon_ready(c.beacon, (int64_t)now * 1000)) {
         char bssid[18];
         bps_beacon_bssid(c.beacon, bssid);
+        snprintf(tsf, sizeof tsf, "%s %lld %lld", bssid,
+                 (long long)bps_beacon_tsf_at(c.beacon, mono_ts),
+                 (long long)bps_beacon_tsf_at(c.beacon, mono_end));
         bps_json_raw(&x, BPS_HEADER_TSF ": ");
-        bps_json_raw(&x, bssid);
-        bps_json_raw(&x, " ");
-        bps_json_i64(&x, bps_beacon_tsf_at(c.beacon, mono_ts));
-        bps_json_raw(&x, " ");
-        bps_json_i64(&x, bps_beacon_tsf_at(c.beacon, mono_end));
+        bps_json_raw(&x, tsf);
         bps_json_raw(&x, "\r\n");
     }
     c.path_for(path, sizeof path, "audio");
@@ -267,6 +269,8 @@ static void upload_begin(uint32_t start, uint64_t now)
     up.rx_len = 0;
     up.progress_us = now;
     up.state = UP_SEND;
+    bps_record_begin(start_ns, end_ns, tsf[0] ? tsf : NULL, c.cfg->sample_rate, c.chunk_len,
+                     up.buf + head + 6, BPS_FLAC_HEADER_LEN);
     diag_upload_begin();
 }
 
@@ -315,6 +319,7 @@ static int upload_refill(void)
     uint64_t t0 = port_mono_us();
     size_t n = bps_flac_frame(up.buf + 6, up.pcm, want, up.frame++, c.cfg->sample_rate);
     diag_upload_encode((uint32_t)(port_mono_us() - t0));
+    bps_record_frame(up.buf + 6, n);
     put_chunk_size(up.buf, n);
     memcpy(up.buf + 6 + n, "\r\n", 2);
     up.len = 6 + n + 2;
@@ -423,6 +428,7 @@ uint32_t bps_upload_end(void) { return up.end; }
 void bps_upload_drop(void)
 {
     if (up.state != UP_IDLE) {
+        bps_record_end(up.next - up.start, up.lost, "dropped (reconnecting)");
         port_tcp_close(up.h);
         up.h = -1;
         up.state = UP_IDLE;

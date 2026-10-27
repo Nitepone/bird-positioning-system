@@ -164,12 +164,13 @@
   .ok { color: var(--ok); }
   .bad { color: var(--bad); font-weight: bold; }
 
-  /* Clocks page */
+  /* Clients page */
   .scroll-x { overflow-x: auto; max-width: 100%; }
-  #clock-clients tr.selected td:first-child { font-weight: bold; }
-  #clock-detail { max-width: 980px; }
-  #clock-detail .tile { min-width: 9em; }
-  #clock-detail .tile .value { font-size: 20px; font-variant-numeric: tabular-nums; }
+  #client-list tr.selected td:first-child { font-weight: bold; }
+  #client-detail { max-width: 980px; }
+  #client-detail h4 { margin: 0.5em 0; }
+  #client-detail .tile { min-width: 9em; }
+  #client-detail .tile .value { font-size: 20px; font-variant-numeric: tabular-nums; }
   #clock-chart { width: 100%; height: 540px; }
 </style>
 </head>
@@ -179,7 +180,7 @@
   <a href="#/" data-page="home">Dashboard</a>
   <a href="#/detections" data-page="detections">Detections</a>
   <a href="#/config" data-page="config">Config</a>
-  <a href="#/clock" data-page="clock">Clocks</a>
+  <a href="#/clients" data-page="clients">Clients</a>
   <a href="#/logs" data-page="logs">Logs</a>
   <span id="status" class="mono"></span>
   <a href="/client">[Web client]</a>
@@ -363,27 +364,30 @@
   </div>
 </section>
 
-<section id="page-clock">
-  <h2>Clock sync</h2>
-  <p class="hint" id="clock-intro"></p>
+<section id="page-clients">
+  <h2>Clients</h2>
+  <p class="hint" id="clients-intro"></p>
   <div class="scroll-x">
-  <table id="clock-clients">
-    <thead><tr><th>Client</th><th>Status</th><th>Timestamp error</th><th>Clock offset</th><th>Drift</th>
-      <th>Best RTT</th><th>Replies</th><th>Corrects timestamps</th><th>Last measured</th></tr></thead>
+  <table id="client-list">
+    <thead><tr><th>Client</th><th>Status</th><th>Timestamp error</th><th>Best RTT</th><th>Battery</th>
+      <th>SD card</th><th>Up for</th><th>Last heard</th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
-  <p class="empty" id="clock-none" hidden>No clients yet.</p>
-  <div class="card" id="clock-detail" hidden>
-    <h3 id="clock-title"></h3>
+  <p class="empty" id="clients-none" hidden>No clients yet.</p>
+  <div class="card" id="client-detail" hidden>
+    <h3 id="client-title"></h3>
     <div class="body">
+      <p class="hint" id="client-meta"></p>
+      <h4>Health</h4>
+      <div class="tiles" id="health-tiles"></div>
+      <h4>Clock</h4>
       <div class="filters">
-        <label>Range <select id="clock-range" onchange="refreshClock()">
+        <label>Range <select id="clock-range" onchange="refreshClientsPage()">
           <option value="15">last 15 min</option>
           <option value="30" selected>last 30 min</option>
           <option value="60">last hour</option>
         </select></label>
-        <span class="hint" id="clock-meta"></span>
       </div>
       <div class="tiles" id="clock-tiles"></div>
       <div id="clock-chart"></div>
@@ -408,7 +412,7 @@
 <script src="/static/echarts-6.1.0.min.js"></script>
 <script>
 const API = "/api/v1/control";
-const PAGES = ["home", "detections", "config", "clock", "logs"];
+const PAGES = ["home", "detections", "config", "clients", "logs"];
 let clients = [];
 let positioning = null;
 let configDirty = false;
@@ -462,7 +466,8 @@ const msToNs = ms => Math.round(ms) * 1e6;
 
 // ---- pages (#/page?param=value) ----
 function route() {
-  const [path, query] = location.hash.replace(/^#\/?/, "").split("?");
+  const [hashPath, query] = location.hash.replace(/^#\/?/, "").split("?");
+  const path = hashPath === "clock" ? "clients" : hashPath; // the Clients page was the Clocks page
   return { page: PAGES.includes(path) ? path : "home", params: new URLSearchParams(query || "") };
 }
 function currentPage() { return route().page; }
@@ -473,7 +478,7 @@ function showPage() {
   if (page === "config" && !settingsDirty) loadSettings();
   if (page === "home") { renderDashboard(); timelineFetchedAt = 0; }
   if (page === "detections") enterDetections(params);
-  if (page === "clock" && params.get("client")) clockClient = params.get("client");
+  if (page === "clients" && params.get("client")) clockClient = params.get("client");
   refresh();
 }
 
@@ -1384,7 +1389,7 @@ function renderConfigPage() {
   document.querySelector("#clients tbody").innerHTML = clients.map(c => {
     const cls = (c.active ? "" : "inactive") + (c.positioning_requested ? " requesting" : "");
     const clock = c.clock
-      ? `<a href="#/clock?client=${c.id}" title="Clock details">&plusmn;${fmtNsMs(c.clock_error_ns)} / ${fmtNsMs(c.clock.rtt_ns, 2)}</a>`
+      ? `<a href="#/clients?client=${c.id}" title="Clock details">&plusmn;${fmtNsMs(c.clock_error_ns)} / ${fmtNsMs(c.clock.rtt_ns, 2)}</a>`
       : "-";
     const status = (c.active ? "active" : "inactive") + (c.synced ? ", synced" : (c.active ? ", NOT synced" : ""))
       + (c.positioning_requested ? ", <b>requesting position</b>" : "");
@@ -1554,9 +1559,13 @@ async function refreshEvents() {
 }
 
 // ---- clocks page ----
+// ---- clients page: each client's health and clock ----
 // Positioning needs every client's audio timestamps on the server's clock.
 // Clients report the worst-case error left in their timestamps with every
-// heartbeat; the server keeps the last hour of reports (in memory) for this page.
+// heartbeat; the server keeps the last hour of reports (in memory) for this
+// page. Heartbeats also carry the client's health: uptime, chunks sent, and on
+// boards that have them its battery and storage card (kept by the server, so a
+// client that has gone quiet still shows how it was).
 let clockClient = null;  // selected client id
 let clockData = null;    // latest /clients/{id}/clock response
 let clockChart = null;
@@ -1571,43 +1580,126 @@ function clockState(c) {
 
 function fmtNsUs(ns) { return ns == null ? "-" : (ns / 1e3).toFixed(1) + " µs"; }
 
-function correctsText(d) {
-  if (!d) return "unknown (older client)";
-  return d.corrects_timestamps ? "yes" : "no (trusts OS clock)";
+function fmtBytes(n) {
+  if (n == null) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  for (; n >= 1024 && i < units.length - 1; i++) n /= 1024;
+  return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + units[i];
 }
 
-async function refreshClock() {
+function fmtDuration(s) {
+  if (s == null) return "-";
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${Math.floor(s % 60)}s`;
+}
+
+const BATTERY_LOW_PCT = 20;         // as the server's battery_low event
+const STORAGE_LOW_BYTES = 1 << 30;  // as its storage_low event
+const GAUGE_KINDS = ["max17048"];   // devices that report the battery
+
+/// The battery as { text, sub, cls }, or null if the client has no gauge.
+function batteryView(c) {
+  const h = c.health, b = h?.battery;
+  if (b) {
+    const r = b.rate_pct_per_h;
+    const trend = r == null ? "" : r > 0.2 ? `charging, +${r.toFixed(1)} %/h` : r < -0.2 ? `${r.toFixed(1)} %/h` : "steady";
+    return {
+      text: `${Math.min(100, b.percent).toFixed(0)}%`, cls: b.percent < BATTERY_LOW_PCT ? "bad" : "",
+      sub: `${b.voltage_v.toFixed(2)} V` + (trend ? ` · ${trend}` : ""),
+    };
+  }
+  if (h?.devices?.some(d => GAUGE_KINDS.includes(d.kind)))
+    return { text: "no reading", cls: "muted", sub: "the gauge does not answer: no battery connected?" };
+  return null;
+}
+
+/// The storage card as { text, sub, cls }, or null if the client has no slot.
+function storageView(c) {
+  const s = c.health?.storage;
+  if (!s) return null;
+  const problems = [s.errors ? `${s.errors} write error${s.errors === 1 ? "" : "s"}` : "",
+    s.dropped_bytes ? `${fmtBytes(s.dropped_bytes)} not written` : ""]
+    .filter(Boolean).join(", ");
+  const saved = `${s.recordings} recording${s.recordings === 1 ? "" : "s"} (${fmtBytes(s.recorded_bytes)}) saved since it started`;
+  if (!s.present)
+    return { text: "no card", cls: "muted", sub: "recordings are not being kept" + (problems ? ` · ${problems}` : "") };
+  return {
+    text: `${fmtBytes(s.free_bytes)} free`, cls: s.free_bytes < STORAGE_LOW_BYTES ? "bad" : "",
+    sub: `of ${fmtBytes(s.total_bytes)} · ${saved}` + (problems ? ` · ${problems}` : ""),
+  };
+}
+
+function deviceWhere(d) {
+  if (d.bus === "i2c") return `I2C 0x${d.address.toString(16).padStart(2, "0")}`;
+  return d.address >= 0 ? `SPI, chip select ${d.address}` : "SPI";
+}
+
+async function refreshClientsPage() {
   if (!clients.some(c => c.id === clockClient)) clockClient = (clients.find(c => c.active) || clients[0])?.id ?? null;
-  renderClockTable();
-  if (!clockClient) { clockData = null; renderClockDetail(); return; }
+  renderClientTable();
+  if (!clockClient) { clockData = null; renderClientDetail(); return; }
   const minutes = document.getElementById("clock-range").value;
   clockData = await api(`/clients/${clockClient}/clock?minutes=${minutes}`);
-  renderClockDetail();
+  renderClientDetail();
 }
 
-function renderClockTable() {
-  document.getElementById("clock-none").hidden = clients.length > 0;
-  document.getElementById("clock-intro").textContent =
+function renderClientTable() {
+  document.getElementById("clients-none").hidden = clients.length > 0;
+  document.getElementById("clients-intro").textContent =
     "Direction finding needs every client's audio timestamps on the server's clock. Timestamp error is the worst " +
     `case left in them; clients over the limit (±${fmtNsMs(clockLimitNs(), 1)}) are left out of positioning. ` +
     "Clients that follow their Wi-Fi access point's clock by its beacons (ESP32 boards) also line up with that " +
     "AP's other clients to microseconds, and can be used with them even when over the limit. " +
-    "Replies, drift and round trips are from each client's latest heartbeat.";
-  document.querySelector("#clock-clients tbody").innerHTML = clients.map(c => {
-    const k = c.clock, d = k?.detail, st = clockState(c);
+    "Battery and SD card are from boards that have them. Select a client for its details.";
+  document.querySelector("#client-list tbody").innerHTML = clients.map(c => {
+    const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c);
+    const cell = (v, short) => v ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}</td>` : "<td>-</td>";
     return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
-      <td><a href="#/clock?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
+      <td><a href="#/clients?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
       <td class="${st.cls}">${st.text}</td>
       <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}${c.ap_error_ns != null
         ? `<br><span class="muted" title="against the other clients of access point ${esc(k.beacon.bssid)}">&plusmn;${fmtNsUs(c.ap_error_ns)} within its AP</span>` : ""}</td>
-      <td class="num">${fmtNsMs(d?.clock_offset_ns)}</td>
-      <td class="num">${d ? d.drift_ppm.toFixed(2) + " ppm" : "-"}</td>
       <td class="num">${fmtNsMs(k?.rtt_ns)}</td>
-      <td class="num">${d ? `${d.replies}/${d.requests}` : "-"}</td>
-      <td>${k ? correctsText(d) : "-"}</td>
-      <td>${k ? fmtAgo(k.measured_at) : "never"}</td>
+      ${cell(bat)}
+      ${cell(card)}
+      <td>${c.health ? fmtDuration(c.health.uptime_s) : "-"}</td>
+      <td>${fmtAgo(c.last_seen)}</td>
     </tr>`;
   }).join("");
+}
+
+function tile(label, value, sub, cls) {
+  return `<div class="tile"><div class="label">${label}</div><div class="value ${cls || ""}">${value}</div><div class="sub">${sub}</div></div>`;
+}
+
+function renderClientDetail() {
+  const box = document.getElementById("client-detail");
+  const data = clockData;
+  box.hidden = !data;
+  if (!data || currentPage() !== "clients") return;
+  const c = data.client, h = c.health, st = clockState(c);
+  document.getElementById("client-title").innerHTML =
+    `${esc(displayName(c) || "unnamed")} <span class="mono">${esc(c.id)}</span> &middot; <span class="${st.cls}">${st.text}</span>`;
+  document.getElementById("client-meta").textContent = [
+    c.hostname, c.version, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : "",
+    `clock source: ${c.capabilities?.clock_source || "unknown"}`, c.last_addr,
+    `heartbeat every ${data.heartbeat_interval_s} s, last heard ${fmtAgo(c.last_seen)}`,
+  ].filter(Boolean).join(" · ");
+
+  const bat = batteryView(c), card = storageView(c);
+  const asOf = h && !c.active ? ` (as of ${fmtAgo(h.at)})` : "";
+  document.getElementById("health-tiles").innerHTML = !h
+    ? tile("Health", "-", "no heartbeat stored yet")
+    : [
+      bat ? tile("Battery" + asOf, bat.text, bat.sub, bat.cls) : "",
+      card ? tile("SD card" + asOf, card.text, card.sub, card.cls) : "",
+      tile("Audio", `${h.chunks_sent} sent`, `${h.chunks_gated} chunks gated (quiet) since it started`),
+      tile("Up for" + asOf, fmtDuration(h.uptime_s), `since ${fmtTime(h.at - h.uptime_s * 1e9)}`),
+      h.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
+        h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
+    ].join("");
+  renderClockDetail();
 }
 
 /// The reports as chart rows, with a gap row wherever heartbeats stopped.
@@ -1625,18 +1717,11 @@ function clockRows(data) {
 
 function percentile(sorted, p) { return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : null; }
 
+/// The selected client's clock tiles and charts.
 function renderClockDetail() {
-  const box = document.getElementById("clock-detail");
   const data = clockData;
-  box.hidden = !data;
-  if (!data || currentPage() !== "clock") return;
   const c = data.client, k = c.clock, d = k?.detail, st = clockState(c), limit = clockLimitNs();
   const minutes = Math.round((data.server_time - data.from) / 60e9);
-  document.getElementById("clock-title").innerHTML =
-    `Clock: ${esc(displayName(c) || "unnamed")} <span class="mono">${esc(c.id)}</span> &middot; <span class="${st.cls}">${st.text}</span>`;
-  document.getElementById("clock-meta").textContent =
-    `${c.hostname} · ${c.version} · clock source: ${c.capabilities?.clock_source || "unknown"} · ` +
-    `limit ±${fmtNsMs(limit, 1)} · heartbeat every ${data.heartbeat_interval_s} s`;
 
   const reports = data.reports.filter(r => r.clock);
   const errors = reports.map(r => r.error_ns).sort((a, b) => a - b);
@@ -1644,8 +1729,6 @@ function renderClockDetail() {
   const dets = reports.map(r => r.clock.detail).filter(Boolean);
   const requests = dets.reduce((n, x) => n + x.requests, 0), replies = dets.reduce((n, x) => n + x.replies, 0);
   const medians = dets.map(x => x.rtt_median_ns).filter(v => v != null).sort((a, b) => a - b);
-  const tile = (label, value, sub, cls) =>
-    `<div class="tile"><div class="label">${label}</div><div class="value ${cls || ""}">${value}</div><div class="sub">${sub}</div></div>`;
   document.getElementById("clock-tiles").innerHTML = [
     tile("Timestamp error now", k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-",
       k ? `<span class="${st.cls}">${st.text}</span> (limit &plusmn;${fmtNsMs(limit, 1)})` : "no measurement"),
@@ -1771,7 +1854,7 @@ async function refresh() {
       page === "home" ? refreshTimeline() : null,
       page === "detections" ? refreshDetections() : null,
       page === "logs" ? refreshEvents() : null,
-      page === "clock" ? refreshClock() : null,
+      page === "clients" ? refreshClientsPage() : null,
     ]);
     document.getElementById("error").textContent = "";
   } catch (e) {

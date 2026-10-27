@@ -26,6 +26,7 @@ void setup()
         BPS_MIC_CHANNEL,
         BPS_RING_BYTES,
         BPS_LOOKBACK_MS,
+        {BPS_I2C_SDA, BPS_I2C_SCL, BPS_SPI_SCK, BPS_SPI_MISO, BPS_SPI_MOSI, BPS_DEVICES},
     };
     bps_client_setup(&settings);
 }

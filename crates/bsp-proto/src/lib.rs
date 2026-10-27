@@ -245,6 +245,66 @@ pub struct Heartbeat {
     pub queue_len: u32,
     /// Number of capture discontinuities since the previous heartbeat.
     pub capture_dropouts: u32,
+    /// The client's battery, from its fuel gauge (microcontroller boards with
+    /// one, while a battery is connected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<BatteryStatus>,
+    /// The client's storage card, where it keeps a copy of its recordings
+    /// (boards with a card slot, whether or not a card is in it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageStatus>,
+    /// The peripherals the client is configured with, and whether each answers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceStatus>,
+}
+
+/// A battery, as its fuel gauge reports it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BatteryStatus {
+    /// State of charge, percent (a gauge may report a little over 100).
+    pub percent: f32,
+    /// Cell voltage.
+    pub voltage_v: f32,
+    /// How fast the charge changes, percent per hour (positive: charging).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_pct_per_h: Option<f32>,
+}
+
+/// A storage card and what the client has written to it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct StorageStatus {
+    /// Whether a card is in and mounted.
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    /// Recordings saved since the client started.
+    #[serde(default)]
+    pub recordings: u32,
+    /// Bytes of recordings saved since the client started.
+    #[serde(default)]
+    pub recorded_bytes: u64,
+    /// Writes that failed since the client started (a card pulled out, or full).
+    #[serde(default)]
+    pub errors: u32,
+    /// Bytes not written since the client started: no card, or the card was
+    /// too slow to keep up.
+    #[serde(default)]
+    pub dropped_bytes: u64,
+}
+
+/// A peripheral on one of the client's buses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceStatus {
+    /// Its driver, e.g. `max17048` or `sd`.
+    pub kind: String,
+    /// `i2c` or `spi`.
+    pub bus: String,
+    /// The I2C address, or the SPI chip select pin.
+    pub address: i32,
+    /// Whether it answers.
+    pub present: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

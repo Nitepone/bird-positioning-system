@@ -6,6 +6,7 @@
 
 #include "beacon.h"
 #include "capture.h"
+#include "devices.h"
 #include "port.h"
 #include "proto.h"
 #include "ring.h"
@@ -35,8 +36,8 @@ enum { TXN_IDLE, TXN_SENDING, TXN_RECEIVING, TXN_DONE, TXN_FAILED };
  * gives each core only 2-4 KB of it. */
 typedef struct {
     int h, state;
-    char tx[1024];
-    size_t tx_len, tx_off;
+    char *tx; /* the request: head and body */
+    size_t tx_cap, tx_len, tx_off;
     char rx[768];
     size_t rx_len;
     uint64_t deadline_us;
@@ -69,6 +70,8 @@ static uint32_t chunk_len, lookback;
 static bps_gate_config gate_cfg;
 
 static txn reg_txn, hb_txn, pos_txn;
+/* Heartbeats carry the clock and the devices' reports; the others are small. */
+static char reg_tx[1024], hb_tx[2560], pos_tx[512];
 static uint64_t reg_next_us, reg_delay_us, hb_next_us, status_next_us;
 static bool hb_failing;
 
@@ -170,10 +173,10 @@ static void txn_reset(txn *t)
 static void txn_start(txn *t, const char *what, const char *path, const char *body,
                       size_t body_len)
 {
-    size_t head = bps_http_head(t->tx, sizeof t->tx, "POST", cfg.server_host, cfg.server_port, path,
+    size_t head = bps_http_head(t->tx, t->tx_cap, "POST", cfg.server_host, cfg.server_port, path,
                                 body_len ? "application/json" : NULL, body_len, NULL);
     t->state = TXN_FAILED;
-    if (!head || head + body_len > sizeof t->tx)
+    if (!head || head + body_len > t->tx_cap)
         return;
     memcpy(t->tx + head, body, body_len);
     t->tx_len = head + body_len;
@@ -558,7 +561,7 @@ static uint32_t dropouts_total(void) { return LOAD(&cap.dropouts) + stats.overru
 
 static void start_heartbeat(uint64_t now)
 {
-    static char body[1024];
+    static char body[2048];
     char path[96];
     bps_json j;
     bps_json_init(&j, body, sizeof body);
@@ -639,7 +642,10 @@ static void start_heartbeat(uint64_t now)
     bps_json_i64(&j, 0);
     bps_json_key(&j, "capture_dropouts");
     bps_json_i64(&j, stats.dropouts_sending - stats.dropouts_reported);
+    bps_devices_heartbeat(&j);
     bps_json_raw(&j, "}");
+    if (j.overflow)
+        port_log("heartbeat: too long for its buffer; not sent");
     path_for(path, sizeof path, "heartbeat");
     txn_start(&hb_txn, "a heartbeat", path, body, j.overflow ? 0 : j.len);
 }
@@ -789,6 +795,10 @@ static void log_status(uint64_t now)
              (unsigned long)stats.chunks_sent, (unsigned long)stats.chunks_gated,
              (unsigned long)dropouts_total(), (unsigned long)port_free_heap(),
              (unsigned long)heap_low);
+    char devices[256];
+    bps_devices_describe(devices, sizeof devices);
+    if (devices[0])
+        port_log("devices: %s", devices);
     if (bps_beacon_ready(&beacon, (int64_t)now * 1000)) {
         char bssid[18];
         bps_beacon_bssid(&beacon, bssid);
@@ -818,8 +828,12 @@ void bps_client_setup(const bps_settings *s)
     snprintf(hostname, sizeof hostname, "bps-%s-%.8s", cfg.board, id_str);
     bps_clock_init(&clk, true);
     reg_txn.h = hb_txn.h = pos_txn.h = -1;
+    reg_txn.tx = reg_tx, reg_txn.tx_cap = sizeof reg_tx;
+    hb_txn.tx = hb_tx, hb_txn.tx_cap = sizeof hb_tx;
+    pos_txn.tx = pos_tx, pos_txn.tx_cap = sizeof pos_tx;
     port_log("bps client %s on %s, id %s, %lu bytes free", cfg.version, cfg.board, id_str,
              (unsigned long)port_free_heap());
+    bps_devices_setup(&cfg.buses);
     port_wifi_begin(cfg.wifi_ssid, cfg.wifi_password, hostname);
     set_state(ST_WIFI);
 }
@@ -872,6 +886,7 @@ void bps_client_loop(void)
         }
         break;
     }
+    bps_devices_poll(now);
     update_led(now);
     log_status(now);
 }
