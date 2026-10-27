@@ -778,6 +778,15 @@ static void log_status(uint64_t now)
                  centi(a, sizeof a, LOAD(&cap.level_cdb[0])),
                  centi(b, sizeof b, LOAD(&cap.level_cdb[1])), cfg.mic_channel ? "right" : "left");
     }
+    /* Each jump's size: whole DMA buffers lost, or a timeline that was off? */
+    static uint32_t dropouts_logged;
+    uint32_t d = LOAD(&cap.dropouts);
+    if (d != dropouts_logged) {
+        dropouts_logged = d;
+        long us = (long)LOAD(&cap.predict_ns) / 1000;
+        port_log("capture: timeline jumped %ld us %s", us < 0 ? -us : us,
+                 us >= 0 ? "late (samples missing)" : "early");
+    }
     if (now < status_next_us)
         return;
     status_next_us = now + STATUS_LOG_US;

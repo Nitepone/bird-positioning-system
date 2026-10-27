@@ -139,8 +139,7 @@ static void beacons_start(void)
     filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(beacon_rx);
-    if (esp_wifi_set_promiscuous(true) != ESP_OK)
-        port_log("beacons: cannot turn on promiscuous mode");
+    // Turned on once connected (port_wifi_up).
 }
 
 extern "C" bool port_beacon_take(port_beacon *out)
@@ -169,6 +168,10 @@ extern "C" bool port_beacon_take(port_beacon *out)
     return true;
 }
 
+static volatile uint8_t wifi_reason; // why the last connection or attempt ended
+static int wifi_retries;              // since the connection was lost
+static bool promiscuous_on;
+
 // Logs why joining failed, once per distinct reason (auto-reconnect repeats it).
 static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
 {
@@ -183,15 +186,72 @@ static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
             port_log("wifi: not connected: %s (reason %u)",
                      WiFi.disconnectReasonName((wifi_err_reason_t)r), r);
         last_reason = r;
+        wifi_reason = r;
     }
 }
+
+static void set_promiscuous(bool on)
+{
+    // Not tried again when it fails, so as not to log it every loop.
+    promiscuous_on = on;
+    if (esp_wifi_set_promiscuous(on) != ESP_OK && on)
+        port_log("beacons: cannot turn on promiscuous mode");
+}
+
+// Logs the access points named `ssid` that a scan finds, strongest first.
+static void wifi_scan_log(const char *ssid)
+{
+    int n = WiFi.scanNetworks(false, true);
+    if (n < 0) {
+        port_log("wifi: scan failed (%d)", n);
+        return;
+    }
+    char seen[160];
+    size_t len = 0;
+    int found = 0;
+    seen[0] = 0;
+    for (int i = 0; i < n; i++) { // sorted by signal
+        if (WiFi.SSID(i) != ssid)
+            continue;
+        found++;
+        if (len < sizeof seen)
+            len += snprintf(seen + len, sizeof seen - len, "%s%s channel %ld %ld dBm",
+                            found > 1 ? ", " : "", WiFi.BSSIDstr(i).c_str(), (long)WiFi.channel(i),
+                            (long)WiFi.RSSI(i));
+    }
+    port_log("wifi: scan: %d access points, %d named \"%s\"%s%s", n, found, ssid,
+             found ? ": " : "", seen);
+    WiFi.scanDelete();
+}
+
+#define WIFI_RESTART_RETRIES 3 // client.c retries every 20 s
 
 extern "C" void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
 {
     static bool started;
     if (started) {
-        // A retry. Arduino's auto-reconnect retries after almost every failure
-        // by itself, and begin() would collide with it; only restart the
+        wifi_retries++;
+        uint8_t r = wifi_reason;
+        static const uint8_t none[6] = {0};
+        char assoc[48] = "not associated";
+        if (memcmp(ap_bssid, none, 6) != 0) // joined, but no IP address yet
+            snprintf(assoc, sizeof assoc, "associated with %02x:%02x:%02x:%02x:%02x:%02x",
+                     ap_bssid[0], ap_bssid[1], ap_bssid[2], ap_bssid[3], ap_bssid[4], ap_bssid[5]);
+        port_log("wifi: retry %d; %s, status %d; last disconnect %s (reason %u)", wifi_retries,
+                 assoc, (int)WiFi.status(), WiFi.disconnectReasonName((wifi_err_reason_t)r), r);
+        if (wifi_retries % WIFI_RESTART_RETRIES == 0) {
+            // Nudging the driver has not worked for a minute (and does
+            // nothing while associated without an IP address): start the
+            // connection afresh from a scan, with beacon capture off (it
+            // comes back on once connected).
+            set_promiscuous(false);
+            WiFi.disconnect();
+            wifi_scan_log(ssid);
+            WiFi.begin(ssid, password);
+            return;
+        }
+        // Arduino's auto-reconnect retries after almost every failure by
+        // itself, and begin() would collide with it; only restart the
         // driver in case it gave up. While it is still trying, the driver
         // just logs "sta is connecting", so quiet that.
         esp_log_level_t level = esp_log_level_get("wifi");
@@ -211,7 +271,16 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
     beacons_start();
 }
 
-extern "C" bool port_wifi_up(void) { return WiFi.status() == WL_CONNECTED; }
+extern "C" bool port_wifi_up(void)
+{
+    bool up = WiFi.status() == WL_CONNECTED;
+    if (up) {
+        wifi_retries = 0;
+        if (!promiscuous_on)
+            set_promiscuous(true);
+    }
+    return up;
+}
 
 extern "C" int port_wifi_rssi(void) { return (int)WiFi.RSSI(); }
 
@@ -465,8 +534,13 @@ extern "C" void port_audio_start(uint32_t sample_rate)
         port_log("audio: I2S failed to start");
         return;
     }
-    // Arduino's loop() runs on core 1 at priority 1; Wi-Fi lives on core 0.
-    xTaskCreatePinnedToCore(capture_task, "capture", 8192, nullptr, 10, nullptr, 1);
+    // On core 0, with Wi-Fi, not core 1 with Arduino's loop() (priority 1):
+    // there, every minute or two, the loop kept the core for 40-500 ms while
+    // this task was ready (scheduler running, not in a critical section, the
+    // I2S interrupt on time), until the loop next blocked, and the DMA queue
+    // (42.7 ms) overflowed. Wi-Fi's tasks on core 0 preempt this one only for
+    // a few ms at a time.
+    xTaskCreatePinnedToCore(capture_task, "capture", 8192, nullptr, 10, nullptr, 0);
 }
 
 // ---- I2C ----
@@ -684,9 +758,10 @@ extern "C" bool port_sd_begin(int sck, int miso, int mosi, int cs)
     pinMode(cs, OUTPUT);
     digitalWrite(cs, HIGH);
     SPI.begin(sck, miso, mosi, -1);
-    // On the core away from the capture task, at the idle task's priority:
+    // On core 0 (core 1's loop() never sleeps), at the idle task's priority:
     // the SD library busy-waits on the card (for seconds when it stops
     // answering), and the idle task must still run to feed the watchdog.
+    // The capture task, above it, preempts it.
     xTaskCreatePinnedToCore(sd_task, "sd", 6144, nullptr, tskIDLE_PRIORITY, nullptr, 0);
     return true;
 }
@@ -753,6 +828,9 @@ extern "C" bool port_button(void)
 
 extern "C" void port_board_init(void)
 {
+    // Down from 240 MHz, for power. The I2S clock comes from its own 160 MHz
+    // PLL output and the timer from the crystal, so neither changes.
+    setCpuFrequencyMhz(160);
     Serial.begin(115200);
 #ifdef LED_GPIO
     pinMode(LED_GPIO, OUTPUT);

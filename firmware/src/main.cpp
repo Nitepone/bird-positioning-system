@@ -31,4 +31,13 @@ void setup()
     bps_client_setup(&settings);
 }
 
-void loop() { bps_client_loop(); }
+void loop()
+{
+    bps_client_loop();
+#if defined(ARDUINO_ARCH_ESP32)
+    // Rest until the next tick (1 ms), so the core idles instead of spinning:
+    // nothing in the loop needs a quicker turn (an upload pass writes up to
+    // 16 times, and time sync waits for its reply itself).
+    delay(1);
+#endif
+}

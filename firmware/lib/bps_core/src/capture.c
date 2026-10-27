@@ -53,8 +53,8 @@ static void process(bps_capture *c, const int32_t *lr, size_t frames, uint64_t r
             STORE(&c->dropouts, c->dropouts + 1);
         STORE(&c->rate_err_ppb, -t->model.ppb);
         STORE(&c->scatter_ns, (int32_t)t->scatter_ns);
-        int64_t p = bps_abs64(t->predict_ns);
-        STORE(&c->predict_ns, (int32_t)(p > INT32_MAX ? INT32_MAX : p));
+        int64_t p = t->predict_ns;
+        STORE(&c->predict_ns, (int32_t)(p > INT32_MAX ? INT32_MAX : p < -INT32_MAX ? -INT32_MAX : p));
     }
 
     c->block_start = idx;

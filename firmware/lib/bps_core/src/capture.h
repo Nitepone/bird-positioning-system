@@ -28,7 +28,7 @@ typedef struct {
     uint32_t dropouts;      /* capture timeline jumps */
     int32_t rate_err_ppb;   /* sample rate vs. the monotonic clock, parts per billion */
     int32_t scatter_ns;     /* how far the timeline's points lie from it (RMS) */
-    int32_t predict_ns;     /* how far the latest point lay from the timeline before it */
+    int32_t predict_ns;     /* how far the latest point lay from the timeline before it (+: late) */
     int32_t level_cdb[2];   /* first seconds' level per channel, centi-dBFS */
     uint32_t levels_ready;
 

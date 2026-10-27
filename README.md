@@ -441,7 +441,9 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   device is a driver, a line in the table in `devices.c` and its entry in `DRIVERS` in
   `scripts/bps_config.py`.
   `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
-  `esp32.cpp` (ESP32 and ESP32-S3: Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in its own task).
+  `esp32.cpp` (ESP32 and ESP32-S3: Arduino Wi-Fi with ESP-IDF I2S and lwIP sockets; capture in
+  its own task on core 0, with Wi-Fi, since on core 1 `loop()` held it off for up to 0.5 s; for
+  power, the CPU runs at 160 MHz and `loop()` rests 1 ms between passes).
   `host/` is a Linux board layer for testing.
 - `scripts/bps_config.py` holds the board defaults and the config validation, used by both
   `./configure.sh` and the build. `./build.sh` drives PlatformIO, locally or in Docker.
