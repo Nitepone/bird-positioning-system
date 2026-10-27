@@ -44,6 +44,8 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    bool battery;   /* false: the gauge runs off the charger, with no cell */
+    bool restarted; /* its estimate was restarted for this battery */
     uint16_t millivolts;
     int32_t centi_percent;   /* state of charge */
     int32_t centi_pct_per_h; /* rate of change */

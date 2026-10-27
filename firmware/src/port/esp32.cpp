@@ -574,6 +574,27 @@ static void sd_make_dirs(const char *path)
     strcpy(made, dir);
 }
 
+// Whether a card answers its reset command (CMD0). Mounting an empty slot
+// logs a handful of the SD library's errors every try; this logs nothing.
+static bool sd_answers(void)
+{
+    static const uint8_t cmd0[] = {0x40, 0, 0, 0, 0, 0x95};
+    uint8_t r = 0xff;
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    digitalWrite(sd_cs, HIGH);
+    for (int i = 0; i < 10; i++) // 80 clocks with the card deselected
+        SPI.transfer(0xff);
+    digitalWrite(sd_cs, LOW);
+    for (uint8_t b : cmd0)
+        SPI.transfer(b);
+    for (int i = 0; i < 8 && r == 0xff; i++) // the reply comes within 8 bytes
+        r = SPI.transfer(0xff);
+    digitalWrite(sd_cs, HIGH);
+    SPI.transfer(0xff);
+    SPI.endTransaction();
+    return r != 0xff;
+}
+
 static void sd_task(void *)
 {
     File f;
@@ -595,7 +616,7 @@ static void sd_task(void *)
         int64_t now = esp_timer_get_time() / 1000;
         if (!mounted && now >= next_try) {
             next_try = now + SD_RETRY_MS;
-            if (SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 2)) {
+            if (sd_answers() && SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 2)) {
                 mounted = true;
                 next_check = now + SD_CHECK_MS;
                 sd_refresh();
@@ -660,6 +681,8 @@ extern "C" bool port_sd_begin(int sck, int miso, int mosi, int cs)
     if (!sd_q)
         return false;
     sd_cs = cs;
+    pinMode(cs, OUTPUT);
+    digitalWrite(cs, HIGH);
     SPI.begin(sck, miso, mosi, -1);
     // On the core away from the capture task, at the idle task's priority:
     // the SD library busy-waits on the card (for seconds when it stops

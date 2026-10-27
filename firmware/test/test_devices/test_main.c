@@ -17,9 +17,10 @@ void port_log(const char *fmt, ...)
     (void)fmt;
 }
 
-// A MAX17048 at 0x36 while `gauge_on`: 16-bit registers, read big-endian.
+// A MAX17048 at 0x36 while `gauge_on`: 16-bit registers, big-endian.
 static bool gauge_on;
 static uint16_t regs[256];
+static int quick_starts;
 
 bool port_i2c_begin(int sda, int scl, uint32_t hz)
 {
@@ -29,7 +30,14 @@ bool port_i2c_begin(int sda, int scl, uint32_t hz)
 
 bool port_i2c_xfer(uint8_t addr, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t rx_len)
 {
-    if (!gauge_on || addr != 0x36 || tx_len != 1 || rx_len != 2)
+    if (!gauge_on || addr != 0x36)
+        return false;
+    if (tx_len == 3 && rx_len == 0) {
+        regs[tx[0]] = (uint16_t)(tx[1] << 8 | tx[2]);
+        quick_starts += tx[0] == 0x06 && regs[0x06] == 0x4000;
+        return true;
+    }
+    if (tx_len != 1 || rx_len != 2)
         return false;
     rx[0] = (uint8_t)(regs[tx[0]] >> 8);
     rx[1] = (uint8_t)regs[tx[0]];
@@ -77,6 +85,7 @@ void setUp(void)
     gauge_on = false;
     memset(regs, 0, sizeof regs);
     regs[0x08] = 0x0012; // VERSION
+    quick_starts = 0;
     memset(&card, 0, sizeof card);
     written[0] = 0;
     writes = 0;
@@ -164,6 +173,54 @@ static void test_reports_no_battery_and_an_empty_slot(void)
     TEST_ASSERT_NOT_NULL(strstr(heartbeat(), "\"battery\":{\"percent\":50.00,"));
 }
 
+static char *described(void)
+{
+    static char out[256];
+    bps_devices_describe(out, sizeof out);
+    return out;
+}
+
+static void test_reads_no_battery_off_the_charger(void)
+{
+    gauge_on = true;
+    regs[0x02] = 65088;  // 5085 mV: the charger's output
+    regs[0x04] = 0xd980; // 217.5 %
+    bps_devices_setup(&BUSES);
+    bps_devices_poll(0);
+    TEST_ASSERT_NULL(strstr(heartbeat(), "\"battery\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"kind\":\"max17048\",\"bus\":\"i2c\",\"address\":54,\"present\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(described(), "max17048: no battery (5085 mV from the charger)"));
+    TEST_ASSERT_EQUAL_INT(0, quick_starts);
+
+    // A battery is connected: the estimate that started off the charger is
+    // restarted, and left out until the gauge has a new one.
+    regs[0x02] = 53325; // 4166 mV
+    regs[0x04] = 0x8a50; // 138.3 %
+    bps_devices_poll(10000000);
+    TEST_ASSERT_EQUAL_INT(1, quick_starts);
+    TEST_ASSERT_NULL(strstr(heartbeat(), "\"battery\""));
+    TEST_ASSERT_NOT_NULL(strstr(described(), "max17048: restarting its estimate"));
+    regs[0x04] = 95 << 8;
+    bps_devices_poll(20000000);
+    TEST_ASSERT_NOT_NULL(strstr(heartbeat(), "\"battery\":{\"percent\":95.00,\"voltage_v\":4.166,"));
+    TEST_ASSERT_EQUAL_INT(1, quick_starts);
+}
+
+static void test_restarts_an_implausible_estimate_once(void)
+{
+    gauge_on = true;
+    regs[0x02] = 53325;  // 4166 mV
+    regs[0x04] = 0x8a50; // 138.3 %
+    bps_devices_setup(&BUSES);
+    bps_devices_poll(0);
+    TEST_ASSERT_EQUAL_INT(1, quick_starts);
+    // Still over 105% afterwards: reported as it is, not restarted again.
+    bps_devices_poll(10000000);
+    bps_devices_poll(20000000);
+    TEST_ASSERT_EQUAL_INT(1, quick_starts);
+    TEST_ASSERT_NOT_NULL(strstr(heartbeat(), "\"battery\":{\"percent\":138.31,"));
+}
+
 static void test_leaves_out_i2c_devices_without_a_bus(void)
 {
     gauge_on = true;
@@ -249,6 +306,8 @@ int main(void)
     RUN_TEST(test_parses_device_lists);
     RUN_TEST(test_reports_the_battery_and_card);
     RUN_TEST(test_reports_no_battery_and_an_empty_slot);
+    RUN_TEST(test_reads_no_battery_off_the_charger);
+    RUN_TEST(test_restarts_an_implausible_estimate_once);
     RUN_TEST(test_leaves_out_i2c_devices_without_a_bus);
     RUN_TEST(test_no_devices_no_report);
     RUN_TEST(test_names_recordings_by_their_utc_start);
