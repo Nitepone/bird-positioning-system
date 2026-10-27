@@ -13,19 +13,11 @@
  * -d DIR stands in a directory for a storage card: recordings are saved there.
  */
 #define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -75,117 +67,14 @@ void port_wifi_diag(char *out, size_t cap)
         out[0] = 0;
 }
 
-static bool resolve(const char *host, uint16_t port, int type, struct sockaddr_in *out)
-{
-    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = type}, *res = NULL;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res)
-        return false;
-    memcpy(out, res->ai_addr, sizeof *out);
-    out->sin_port = htons(port);
-    freeaddrinfo(res);
-    return true;
-}
-
-int port_tcp_connect(const char *host, uint16_t port)
-{
-    struct sockaddr_in addr;
-    if (!resolve(host, port, SOCK_STREAM, &addr))
-        return -1;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd < 0)
-        return -1;
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    /* A small send buffer, like an MCU's, so slow networks show up as overruns. */
-    int sndbuf = 16384;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-    fd_set w;
-    FD_ZERO(&w);
-    FD_SET(fd, &w);
-    struct timeval tv = {2, 0};
-    int err = 0;
-    socklen_t len = sizeof err;
-    if (select(fd + 1, NULL, &w, NULL, &tv) != 1 ||
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
+/* Sockets: ../src/port/sockets.c, with these test hooks. */
+extern int sockets_sndbuf;
+extern bool (*sockets_stalled)(void);
 
 /* -S: block every TCP write for this long every 15 s, like a Wi-Fi stall. */
 static unsigned stall_ms;
 
-int port_tcp_write(int h, const void *buf, size_t len)
-{
-    if (stall_ms && port_mono_us() / 1000 % 15000 < stall_ms)
-        return 0;
-    ssize_t n = send(h, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (n >= 0)
-        return (int)n;
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-int port_tcp_read(int h, void *buf, size_t len)
-{
-    ssize_t n = recv(h, buf, len, MSG_DONTWAIT);
-    if (n > 0)
-        return (int)n;
-    if (n == 0)
-        return -1;
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-void port_tcp_close(int h)
-{
-    if (h >= 0)
-        close(h);
-}
-
-#ifdef BPS_NET_DEBUG
-bool port_tcp_get_stats(int h, port_tcp_stats *out)
-{
-    (void)h;
-    (void)out;
-    return false;
-}
-#endif
-
-int port_udp_open(const char *host, uint16_t port)
-{
-    struct sockaddr_in addr;
-    if (!resolve(host, port, SOCK_DGRAM, &addr))
-        return -1;
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    if (fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-int port_udp_send(int h, const void *buf, size_t len)
-{
-    return send(h, buf, len, MSG_DONTWAIT) == (ssize_t)len ? (int)len : -1;
-}
-
-int port_udp_recv(int h, void *buf, size_t len)
-{
-    ssize_t n = recv(h, buf, len, MSG_DONTWAIT);
-    if (n >= 0)
-        return (int)n;
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-void port_udp_close(int h)
-{
-    if (h >= 0)
-        close(h);
-}
+static bool stalled(void) { return port_mono_us() / 1000 % 15000 < stall_ms; }
 
 /* ---- Audio: a WAV file replayed in real time, looping ---- */
 
@@ -412,7 +301,10 @@ int main(int argc, char **argv)
         case 'w': wav_path = optarg; break;
         case 'r': s.ring_bytes = (uint32_t)atoi(optarg) * 1024; break;
         case 'l': s.lookback_ms = (uint32_t)atoi(optarg); break;
-        case 'S': stall_ms = (unsigned)atoi(optarg); break;
+        case 'S':
+            stall_ms = (unsigned)atoi(optarg);
+            sockets_stalled = stalled;
+            break;
         case 'b': fake_beacons = true; break;
         case 'd':
             sd_dir = optarg;
@@ -428,11 +320,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "need -w with a 16-bit PCM WAV file\n");
         return 2;
     }
+    /* A small send buffer, like an MCU's, so slow networks show up as overruns. */
+    sockets_sndbuf = 16384;
     pthread_t t;
     pthread_create(&t, NULL, stdin_thread, NULL);
     bps_client_setup(&s);
     for (;;) {
         bps_client_loop();
-        usleep(500); /* an MCU loop spins; this keeps the host idle */
+        usleep(500); /* keeps the host idle between passes */
     }
 }

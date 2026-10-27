@@ -93,14 +93,10 @@ static void heartbeat(const bps_device *d, bps_json *j)
     const bps_max17048 *g = &d->u.gauge;
     if (!d->present || !g->valid || !g->battery)
         return;
-    bps_json_key(j, "battery");
-    bps_json_raw(j, "{");
-    bps_json_key(j, "percent");
-    bps_json_fixed(j, g->centi_percent / 100.0, 2);
-    bps_json_key(j, "voltage_v");
-    bps_json_fixed(j, g->millivolts / 1000.0, 3);
-    bps_json_key(j, "rate_pct_per_h");
-    bps_json_fixed(j, g->centi_pct_per_h / 100.0, 2);
+    bps_json_obj(j, "battery");
+    bps_json_fixed(j, "percent", g->centi_percent / 100.0, 2);
+    bps_json_fixed(j, "voltage_v", g->millivolts / 1000.0, 3);
+    bps_json_fixed(j, "rate_pct_per_h", g->centi_pct_per_h / 100.0, 2);
     bps_json_raw(j, "}");
 }
 

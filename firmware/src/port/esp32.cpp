@@ -1,6 +1,6 @@
 // Board layer for the ESP32 and ESP32-S3 (Arduino core 3.x on ESP-IDF 5).
-// Wi-Fi comes from the Arduino core; I2S, timer and sockets are IDF/lwIP C
-// APIs. Capture runs in its own high-priority task.
+// Wi-Fi comes from the Arduino core; I2S and timer are IDF C APIs, and
+// sockets lwIP's (sockets.c). Capture runs in its own high-priority task.
 #if defined(ARDUINO_ARCH_ESP32)
 
 #include <Arduino.h>
@@ -16,10 +16,7 @@
 #include <esp_private/wifi.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
-#include <fcntl.h>
 #include <freertos/ringbuf.h>
-#include <lwip/netdb.h>
-#include <lwip/sockets.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -291,121 +288,7 @@ extern "C" void port_wifi_diag(char *out, size_t cap)
              WiFi.BSSIDstr().c_str(), (long)WiFi.channel());
 }
 
-// ---- Sockets ----
-
-static bool resolve(const char *host, uint16_t port, int type, struct sockaddr_in *out)
-{
-    struct addrinfo hints = {};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = type;
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res)
-        return false;
-    memcpy(out, res->ai_addr, sizeof *out);
-    out->sin_port = htons(port);
-    freeaddrinfo(res);
-    return true;
-}
-
-static void set_nonblocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
-
-extern "C" int port_tcp_connect(const char *host, uint16_t port)
-{
-    struct sockaddr_in addr;
-    if (!resolve(host, port, SOCK_STREAM, &addr))
-        return -1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    set_nonblocking(fd);
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-    // Wait at most 2 s for the connection.
-    fd_set w;
-    FD_ZERO(&w);
-    FD_SET(fd, &w);
-    struct timeval tv = {2, 0};
-    int err = 0;
-    socklen_t len = sizeof err;
-    if (select(fd + 1, nullptr, &w, nullptr, &tv) != 1 ||
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-extern "C" int port_tcp_write(int h, const void *buf, size_t len)
-{
-    int n = send(h, buf, len, MSG_DONTWAIT);
-    if (n >= 0)
-        return n;
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-extern "C" int port_tcp_read(int h, void *buf, size_t len)
-{
-    int n = recv(h, buf, len, MSG_DONTWAIT);
-    if (n > 0)
-        return n;
-    if (n == 0)
-        return -1; // closed by the server
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-extern "C" void port_tcp_close(int h)
-{
-    if (h >= 0)
-        close(h);
-}
-
-#ifdef BPS_NET_DEBUG
-extern "C" bool port_tcp_get_stats(int h, port_tcp_stats *out)
-{
-    (void)h;
-    (void)out;
-    return false; // lwIP's internals belong to its own task here
-}
-#endif
-
-extern "C" int port_udp_open(const char *host, uint16_t port)
-{
-    struct sockaddr_in addr;
-    if (!resolve(host, port, SOCK_DGRAM, &addr))
-        return -1;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        close(fd);
-        return -1;
-    }
-    set_nonblocking(fd);
-    return fd;
-}
-
-extern "C" int port_udp_send(int h, const void *buf, size_t len)
-{
-    return send(h, buf, len, MSG_DONTWAIT) == (int)len ? (int)len : -1;
-}
-
-extern "C" int port_udp_recv(int h, void *buf, size_t len)
-{
-    int n = recv(h, buf, len, MSG_DONTWAIT);
-    if (n >= 0)
-        return n;
-    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-}
-
-extern "C" void port_udp_close(int h)
-{
-    if (h >= 0)
-        close(h);
-}
+// Sockets: sockets.c.
 
 // ---- Capture task ----
 

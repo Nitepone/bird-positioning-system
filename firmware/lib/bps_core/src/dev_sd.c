@@ -32,24 +32,16 @@ static void heartbeat(const bps_device *d, bps_json *j)
     port_sd_info_get(&info);
     bps_record_stats rec;
     bps_record_stats_get(&rec);
-    bps_json_key(j, "storage");
-    bps_json_raw(j, "{");
-    bps_json_key(j, "present");
-    bps_json_bool(j, info.present);
+    bps_json_obj(j, "storage");
+    bps_json_bool(j, "present", info.present);
     if (info.present) {
-        bps_json_key(j, "total_bytes");
-        bps_json_i64(j, (int64_t)info.total_bytes);
-        bps_json_key(j, "free_bytes");
-        bps_json_i64(j, (int64_t)info.free_bytes);
+        bps_json_i64(j, "total_bytes", (int64_t)info.total_bytes);
+        bps_json_i64(j, "free_bytes", (int64_t)info.free_bytes);
     }
-    bps_json_key(j, "recordings");
-    bps_json_i64(j, rec.files);
-    bps_json_key(j, "recorded_bytes");
-    bps_json_i64(j, (int64_t)rec.bytes);
-    bps_json_key(j, "errors");
-    bps_json_i64(j, info.errors);
-    bps_json_key(j, "dropped_bytes");
-    bps_json_i64(j, (int64_t)info.dropped_bytes);
+    bps_json_i64(j, "recordings", rec.files);
+    bps_json_i64(j, "recorded_bytes", (int64_t)rec.bytes);
+    bps_json_i64(j, "errors", info.errors);
+    bps_json_i64(j, "dropped_bytes", (int64_t)info.dropped_bytes);
     bps_json_raw(j, "}");
 }
 

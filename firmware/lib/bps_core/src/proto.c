@@ -86,15 +86,7 @@ static void put(bps_json *j, const char *s, size_t n)
 
 void bps_json_raw(bps_json *j, const char *s) { put(j, s, strlen(s)); }
 
-void bps_json_key(bps_json *j, const char *key)
-{
-    if (j->len > 0 && j->buf[j->len - 1] != '{')
-        put(j, ",", 1);
-    bps_json_str(j, key);
-    put(j, ":", 1);
-}
-
-void bps_json_str(bps_json *j, const char *s)
+static void put_str(bps_json *j, const char *s)
 {
     put(j, "\"", 1);
     for (; *s; s++) {
@@ -113,6 +105,38 @@ void bps_json_str(bps_json *j, const char *s)
     put(j, "\"", 1);
 }
 
+void bps_json_key(bps_json *j, const char *key)
+{
+    if (j->len > 0 && j->buf[j->len - 1] != '{')
+        put(j, ",", 1);
+    put_str(j, key);
+    put(j, ":", 1);
+}
+
+static void member(bps_json *j, const char *key)
+{
+    if (key)
+        bps_json_key(j, key);
+}
+
+void bps_json_obj(bps_json *j, const char *key)
+{
+    member(j, key);
+    put(j, "{", 1);
+}
+
+void bps_json_arr(bps_json *j, const char *key)
+{
+    member(j, key);
+    put(j, "[", 1);
+}
+
+void bps_json_str(bps_json *j, const char *key, const char *s)
+{
+    member(j, key);
+    put_str(j, s);
+}
+
 /* Decimal digits of `v`, without relying on printf's 64-bit support. */
 static void put_u64(bps_json *j, uint64_t v)
 {
@@ -128,8 +152,9 @@ static void put_u64(bps_json *j, uint64_t v)
     put(j, r, (size_t)n);
 }
 
-void bps_json_i64(bps_json *j, int64_t v)
+void bps_json_i64(bps_json *j, const char *key, int64_t v)
 {
+    member(j, key);
     if (v < 0) {
         put(j, "-", 1);
         put_u64(j, (uint64_t)0 - (uint64_t)v);
@@ -138,8 +163,9 @@ void bps_json_i64(bps_json *j, int64_t v)
     }
 }
 
-void bps_json_fixed(bps_json *j, double v, int decimals)
+void bps_json_fixed(bps_json *j, const char *key, double v, int decimals)
 {
+    member(j, key);
     if (!isfinite(v)) {
         put(j, "0", 1);
         return;
@@ -168,7 +194,11 @@ void bps_json_fixed(bps_json *j, double v, int decimals)
     }
 }
 
-void bps_json_bool(bps_json *j, bool v) { bps_json_raw(j, v ? "true" : "false"); }
+void bps_json_bool(bps_json *j, const char *key, bool v)
+{
+    member(j, key);
+    bps_json_raw(j, v ? "true" : "false");
+}
 
 bool bps_json_number(const char *json, size_t len, const char *key, double *out)
 {

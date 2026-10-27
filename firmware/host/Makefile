@@ -3,8 +3,10 @@ CORE := ../lib/bps_core/src
 CFLAGS ?= -O2 -g -Wall -Wextra
 override CFLAGS += -std=gnu11 -ffp-contract=off -pthread -I$(CORE)
 
-bps-host-client: host.c $(wildcard $(CORE)/*.c) $(wildcard $(CORE)/*.h)
-	$(CC) $(CFLAGS) -o $@ host.c $(wildcard $(CORE)/*.c) -lm
+SRC := host.c ../src/port/sockets.c $(wildcard $(CORE)/*.c)
+
+bps-host-client: $(SRC) $(wildcard $(CORE)/*.h)
+	$(CC) $(CFLAGS) -o $@ $(SRC) -lm
 
 clean:
 	rm -f bps-host-client

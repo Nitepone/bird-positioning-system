@@ -99,30 +99,20 @@ void bps_record_end(uint32_t samples, uint32_t lost, const char *upload)
     bps_json j;
     bps_json_init(&j, line, sizeof line - 1);
     bps_json_raw(&j, "{");
-    bps_json_key(&j, "file");
-    bps_json_str(&j, rec.file);
-    bps_json_key(&j, "start_ns");
-    bps_json_i64(&j, rec.start_ns);
-    bps_json_key(&j, "end_ns");
-    bps_json_i64(&j, rec.end_ns);
-    bps_json_key(&j, "sample_rate");
-    bps_json_i64(&j, rec.sample_rate);
-    bps_json_key(&j, "samples");
-    bps_json_i64(&j, samples);
-    bps_json_key(&j, "lost_samples");
-    bps_json_i64(&j, lost);
-    bps_json_key(&j, "bytes");
-    bps_json_i64(&j, (int64_t)rec.bytes);
+    bps_json_str(&j, "file", rec.file);
+    bps_json_i64(&j, "start_ns", rec.start_ns);
+    bps_json_i64(&j, "end_ns", rec.end_ns);
+    bps_json_i64(&j, "sample_rate", rec.sample_rate);
+    bps_json_i64(&j, "samples", samples);
+    bps_json_i64(&j, "lost_samples", lost);
+    bps_json_i64(&j, "bytes", (int64_t)rec.bytes);
     if (rec.dropped) { /* the file misses some of its frames */
-        bps_json_key(&j, "dropped_bytes");
-        bps_json_i64(&j, (int64_t)rec.dropped);
+        bps_json_i64(&j, "dropped_bytes", (int64_t)rec.dropped);
     }
     if (rec.tsf[0]) {
-        bps_json_key(&j, "tsf");
-        bps_json_str(&j, rec.tsf);
+        bps_json_str(&j, "tsf", rec.tsf);
     }
-    bps_json_key(&j, "upload");
-    bps_json_str(&j, upload);
+    bps_json_str(&j, "upload", upload);
     bps_json_raw(&j, "}\n");
     if (j.overflow)
         return;

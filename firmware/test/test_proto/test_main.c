@@ -50,23 +50,23 @@ static void test_json_writer(void)
     bps_json j;
     bps_json_init(&j, b, sizeof b);
     bps_json_raw(&j, "{");
-    bps_json_key(&j, "s");
-    bps_json_str(&j, "a\"b\\c\n");
-    bps_json_key(&j, "min");
-    bps_json_i64(&j, INT64_MIN);
-    bps_json_key(&j, "o");
-    bps_json_raw(&j, "{");
-    bps_json_key(&j, "f");
-    bps_json_fixed(&j, -0.00004, 4);
-    bps_json_key(&j, "g");
-    bps_json_fixed(&j, -12.34567, 4);
+    bps_json_str(&j, "s", "a\"b\\c\n");
+    bps_json_i64(&j, "min", INT64_MIN);
+    bps_json_obj(&j, "o");
+    bps_json_fixed(&j, "f", -0.00004, 4);
+    bps_json_fixed(&j, "g", -12.34567, 4);
     bps_json_raw(&j, "}");
-    bps_json_key(&j, "t");
-    bps_json_bool(&j, true);
-    bps_json_raw(&j, "}");
+    bps_json_bool(&j, "t", true);
+    bps_json_arr(&j, "a");
+    bps_json_i64(&j, NULL, 1);
+    bps_json_raw(&j, ",");
+    bps_json_obj(&j, NULL);
+    bps_json_bool(&j, "x", false);
+    bps_json_raw(&j, "}]}");
     TEST_ASSERT_FALSE(j.overflow);
     TEST_ASSERT_EQUAL_STRING("{\"s\":\"a\\\"b\\\\c\\u000a\",\"min\":-9223372036854775808,"
-                             "\"o\":{\"f\":0.0000,\"g\":-12.3457},\"t\":true}",
+                             "\"o\":{\"f\":0.0000,\"g\":-12.3457},\"t\":true,"
+                             "\"a\":[1,{\"x\":false}]}",
                              b);
     bps_json_init(&j, b, 4);
     bps_json_raw(&j, "toolong");

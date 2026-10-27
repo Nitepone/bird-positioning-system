@@ -49,10 +49,15 @@ void bps_json_init(bps_json *j, char *buf, size_t cap);
 void bps_json_raw(bps_json *j, const char *s);
 /* `"key":`, preceded by a comma unless it opens an object. */
 void bps_json_key(bps_json *j, const char *key);
-void bps_json_str(bps_json *j, const char *s);
-void bps_json_i64(bps_json *j, int64_t v);
-void bps_json_fixed(bps_json *j, double v, int decimals);
-void bps_json_bool(bps_json *j, bool v);
+/* A member `"key":value`, or with a NULL key the bare value. */
+void bps_json_str(bps_json *j, const char *key, const char *s);
+void bps_json_i64(bps_json *j, const char *key, int64_t v);
+void bps_json_fixed(bps_json *j, const char *key, double v, int decimals);
+void bps_json_bool(bps_json *j, const char *key, bool v);
+/* Opens an object or array (`"key":{`, or `{` with a NULL key); close it
+ * with bps_json_raw(j, "}") or "]". */
+void bps_json_obj(bps_json *j, const char *key);
+void bps_json_arr(bps_json *j, const char *key);
 
 /* The number stored under `"key"` anywhere in `json` (keys must be unique). */
 bool bps_json_number(const char *json, size_t len, const char *key, double *out);

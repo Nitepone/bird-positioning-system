@@ -233,28 +233,18 @@ static void start_register(void)
     bps_json j;
     bps_json_init(&j, body, sizeof body);
     bps_json_raw(&j, "{");
-    bps_json_key(&j, "client_id");
-    bps_json_str(&j, id_str);
-    bps_json_key(&j, "hostname");
-    bps_json_str(&j, hostname);
-    bps_json_key(&j, "version");
-    bps_json_str(&j, cfg.version);
-    bps_json_key(&j, "capabilities");
-    bps_json_raw(&j, "{");
-    bps_json_key(&j, "sample_rate");
-    bps_json_i64(&j, cfg.sample_rate);
-    bps_json_key(&j, "channels");
-    bps_json_i64(&j, 1);
-    bps_json_key(&j, "sample_format");
-    bps_json_str(&j, "I32");
-    bps_json_key(&j, "clock_source");
-    bps_json_str(&j, "crystal (UDP timesync)");
-    bps_json_key(&j, "device_name");
-    bps_json_str(&j, cfg.device_name);
+    bps_json_str(&j, "client_id", id_str);
+    bps_json_str(&j, "hostname", hostname);
+    bps_json_str(&j, "version", cfg.version);
+    bps_json_obj(&j, "capabilities");
+    bps_json_i64(&j, "sample_rate", cfg.sample_rate);
+    bps_json_i64(&j, "channels", 1);
+    bps_json_str(&j, "sample_format", "I32");
+    bps_json_str(&j, "clock_source", "crystal (UDP timesync)");
+    bps_json_str(&j, "device_name", cfg.device_name);
     bps_json_raw(&j, "}");
     if (cfg.name[0]) {
-        bps_json_key(&j, "name");
-        bps_json_str(&j, cfg.name);
+        bps_json_str(&j, "name", cfg.name);
     }
     bps_json_raw(&j, "}");
     path_for(path, sizeof path, NULL);
@@ -570,34 +560,23 @@ static void start_heartbeat(uint64_t now)
     bps_clock_status st;
     if (bps_clock_status_take(&clk, local_ns(now), &st)) {
         bps_json_raw(&j, "{");
-        bps_json_key(&j, "offset_ns");
-        bps_json_i64(&j, st.offset_ns);
-        bps_json_key(&j, "rtt_ns");
-        bps_json_i64(&j, st.rtt_ns);
-        bps_json_key(&j, "measured_at");
-        bps_json_i64(&j, st.measured_at);
-        bps_json_key(&j, "error_ns");
-        bps_json_i64(&j, st.error_ns);
-        bps_json_key(&j, "detail");
-        bps_json_raw(&j, "{");
-        bps_json_key(&j, "corrects_timestamps");
-        bps_json_bool(&j, st.corrects_timestamps);
-        bps_json_key(&j, "clock_offset_ns");
-        bps_json_i64(&j, st.clock_offset_ns);
-        bps_json_key(&j, "drift_ppm");
-        bps_json_fixed(&j, st.drift_ppm, 4);
-        bps_json_key(&j, "fit_points");
-        bps_json_i64(&j, st.fit_points);
-        bps_json_key(&j, "requests");
-        bps_json_i64(&j, st.requests);
-        bps_json_key(&j, "replies");
-        bps_json_i64(&j, st.replies);
+        bps_json_i64(&j, "offset_ns", st.offset_ns);
+        bps_json_i64(&j, "rtt_ns", st.rtt_ns);
+        bps_json_i64(&j, "measured_at", st.measured_at);
+        bps_json_i64(&j, "error_ns", st.error_ns);
+        bps_json_obj(&j, "detail");
+        bps_json_bool(&j, "corrects_timestamps", st.corrects_timestamps);
+        bps_json_i64(&j, "clock_offset_ns", st.clock_offset_ns);
+        bps_json_fixed(&j, "drift_ppm", st.drift_ppm, 4);
+        bps_json_i64(&j, "fit_points", st.fit_points);
+        bps_json_i64(&j, "requests", st.requests);
+        bps_json_i64(&j, "replies", st.replies);
         const char *keys[3] = {"rtt_min_ns", "rtt_median_ns", "rtt_max_ns"};
         int64_t vals[3] = {st.rtt_min_ns, st.rtt_median_ns, st.rtt_max_ns};
         for (int i = 0; i < 3; i++) {
             bps_json_key(&j, keys[i]);
             if (st.has_rtts)
-                bps_json_i64(&j, vals[i]);
+                bps_json_i64(&j, NULL, vals[i]);
             else
                 bps_json_raw(&j, "null");
         }
@@ -609,22 +588,14 @@ static void start_heartbeat(uint64_t now)
         if (f && clk.corrects && bps_beacon_ready(&beacon, mono)) {
             char bssid[18];
             bps_beacon_bssid(&beacon, bssid);
-            bps_json_key(&j, "beacon");
-            bps_json_raw(&j, "{");
-            bps_json_key(&j, "bssid");
-            bps_json_str(&j, bssid);
-            bps_json_key(&j, "tsf_ns");
-            bps_json_i64(&j, bps_beacon_tsf_at(&beacon, mono));
-            bps_json_key(&j, "server_ns");
-            bps_json_i64(&j, bps_clock_at(&clk, mono + epoch_ns));
-            bps_json_key(&j, "server_error_ns");
-            bps_json_i64(&j, f->error_ns);
-            bps_json_key(&j, "scatter_ns");
-            bps_json_i64(&j, beacon.scatter_ns);
-            bps_json_key(&j, "drift_ppm");
-            bps_json_fixed(&j, beacon.rate * -1e6, 4);
-            bps_json_key(&j, "beacons");
-            bps_json_i64(&j, beacon.fit_points);
+            bps_json_obj(&j, "beacon");
+            bps_json_str(&j, "bssid", bssid);
+            bps_json_i64(&j, "tsf_ns", bps_beacon_tsf_at(&beacon, mono));
+            bps_json_i64(&j, "server_ns", bps_clock_at(&clk, mono + epoch_ns));
+            bps_json_i64(&j, "server_error_ns", f->error_ns);
+            bps_json_i64(&j, "scatter_ns", beacon.scatter_ns);
+            bps_json_fixed(&j, "drift_ppm", beacon.rate * -1e6, 4);
+            bps_json_i64(&j, "beacons", beacon.fit_points);
             bps_json_raw(&j, "}");
         }
         bps_json_raw(&j, "}");
@@ -632,16 +603,11 @@ static void start_heartbeat(uint64_t now)
         bps_json_raw(&j, "null");
     }
     stats.dropouts_sending = dropouts_total();
-    bps_json_key(&j, "uptime_s");
-    bps_json_i64(&j, (int64_t)((now - boot_us) / 1000000));
-    bps_json_key(&j, "chunks_sent");
-    bps_json_i64(&j, (int64_t)stats.chunks_sent);
-    bps_json_key(&j, "chunks_gated");
-    bps_json_i64(&j, (int64_t)stats.chunks_gated);
-    bps_json_key(&j, "queue_len");
-    bps_json_i64(&j, 0);
-    bps_json_key(&j, "capture_dropouts");
-    bps_json_i64(&j, stats.dropouts_sending - stats.dropouts_reported);
+    bps_json_i64(&j, "uptime_s", (int64_t)((now - boot_us) / 1000000));
+    bps_json_i64(&j, "chunks_sent", (int64_t)stats.chunks_sent);
+    bps_json_i64(&j, "chunks_gated", (int64_t)stats.chunks_gated);
+    bps_json_i64(&j, "queue_len", 0);
+    bps_json_i64(&j, "capture_dropouts", stats.dropouts_sending - stats.dropouts_reported);
     bps_devices_heartbeat(&j);
     bps_json_raw(&j, "}");
     if (j.overflow)

@@ -152,20 +152,15 @@ void bps_devices_heartbeat(bps_json *j)
     }
     if (n_devs == 0)
         return;
-    bps_json_key(j, "devices");
-    bps_json_raw(j, "[");
+    bps_json_arr(j, "devices");
     for (size_t i = 0; i < n_devs; i++) {
         if (i)
             bps_json_raw(j, ",");
         bps_json_raw(j, "{");
-        bps_json_key(j, "kind");
-        bps_json_str(j, devs[i].drv->kind);
-        bps_json_key(j, "bus");
-        bps_json_str(j, bus_name(&devs[i]));
-        bps_json_key(j, "address");
-        bps_json_i64(j, devs[i].address);
-        bps_json_key(j, "present");
-        bps_json_bool(j, devs[i].present);
+        bps_json_str(j, "kind", devs[i].drv->kind);
+        bps_json_str(j, "bus", bus_name(&devs[i]));
+        bps_json_i64(j, "address", devs[i].address);
+        bps_json_bool(j, "present", devs[i].present);
         bps_json_raw(j, "}");
     }
     bps_json_raw(j, "]");

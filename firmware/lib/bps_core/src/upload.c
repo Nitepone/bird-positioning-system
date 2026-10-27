@@ -222,9 +222,9 @@ static void upload_begin(uint32_t start, uint64_t now)
     bps_json x;
     bps_json_init(&x, extra, sizeof extra);
     bps_json_raw(&x, BPS_HEADER_START_NS ": ");
-    bps_json_i64(&x, start_ns);
+    bps_json_i64(&x, NULL, start_ns);
     bps_json_raw(&x, "\r\n" BPS_HEADER_END_NS ": ");
-    bps_json_i64(&x, end_ns);
+    bps_json_i64(&x, NULL, end_ns);
     bps_json_raw(&x, "\r\n");
     char tsf[80] = "";
     if (bps_beacon_ready(c.beacon, (int64_t)now * 1000)) {
