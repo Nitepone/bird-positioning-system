@@ -26,8 +26,14 @@ __attribute__((format(printf, 1, 2)))
 #endif
 void port_log(const char *fmt, ...);
 
-/* Starts (or restarts) joining the network; Wi-Fi power saving off. */
+/* Starts (or restarts) joining the network; Wi-Fi power saving off. After
+ * port_wifi_off() it turns the radio back on first. */
 void port_wifi_begin(const char *ssid, const char *password, const char *hostname);
+/* Leaves the network and turns the radio off, to save power (batch mode).
+ * False where the board cannot. */
+bool port_wifi_off(void);
+/* Lets the CPU rest for up to `ms` (the loop has nothing to do meanwhile). */
+void port_idle_ms(uint32_t ms);
 bool port_wifi_up(void);
 /* Signal strength of the access point, dBm (0 if unknown). */
 int port_wifi_rssi(void);
@@ -104,6 +110,24 @@ void port_sd_info_get(port_sd_info *out);
 bool port_sd_write(const char *path, const void *buf, size_t len, bool append);
 /* Queues closing the open file. */
 void port_sd_close(void);
+/* Queues removing the file at `path`. */
+bool port_sd_remove(const char *path);
+
+/* Reads and listings go through the same queue as writes (so they see every
+ * write queued before them), one at a time; port_sd_result() gives the
+ * outcome. Reading: up to `len` (at most PORT_SD_READ_MAX) bytes of the file
+ * at `path` from `offset`. Listing: the names in directory `dir` that end in
+ * `suffix`, one per line, as many as fit in PORT_SD_READ_MAX bytes. False
+ * (and nothing queued) without a card, or while one is still to finish. */
+#define PORT_SD_READ_MAX 4096
+bool port_sd_read(const char *path, uint32_t offset, size_t len);
+bool port_sd_list(const char *dir, const char *suffix);
+#define PORT_SD_PENDING (-2)
+/* PORT_SD_PENDING while the latest read or listing is still to finish, -1 if
+ * it failed (no such file or directory), else the bytes now at `*data` (0 at
+ * the end of a file; for a listing, `*total` is how many names matched). The
+ * bytes stay valid until the next read or listing. */
+int port_sd_result(const void **data, uint32_t *total);
 
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);

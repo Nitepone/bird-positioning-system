@@ -13,10 +13,13 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, put};
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
-use bsp_proto::{ClientId, NANOS_PER_SEC, Timestamp, Uuid, now_ns};
+use bsp_proto::{
+    ClientId, MAX_BATCH_INTERVAL_S, MIN_BATCH_INTERVAL_S, ModeSetting, NANOS_PER_SEC, Timestamp,
+    Uuid, now_ns,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -31,6 +34,7 @@ pub fn router() -> Router<SharedState> {
             get(get_client).put(configure_client).delete(delete_client),
         )
         .route("/clients/{id}/clock", get(client_clock))
+        .route("/clients/{id}/mode", put(set_client_mode))
         .route("/detections", get(list_detections))
         .route("/timeline", get(timeline))
         .route("/species", get(species_seen))
@@ -153,6 +157,26 @@ async fn configure_client(
             *slot = None;
         }
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /clients/{id}/mode`: the mode the client is to run in. It reaches
+/// the client in the reply to its next heartbeat: for a batch client, at its
+/// next contact.
+async fn set_client_mode(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+    Json(mode): Json<ModeSetting>,
+) -> ApiResult<StatusCode> {
+    if !(MIN_BATCH_INTERVAL_S..=MAX_BATCH_INTERVAL_S).contains(&mode.interval_s) {
+        return Err(ApiError::bad_request(format!(
+            "interval_s must be {MIN_BATCH_INTERVAL_S} to {MAX_BATCH_INTERVAL_S}"
+        )));
+    }
+    if !state.db.set_client_mode(id, &mode)? {
+        return Err(ApiError::not_found("client"));
+    }
+    state.event(Some(id), "mode_set", serde_json::to_value(mode)?);
     Ok(StatusCode::NO_CONTENT)
 }
 

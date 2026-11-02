@@ -110,6 +110,34 @@ static void test_uuids(void)
     TEST_ASSERT_TRUE(memcmp(id, back, 16) != 0);
 }
 
+static void test_json_int_and_string(void)
+{
+    const char *j = "{\"mode\":{\"mode\":\"batch\",\"interval_s\":300},\"start\":1762090000123456789,"
+                    "\"start_est\":-5,\"x\":1.5,\"big\":12345678901234567890,\"note\":\"a\\\"b\"}";
+    size_t n = strlen(j);
+    int64_t v;
+    TEST_ASSERT_TRUE(bps_json_int(j, n, "start", &v));
+    TEST_ASSERT_EQUAL_INT64(1762090000123456789LL, v); /* beyond a double's precision */
+    TEST_ASSERT_TRUE(bps_json_int(j, n, "start_est", &v));
+    TEST_ASSERT_EQUAL_INT64(-5, v);
+    TEST_ASSERT_TRUE(bps_json_int(j, n, "interval_s", &v));
+    TEST_ASSERT_EQUAL_INT64(300, v);
+    TEST_ASSERT_FALSE(bps_json_int(j, n, "x", &v));   /* not an integer */
+    TEST_ASSERT_FALSE(bps_json_int(j, n, "big", &v)); /* too long */
+    TEST_ASSERT_FALSE(bps_json_int(j, n, "missing", &v));
+    char s[16];
+    /* The first "mode" holds an object; the string is the one inside. */
+    TEST_ASSERT_TRUE(bps_json_string(j, n, "mode", s, sizeof s));
+    TEST_ASSERT_EQUAL_STRING("batch", s);
+    TEST_ASSERT_FALSE(bps_json_string(j, n, "mode", s, 4)); /* too long for it */
+    TEST_ASSERT_FALSE(bps_json_string(j, n, "note", s, sizeof s)); /* escapes are not read */
+    TEST_ASSERT_FALSE(bps_json_string(j, n, "start", s, sizeof s));
+    /* A value equal to a key's name is not the key. */
+    const char *k = "{\"a\":\"mode\",\"mode\":\"live\"}";
+    TEST_ASSERT_TRUE(bps_json_string(k, strlen(k), "mode", s, sizeof s));
+    TEST_ASSERT_EQUAL_STRING("live", s);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -117,6 +145,7 @@ int main(void)
     RUN_TEST(test_http_parse);
     RUN_TEST(test_json_writer);
     RUN_TEST(test_json_number);
+    RUN_TEST(test_json_int_and_string);
     RUN_TEST(test_uuids);
     return UNITY_END();
 }

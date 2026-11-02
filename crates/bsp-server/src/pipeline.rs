@@ -39,7 +39,14 @@ pub async fn run(
                 None => return,
             },
             _ = tick.tick() => {
-                for group in take_ready_groups(&mut pending, skew, now_ns() - window) {
+                let now = now_ns();
+                let hold = state.db.list_clients().ok()
+                    .and_then(|clients| state.batch_hold(&clients, now))
+                    .map(|h| Hold {
+                        delivered_through: h.delivered_through,
+                        received_before: now - h.max_wait_ns,
+                    });
+                for group in take_ready_groups(&mut pending, skew, now - window, hold) {
                     let d = build_detection(&state, group, locator.clone()).await;
                     // The identifier's thresholds normally see to this already.
                     if d.confidence < ConfidenceLevel::MIN {
@@ -71,17 +78,34 @@ pub struct Pending {
     pub received: Timestamp,
 }
 
-/// Removes and returns groups whose earliest call was received before `cutoff`.
-/// A group holds calls of one species, at most one per client, all starting
-/// within `skew` of the group's earliest call.
+/// Calls kept waiting for batch clients, which upload their audio late: a
+/// call is grouped once they have all delivered their audio past its end, or
+/// once it was received before `received_before`.
+#[derive(Debug, Clone, Copy)]
+pub struct Hold {
+    pub delivered_through: Timestamp,
+    pub received_before: Timestamp,
+}
+
+/// Removes and returns groups whose earliest call was received before `cutoff`
+/// (and is not held for batch clients' audio). A group holds calls of one
+/// species, at most one per client, all starting within `skew` of the
+/// group's earliest call.
 pub fn take_ready_groups(
     pending: &mut Vec<Pending>,
     skew: i64,
     cutoff: Timestamp,
+    hold: Option<Hold>,
 ) -> Vec<Vec<Call>> {
     pending.sort_by_key(|p| p.call.start);
+    let ready = |p: &Pending| {
+        p.received < cutoff
+            && hold.is_none_or(|h| {
+                p.call.end + skew <= h.delivered_through || p.received < h.received_before
+            })
+    };
     let mut groups = Vec::new();
-    while pending.first().is_some_and(|p| p.received < cutoff) {
+    while pending.first().is_some_and(ready) {
         let anchor = pending.remove(0).call;
         let mut group = vec![anchor];
         let mut i = 0;
@@ -264,7 +288,7 @@ mod tests {
             call(1, "a", 1100), // same client again -> merged
             call(5, "a", 9000), // not ready yet
         ];
-        let groups = take_ready_groups(&mut pending, skew, 5000 * NANOS_PER_MS);
+        let groups = take_ready_groups(&mut pending, skew, 5000 * NANOS_PER_MS, None);
         let summary: Vec<Vec<u128>> = groups
             .iter()
             .map(|g| g.iter().map(|c| c.client_id.as_u128()).collect())
@@ -307,10 +331,42 @@ mod tests {
         let mut late = call(1, "a", 1000);
         late.received = 9000 * NANOS_PER_MS;
         let mut pending = vec![late];
-        assert!(take_ready_groups(&mut pending, skew, 5000 * NANOS_PER_MS).is_empty());
+        assert!(take_ready_groups(&mut pending, skew, 5000 * NANOS_PER_MS, None).is_empty());
         pending.push(call(2, "a", 1100));
-        let groups = take_ready_groups(&mut pending, skew, 10_000 * NANOS_PER_MS);
+        let groups = take_ready_groups(&mut pending, skew, 10_000 * NANOS_PER_MS, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn waits_for_batch_clients_audio() {
+        let skew = 200 * NANOS_PER_MS;
+        let ms = NANOS_PER_MS;
+        // Client 1 is live; client 2 has delivered its audio up to 800 ms.
+        let mut pending = vec![call(1, "a", 1000)];
+        let hold = |through_ms, before_ms| {
+            Some(Hold {
+                delivered_through: through_ms * ms,
+                received_before: before_ms * ms,
+            })
+        };
+        assert!(take_ready_groups(&mut pending, skew, 5000 * ms, hold(800, 0)).is_empty());
+        // Its batch arrives minutes later, with the same call in it.
+        let mut late = call(2, "a", 1050);
+        late.received = 300_000 * ms;
+        pending.push(late);
+        assert!(take_ready_groups(&mut pending, skew, 301_000 * ms, hold(1400, 0)).is_empty());
+        // Delivered past the calls' ends (plus the skew) and waited long
+        // enough for the late one: one group of both.
+        let groups = take_ready_groups(&mut pending, skew, 316_000 * ms, hold(1600, 0));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        // A batch client that never delivers holds calls only so long.
+        let mut pending = vec![call(1, "a", 1000)];
+        assert!(take_ready_groups(&mut pending, skew, 5000 * ms, hold(0, 1000)).is_empty());
+        assert_eq!(
+            take_ready_groups(&mut pending, skew, 5000 * ms, hold(0, 1001)).len(),
+            1
+        );
     }
 }

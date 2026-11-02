@@ -4,12 +4,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "anchor.h"
 #include "beacon.h"
 #include "capture.h"
 #include "devices.h"
 #include "port.h"
 #include "proto.h"
+#include "record.h"
 #include "ring.h"
+#include "spool.h"
 #include "timesync.h"
 #include "upload.h"
 
@@ -28,7 +31,34 @@
 /* Heap left for the network stack and Wi-Fi driver after the ring buffer. */
 #define HEAP_RESERVE (32 * 1024)
 
-enum { ST_WIFI, ST_REGISTER, ST_RUN };
+/* Batch mode's contacts: the radio comes on, the client joins Wi-Fi and
+ * registers, measures its clock afresh, uploads what it saved, sends a last
+ * heartbeat, and the radio goes off again. */
+#define CONTACT_CONNECT_US 30000000 /* to join and register, or wait for the next */
+/* Clock measurements in the contact before its first anchor (6 s), and
+ * beacons in the line through the access point's clock, if it is heard. */
+#define CONTACT_SYNC_REPLIES 12
+#define CONTACT_SYNC_BEACONS 24
+/* Then the anchor is taken anyway, if there is any measurement. */
+#define CONTACT_SYNC_MAX_US 30000000
+/* The radio stays on at most this long per contact; what is left of the
+ * card goes up next time. */
+#define CONTACT_MAX_US 120000000
+/* Contacts are at least this far apart, however long the last one took. */
+#define CONTACT_MIN_GAP_US 5000000
+/* Anchors are taken this often while in contact (all modes). */
+#define ANCHOR_EVERY_US 10000000
+/* Live mode: how often chunks left on the card are looked for again. */
+#define LIVE_SPOOL_US 30000000
+/* With the radio off, the loop rests this long between passes (the ring
+ * buffer holds seconds; saving a chunk keeps up easily). */
+#define OFF_IDLE_MS 10
+
+enum { ST_WIFI, ST_REGISTER, ST_RUN, ST_OFF };
+enum { MODE_LIVE, MODE_BATCH };
+static const char *const MODE_NAMES[] = {"live", "batch"};
+/* The phases of a contact, once registered. */
+enum { C_SYNC, C_FLUSH, C_LAST_FLUSH, C_FINAL };
 enum { TXN_IDLE, TXN_SENDING, TXN_RECEIVING, TXN_DONE, TXN_FAILED };
 
 /* One buffered HTTP request and its (small) response.
@@ -70,8 +100,9 @@ static uint32_t chunk_len, lookback;
 static bps_gate_config gate_cfg;
 
 static txn reg_txn, hb_txn, pos_txn;
-/* Heartbeats carry the clock and the devices' reports; the others are small. */
-static char reg_tx[1024], hb_tx[2560], pos_tx[512];
+/* Heartbeats carry the clock, the devices' reports and the mode; the others
+ * are small. */
+static char reg_tx[1024], hb_tx[2816], pos_tx[512];
 static uint64_t reg_next_us, reg_delay_us, hb_next_us, status_next_us;
 static bool hb_failing;
 
@@ -94,6 +125,34 @@ static struct {
     bool raw, pressed;
     uint64_t changed_us;
 } button;
+
+/* The operation mode: as the server asks in heartbeat replies, and as run. */
+static struct {
+    int want, run;
+    uint32_t interval_s;
+    const char *note; /* why `run` is not `want` */
+    /* A session is one connection: registered until disconnected. */
+    uint32_t session;
+    uint64_t session_us;
+    uint32_t replies, beacons_heard; /* clock replies in the session; beacons before it */
+    bool session_synced;             /* measured afresh: anchors can be taken */
+    uint64_t anchor_us;              /* when the latest was */
+    uint64_t live_spool_us;
+    /* Batch mode. */
+    uint64_t contact_us; /* when the radio came on for this contact */
+    int phase;
+    bool final_hb; /* the heartbeat in flight is the contact's last */
+    uint64_t next_contact_us;
+    /* The radio's share of the time since the mode started. */
+    uint64_t since_us, on_us, on_mark_us;
+    bool radio_on;
+    /* The latest gap: how far the clock moved beyond its drift. */
+    bool has_gap, gap_has_tsf;
+    uint32_t gap_off_s;
+    int64_t gap_clock_ns, gap_tsf_ns;
+} mode = {.interval_s = 300, .radio_on = true};
+
+static bps_anchors anchors;
 
 static bool led_on, levels_logged;
 
@@ -328,6 +387,7 @@ static void drop_connections(void)
     txn_reset(&hb_txn);
     txn_reset(&pos_txn);
     bps_upload_drop();
+    bps_spool_drop();
     if (ts.h >= 0)
         port_udp_close(ts.h);
     ts.h = -1;
@@ -342,6 +402,15 @@ static void start_run(uint64_t now)
     ts.waiting = false;
     ts.next_us = now;
     hb_next_us = now;
+    mode.session++;
+    mode.session_us = now;
+    mode.replies = 0;
+    mode.beacons_heard = beacon.heard;
+    mode.session_synced = false;
+    mode.final_hb = false;
+    if (mode.run == MODE_BATCH)
+        mode.phase = C_SYNC;
+    mode.live_spool_us = now; /* live: the first look waits for the clock */
     set_state(ST_RUN);
 }
 
@@ -479,6 +548,7 @@ static void timesync_handle(const uint8_t *buf, int n, uint64_t at_us)
         return; /* stale reply to an earlier, timed-out request */
     ts.waiting = false;
     ts.warned = false;
+    mode.replies++;
     bps_clock_count_request(&clk);
     /* t4 from the monotonic clock, like t1. */
     int64_t t4 = ts.t1 + (int64_t)(at_us - ts.sent_us) * 1000;
@@ -545,13 +615,313 @@ static void timesync_poll(uint64_t now)
         timesync_recv();
 }
 
+/* ---- Operation modes ---- */
+
+static bool synced(void);
+
+static void radio_account(uint64_t now, bool on)
+{
+    if (mode.radio_on)
+        mode.on_us += now - mode.on_mark_us;
+    mode.radio_on = on;
+    mode.on_mark_us = now;
+}
+
+static void mode_started(uint64_t now)
+{
+    mode.since_us = mode.on_mark_us = now;
+    mode.on_us = 0;
+    mode.radio_on = true;
+}
+
+/* Where the clock stands now against the server's, and the access point's. */
+static bool take_anchor(uint64_t now, bps_anchor *a)
+{
+    const bps_ts_fit *f = bps_est_fit(&clk.est);
+    if (!f || !epoch_set)
+        return false;
+    int64_t mono = (int64_t)now * 1000;
+    memset(a, 0, sizeof *a);
+    a->local_ns = local_ns(now);
+    a->server_ns = bps_clock_at(&clk, a->local_ns);
+    a->rate = f->rate;
+    a->has_tsf = bps_beacon_ready(&beacon, mono);
+    if (a->has_tsf) {
+        memcpy(a->bssid, beacon.bssid, 6);
+        a->tsf_ns = bps_beacon_tsf_at(&beacon, mono);
+        a->tsf_rate = beacon.rate;
+    }
+    a->session = mode.session;
+    return true;
+}
+
+static void push_anchor(uint64_t now)
+{
+    bps_anchor a;
+    if (!mode.session_synced || !take_anchor(now, &a))
+        return;
+    const bps_anchor *last = bps_anchors_last(&anchors);
+    if (last && last->session != a.session && mode.run == MODE_BATCH) {
+        /* The first of a contact: how far the clock moved while the radio
+         * was off, beyond what its drift predicted. */
+        mode.has_gap = true;
+        mode.gap_off_s = (uint32_t)((a.local_ns - last->local_ns) / BPS_NANOS_PER_SEC);
+        mode.gap_clock_ns = bps_anchor_gap_ns(last, &a);
+        mode.gap_has_tsf = bps_anchor_gap_tsf_ns(last, &a, &mode.gap_tsf_ns);
+        char tsf[48] = "";
+        if (mode.gap_has_tsf)
+            snprintf(tsf, sizeof tsf, ", against the access point %ld us",
+                     (long)(mode.gap_tsf_ns / 1000));
+        port_log("contact: after %lu s, the clock was %ld us from where its drift put it%s",
+                 (unsigned long)mode.gap_off_s, (long)(mode.gap_clock_ns / 1000), tsf);
+    }
+    bps_anchors_push(&anchors, &a);
+    mode.anchor_us = now;
+}
+
+/* Once the clock has been measured afresh this session (and the access
+ * point's, if it is heard), anchors can be taken. */
+static void sync_poll(uint64_t now)
+{
+    if (mode.session_synced)
+        return;
+    bool heard = beacon.heard != mode.beacons_heard;
+    bool tsf_ok = !heard || (bps_beacon_ready(&beacon, (int64_t)now * 1000) &&
+                             beacon.fit_points >= CONTACT_SYNC_BEACONS);
+    bool clock_ok = mode.replies >= CONTACT_SYNC_REPLIES && synced();
+    bool late = now - mode.session_us > CONTACT_SYNC_MAX_US && mode.replies >= 3 &&
+                bps_est_fit(&clk.est);
+    if (!((clock_ok && tsf_ok) || late))
+        return;
+    if (!(clock_ok && tsf_ok))
+        port_log("contact: clock still not measured well after %lu s; going on anyway",
+                 (unsigned long)(CONTACT_SYNC_MAX_US / 1000000));
+    mode.session_synced = true;
+    push_anchor(now);
+}
+
+static bool card_has_room(void)
+{
+    port_sd_info info;
+    port_sd_info_get(&info);
+    return info.present && info.free_bytes >= BPS_RECORD_MIN_FREE;
+}
+
+/* Turns the radio off until the next contact. */
+static void go_off(uint64_t now)
+{
+    drop_connections();
+    if (!port_wifi_off()) {
+        port_log("mode: this board cannot turn its radio off; staying live");
+        mode.note = "this board cannot turn its radio off";
+        mode.run = MODE_LIVE;
+        bps_upload_set_spool(false);
+        set_state(ST_WIFI);
+        return;
+    }
+    radio_account(now, false);
+    uint64_t next = mode.contact_us + (uint64_t)mode.interval_s * 1000000;
+    if (next < now + CONTACT_MIN_GAP_US)
+        next = now + CONTACT_MIN_GAP_US;
+    mode.next_contact_us = next;
+    bps_spool_status sp;
+    bps_spool_status_get(&sp);
+    port_log("contact: radio off after %lu s; next contact in %lu s (%lu chunks on the card)",
+             (unsigned long)((now - mode.contact_us) / 1000000),
+             (unsigned long)((next - now) / 1000000), (unsigned long)sp.items);
+    set_state(ST_OFF);
+}
+
+static void wake(uint64_t now)
+{
+    mode.contact_us = now;
+    mode.phase = C_SYNC;
+    radio_account(now, true);
+    /* The line through the beacons from before would bridge the gap; the
+     * anchors do that, from fresh lines on either side. */
+    bps_beacon_forget(&beacon);
+    port_wifi_begin(cfg.wifi_ssid, cfg.wifi_password, hostname);
+    set_state(ST_WIFI);
+}
+
+/* A contact's steps once registered (batch mode). */
+static void contact_poll(uint64_t now)
+{
+    if (mode.run != MODE_BATCH)
+        return;
+    bool over = now - mode.contact_us > CONTACT_MAX_US;
+    if (!card_has_room()) {
+        /* Audio would be lost with the radio off: upload it as it comes. */
+        port_log("mode: the storage card is gone or full; live until it is back");
+        mode.note = "batch mode needs a storage card with room";
+        mode.run = MODE_LIVE;
+        bps_upload_set_spool(false);
+        mode_started(now);
+        hb_next_us = now;
+        return;
+    }
+    switch (mode.phase) {
+    case C_SYNC:
+        if (!mode.session_synced && !over)
+            return;
+        bps_spool_kick();
+        mode.phase = C_FLUSH;
+        break;
+    case C_FLUSH:
+        if (bps_spool_busy() && !over)
+            return;
+        /* What was saved during the contact needs an anchor after it. */
+        push_anchor(now);
+        bps_spool_kick();
+        mode.phase = C_LAST_FLUSH;
+        break;
+    case C_LAST_FLUSH:
+        if (bps_spool_busy() && !over)
+            return;
+        bps_spool_drop();
+        push_anchor(now); /* the last before the radio goes off */
+        mode.phase = C_FINAL;
+        hb_next_us = now; /* say so, and hear whether the mode changed */
+        break;
+    case C_FINAL:
+        /* Waits for that heartbeat (heartbeat_poll), however it goes. */
+        if (now - mode.contact_us > CONTACT_MAX_US + 2 * TXN_TIMEOUT_US)
+            go_off(now);
+        break;
+    }
+}
+
+/* A contact that cannot get as far as registering waits for the next. */
+static void contact_connect_poll(uint64_t now)
+{
+    if (mode.run == MODE_BATCH && now - mode.contact_us > CONTACT_CONNECT_US) {
+        port_log("contact: could not reach the server; trying again at the next contact");
+        go_off(now);
+    }
+}
+
+/* The mode the server asks for, from a heartbeat reply. */
+static void apply_mode(int want, uint32_t interval_s, uint64_t now)
+{
+    if (want == mode.run && interval_s == mode.interval_s && !mode.note)
+        return;
+    if (want == MODE_BATCH && interval_s != mode.interval_s && mode.run == MODE_BATCH)
+        port_log("mode: batch, now a contact every %lu s", (unsigned long)interval_s);
+    mode.want = want;
+    mode.interval_s = interval_s;
+    if (want == MODE_LIVE) {
+        mode.note = NULL;
+        if (mode.run == MODE_BATCH) {
+            port_log("mode: live (the radio stays on)");
+            mode.run = MODE_LIVE;
+            bps_upload_set_spool(false);
+            mode_started(now);
+            bps_spool_kick(); /* what is still on the card */
+        }
+        return;
+    }
+    if (mode.run == MODE_BATCH)
+        return;
+    if (!card_has_room()) {
+        if (!mode.note)
+            port_log("mode: batch needs a storage card with room; staying live");
+        mode.note = "batch mode needs a storage card with room";
+        return;
+    }
+    mode.note = NULL;
+    port_log("mode: batch, a contact every %lu s (the radio is off in between)",
+             (unsigned long)interval_s);
+    mode.run = MODE_BATCH;
+    bps_upload_set_spool(true);
+    mode_started(now);
+    /* This connection is the first contact. */
+    mode.contact_us = now;
+    mode.phase = C_SYNC;
+}
+
+static void heartbeat_reply(uint64_t now)
+{
+    const char *body = hb_txn.rx + hb_txn.resp.body_off;
+    size_t len = hb_txn.rx_len - hb_txn.resp.body_off;
+    char m[16];
+    double interval = mode.interval_s;
+    if (!bps_json_string(body, len, "mode", m, sizeof m))
+        return; /* a server without modes */
+    bps_json_number(body, len, "interval_s", &interval);
+    if (interval < 30)
+        interval = 30;
+    if (interval > 3600)
+        interval = 3600;
+    apply_mode(strcmp(m, "batch") == 0 ? MODE_BATCH : MODE_LIVE, (uint32_t)interval, now);
+}
+
+/* Live mode: chunks left on the card (from batch mode) go up as well. */
+static void live_spool_poll(uint64_t now)
+{
+    if (mode.run != MODE_LIVE || !mode.session_synced || bps_spool_busy() ||
+        now < mode.live_spool_us)
+        return;
+    mode.live_spool_us = now + LIVE_SPOOL_US;
+    bps_spool_status sp;
+    bps_spool_status_get(&sp);
+    if (!sp.known || sp.items)
+        bps_spool_kick();
+}
+
+static void anchor_poll(uint64_t now)
+{
+    if (mode.session_synced && now - mode.anchor_us >= ANCHOR_EVERY_US)
+        push_anchor(now);
+}
+
+static void mode_json(bps_json *j, uint64_t now)
+{
+    bps_spool_status sp;
+    bps_spool_status_get(&sp);
+    bps_json_obj(j, "mode");
+    bps_json_str(j, "mode", MODE_NAMES[mode.run]);
+    bps_json_i64(j, "interval_s", mode.interval_s);
+    bps_json_i64(j, "backlog", sp.items);
+    bps_json_i64(j, "backlog_bytes", (int64_t)sp.bytes);
+    if (mode.run == MODE_BATCH) {
+        /* Everything before the oldest chunk still on the card, or (none)
+         * before a chunk starting now would start, has been delivered. */
+        int64_t local = sp.has_oldest
+                            ? sp.oldest_local_ns
+                            : local_ns(now) - bps_samples_to_ns(lookback + chunk_len / 4,
+                                                                cfg.sample_rate);
+        bps_json_i64(j, "delivered_through", bps_clock_at(&clk, local));
+        if (mode.phase == C_FINAL) {
+            uint64_t next = mode.contact_us + (uint64_t)mode.interval_s * 1000000;
+            uint64_t in = next > now + CONTACT_MIN_GAP_US ? next - now : CONTACT_MIN_GAP_US;
+            bps_json_i64(j, "next_contact_s", (int64_t)(in / 1000000));
+        }
+        uint64_t on = mode.on_us + (mode.radio_on ? now - mode.on_mark_us : 0);
+        uint64_t all = now - mode.since_us;
+        bps_json_fixed(j, "radio_on_pct", all ? 100.0 * (double)on / (double)all : 100.0, 1);
+        if (mode.has_gap) {
+            bps_json_obj(j, "gap");
+            bps_json_i64(j, "off_s", mode.gap_off_s);
+            bps_json_i64(j, "clock_ns", mode.gap_clock_ns);
+            if (mode.gap_has_tsf) {
+                bps_json_i64(j, "tsf_ns", mode.gap_tsf_ns);
+            }
+            bps_json_raw(j, "}");
+        }
+    }
+    if (mode.note) {
+        bps_json_str(j, "note", mode.note);
+    }
+    bps_json_raw(j, "}");
+}
+
 /* ---- Heartbeats ---- */
 
 static uint32_t dropouts_total(void) { return LOAD(&cap.dropouts) + stats.overruns; }
 
 static void start_heartbeat(uint64_t now)
 {
-    static char body[2048];
+    static char body[2304];
     char path[96];
     bps_json j;
     bps_json_init(&j, body, sizeof body);
@@ -609,7 +979,9 @@ static void start_heartbeat(uint64_t now)
     bps_json_i64(&j, "queue_len", 0);
     bps_json_i64(&j, "capture_dropouts", stats.dropouts_sending - stats.dropouts_reported);
     bps_devices_heartbeat(&j);
+    mode_json(&j, now);
     bps_json_raw(&j, "}");
+    mode.final_hb = mode.run == MODE_BATCH && mode.phase == C_FINAL;
     if (j.overflow)
         port_log("heartbeat: too long for its buffer; not sent");
     path_for(path, sizeof path, "heartbeat");
@@ -632,6 +1004,7 @@ static void heartbeat_poll(uint64_t now)
         if (hb_failing)
             port_log("heartbeat: delivered again");
         hb_failing = false;
+        heartbeat_reply(now);
     } else if (txn_unknown(&hb_txn)) {
         port_log("server forgot this client; re-registering");
         need_register = true;
@@ -643,6 +1016,13 @@ static void heartbeat_poll(uint64_t now)
         hb_failing = true;
     }
     txn_reset(&hb_txn);
+    /* The contact's last heartbeat: the radio goes off, unless the reply
+     * asked for live mode. */
+    if (mode.final_hb) {
+        mode.final_hb = false;
+        if (mode.run == MODE_BATCH && mode.phase == C_FINAL && !need_register)
+            go_off(now);
+    }
 }
 
 /* ---- Positioning button ---- */
@@ -712,7 +1092,9 @@ static void update_led(uint64_t now)
 {
     uint64_t ms = now / 1000;
     bool on;
-    if (state != ST_RUN)
+    if (state == ST_OFF)
+        on = ms % 10000 < 20; /* a glimmer now and then: the LED costs power */
+    else if (state != ST_RUN)
         on = (ms / 250) % 2;
     else if (!synced())
         on = ms % 1000 < 100;
@@ -774,6 +1156,16 @@ static void log_status(uint64_t now)
     bps_devices_describe(devices, sizeof devices);
     if (devices[0])
         port_log("devices: %s", devices);
+    if (mode.run == MODE_BATCH) {
+        bps_spool_status sp;
+        bps_spool_status_get(&sp);
+        uint64_t on = mode.on_us + (mode.radio_on ? now - mode.on_mark_us : 0);
+        uint64_t all = now - mode.since_us;
+        port_log("mode: batch, a contact every %lu s; radio on %lu%% of the time; %lu chunks on "
+                 "the card (%lu waiting for the clock), %lu not saved",
+                 (unsigned long)mode.interval_s, (unsigned long)(all ? on * 100 / all : 100),
+                 (unsigned long)sp.items, (unsigned long)sp.waiting, (unsigned long)sp.skipped);
+    }
     if (bps_beacon_ready(&beacon, (int64_t)now * 1000)) {
         char bssid[18];
         bps_beacon_bssid(&beacon, bssid);
@@ -802,6 +1194,14 @@ void bps_client_setup(const bps_settings *s)
     bps_uuid_format(client_id, id_str);
     snprintf(hostname, sizeof hostname, "bps-%s-%.8s", cfg.board, id_str);
     bps_clock_init(&clk, true);
+    bps_anchors_init(&anchors);
+    bps_spool_ctx sc = {
+        .cfg = &cfg, .anchors = &anchors, .epoch_ns = &epoch_ns,
+        .chunks_sent = &stats.chunks_sent, .need_register = &need_register,
+        .connect_server = connect_server, .path_for = path_for, .read_response = read_response,
+    };
+    bps_spool_init(&sc);
+    mode_started(boot_us);
     reg_txn.h = hb_txn.h = pos_txn.h = -1;
     reg_txn.tx = reg_tx, reg_txn.tx_cap = sizeof reg_tx;
     hb_txn.tx = hb_tx, hb_txn.tx_cap = sizeof hb_tx;
@@ -819,7 +1219,7 @@ void bps_client_loop(void)
     port_beacon pb;
     for (int i = 0; i < 16 && port_beacon_take(&pb); i++)
         bps_beacon_push(&beacon, pb.bssid, pb.tsf_us, pb.mono_ns);
-    if (state != ST_WIFI && !port_wifi_up()) {
+    if (state != ST_WIFI && state != ST_OFF && !port_wifi_up()) {
         port_log("wifi: disconnected");
         drop_connections();
         set_state(ST_WIFI);
@@ -838,9 +1238,13 @@ void bps_client_loop(void)
             port_wifi_begin(cfg.wifi_ssid, cfg.wifi_password, hostname);
             state_since_us = now;
         }
+        if (capturing)
+            contact_connect_poll(now);
         break;
     case ST_REGISTER:
         register_poll(now);
+        if (state == ST_REGISTER)
+            contact_connect_poll(now);
         break;
     case ST_RUN:
         diag_loop_start();
@@ -853,15 +1257,32 @@ void bps_client_loop(void)
         bps_upload_poll(now);
         diag_loop_part("upload");
         count_gated();
-        if (need_register) {
+        sync_poll(now);
+        anchor_poll(now);
+        live_spool_poll(now);
+        bps_spool_poll(now);
+        diag_loop_part("stored uploads");
+        if (state == ST_RUN)
+            contact_poll(now);
+        if (need_register && state == ST_RUN) {
             need_register = false;
             drop_connections();
             reg_next_us = now;
             set_state(ST_REGISTER);
         }
         break;
+    case ST_OFF:
+        /* Chunks are saved on the card meanwhile. */
+        bps_upload_poll(now);
+        count_gated();
+        /* Early if the card went: what is recorded cannot be kept. */
+        if (now >= mode.next_contact_us || !card_has_room())
+            wake(now);
+        break;
     }
     bps_devices_poll(now);
     update_led(now);
     log_status(now);
+    if (state == ST_OFF)
+        port_idle_ms(OFF_IDLE_MS);
 }

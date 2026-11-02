@@ -5,6 +5,7 @@ use crate::beacon_clock::BeaconClocks;
 use bsp_core::audio::AudioSample;
 use bsp_proto::{Bssid, ClientId, NANOS_PER_SEC, Timestamp};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A chunk's start and end on its access point's clock (TSF, ns), from a
@@ -23,6 +24,9 @@ struct Stored {
 
 pub struct AudioBuffers {
     retention_ns: i64,
+    /// Kept on top of `retention_ns` while batch clients upload late: the
+    /// other clients' audio is needed to locate their calls.
+    extra_retention_ns: AtomicI64,
     clocks: Arc<BeaconClocks>,
     clients: Mutex<HashMap<ClientId, VecDeque<Stored>>>,
 }
@@ -31,12 +35,19 @@ impl AudioBuffers {
     pub fn new(retention_s: u64, clocks: Arc<BeaconClocks>) -> Self {
         Self {
             retention_ns: retention_s as i64 * NANOS_PER_SEC,
+            extra_retention_ns: AtomicI64::new(0),
             clocks,
             clients: Mutex::default(),
         }
     }
 
+    /// Keeps this much more audio than configured (see `extra_retention_ns`).
+    pub fn set_extra_retention(&self, ns: i64) {
+        self.extra_retention_ns.store(ns.max(0), Ordering::Relaxed);
+    }
+
     pub fn push(&self, sample: AudioSample, tsf: Option<TsfStamp>) {
+        let retention = self.retention_ns + self.extra_retention_ns.load(Ordering::Relaxed);
         let mut clients = self.clients.lock().unwrap();
         let q = clients.entry(sample.client_id).or_default();
         let newest = sample.end();
@@ -47,7 +58,7 @@ impl AudioBuffers {
         q.insert(pos, Stored { sample, tsf });
         while q
             .front()
-            .is_some_and(|s| s.sample.end() < newest - self.retention_ns)
+            .is_some_and(|s| s.sample.end() < newest - retention)
         {
             q.pop_front();
         }

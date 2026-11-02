@@ -61,6 +61,11 @@ void bps_json_arr(bps_json *j, const char *key);
 
 /* The number stored under `"key"` anywhere in `json` (keys must be unique). */
 bool bps_json_number(const char *json, size_t len, const char *key, double *out);
+/* The same, for an integer, exactly (a double cannot hold every ns timestamp). */
+bool bps_json_int(const char *json, size_t len, const char *key, int64_t *out);
+/* The first string stored under `"key"` (one without escapes); false if
+ * none, or longer than `cap` - 1. */
+bool bps_json_string(const char *json, size_t len, const char *key, char *out, size_t cap);
 
 /* ---- UUIDs ---- */
 

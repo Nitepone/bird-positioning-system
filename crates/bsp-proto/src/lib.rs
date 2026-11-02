@@ -256,6 +256,102 @@ pub struct Heartbeat {
     /// The peripherals the client is configured with, and whether each answers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<DeviceStatus>,
+    /// How the client uses its radio (clients that can switch modes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeStatus>,
+}
+
+/// The server's answer to a heartbeat. Older servers answer with no body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatResponse {
+    /// The mode the operator wants the client in.
+    pub mode: ModeSetting,
+}
+
+/// How a client uses its radio.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationMode {
+    /// Always connected: audio is uploaded as it is recorded.
+    #[default]
+    Live,
+    /// Wi-Fi off between contacts, one every `interval_s`. Audio is kept on
+    /// the storage card meanwhile, and uploaded (then deleted from the card)
+    /// at the next contact. Each contact measures the clock again, so audio
+    /// recorded in between keeps accurate timestamps.
+    Batch,
+}
+
+/// Seconds between a batch client's contacts, unless set otherwise.
+pub const DEFAULT_BATCH_INTERVAL_S: u32 = 300;
+/// The shortest and longest interval between contacts the server accepts.
+pub const MIN_BATCH_INTERVAL_S: u32 = 30;
+pub const MAX_BATCH_INTERVAL_S: u32 = 3600;
+
+fn default_batch_interval() -> u32 {
+    DEFAULT_BATCH_INTERVAL_S
+}
+
+/// A mode the operator sets for a client.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModeSetting {
+    pub mode: OperationMode,
+    /// Batch mode: seconds from the start of one contact to the next.
+    #[serde(default = "default_batch_interval")]
+    pub interval_s: u32,
+}
+
+impl Default for ModeSetting {
+    fn default() -> Self {
+        Self {
+            mode: OperationMode::Live,
+            interval_s: DEFAULT_BATCH_INTERVAL_S,
+        }
+    }
+}
+
+/// The mode a client runs in, as its heartbeat reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModeStatus {
+    pub mode: OperationMode,
+    /// Batch mode: seconds from the start of one contact to the next.
+    pub interval_s: u32,
+    /// Recordings kept on the card that are still to be uploaded.
+    #[serde(default)]
+    pub backlog: u32,
+    #[serde(default)]
+    pub backlog_bytes: u64,
+    /// All audio the client recorded before this time (server clock) has
+    /// been uploaded. Batch mode: the server holds back other clients' calls
+    /// after it, so they can still be grouped with this client's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_through: Option<Timestamp>,
+    /// Batch mode: seconds until the client's next contact, in the last
+    /// heartbeat before its radio goes off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_contact_s: Option<u32>,
+    /// Share of the time the radio was on since the mode started, percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_on_pct: Option<f32>,
+    /// About the latest time the radio was off: how long, and how far the
+    /// client's clock moved against the server's (and against its access
+    /// point's) beyond what the drift measured before predicted (ns). Audio
+    /// recorded meanwhile is timestamped between the measurements on either
+    /// side, so its error is at most about this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<RadioGap>,
+    /// Why the client is not in the mode the server asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// See [`ModeStatus::gap`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RadioGap {
+    pub off_s: u32,
+    pub clock_ns: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsf_ns: Option<i64>,
 }
 
 /// A battery, as its fuel gauge reports it.

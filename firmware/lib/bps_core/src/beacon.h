@@ -36,6 +36,8 @@ typedef struct {
 } bps_beacon;
 
 void bps_beacon_init(bps_beacon *b);
+/* Starts the line afresh (the radio was off: its beacons will start a new one). */
+void bps_beacon_forget(bps_beacon *b);
 /* A beacon of `bssid` carrying `tsf_us` arrived at monotonic time `mono_ns`. */
 void bps_beacon_push(bps_beacon *b, const uint8_t bssid[6], uint64_t tsf_us, int64_t mono_ns);
 /* Whether the line is fitted and recent beacons back it at `now_mono`. */

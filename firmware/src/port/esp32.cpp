@@ -129,19 +129,29 @@ static int32_t link_offset(void)
     return s[n / 2];
 }
 
+static bool radio_off; // port_wifi_off()
+
 static void beacons_start(void)
 {
-    beacon_q = xQueueCreate(32, sizeof(beacon_obs));
-    wifi_promiscuous_filter_t filter = {};
-    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous_rx_cb(beacon_rx);
-    // Turned on once connected (port_wifi_up).
+    if (!beacon_q)
+        beacon_q = xQueueCreate(32, sizeof(beacon_obs));
+    // The filter and callback are set each time promiscuous mode goes on
+    // (set_promiscuous): turning the radio off forgets them.
+}
+
+// The radio's clock starts again with the radio: links to it from before
+// mean nothing, and beacons queued before are stale.
+static void beacons_forget(void)
+{
+    n_links = 0;
+    next_link_us = 0;
+    if (beacon_q)
+        xQueueReset(beacon_q);
 }
 
 extern "C" bool port_beacon_take(port_beacon *out)
 {
-    if (!beacon_q)
+    if (!beacon_q || radio_off)
         return false;
     int64_t now = esp_timer_get_time();
     if (now >= next_link_us) {
@@ -168,6 +178,11 @@ extern "C" bool port_beacon_take(port_beacon *out)
 static volatile uint8_t wifi_reason; // why the last connection or attempt ended
 static int wifi_retries;              // since the connection was lost
 static bool promiscuous_on;
+// The access point last joined, to join it again straight away (no scan)
+// after the radio was off; `fast_join` while such a join is being tried.
+static uint8_t join_bssid[6];
+static int32_t join_channel;
+static bool fast_join;
 
 // Logs why joining failed, once per distinct reason (auto-reconnect repeats it).
 static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
@@ -176,6 +191,8 @@ static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info)
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
         last_reason = 0;
         memcpy(ap_bssid, info.wifi_sta_connected.bssid, 6);
+        memcpy(join_bssid, info.wifi_sta_connected.bssid, 6);
+        join_channel = info.wifi_sta_connected.channel;
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         memset(ap_bssid, 0, 6);
         uint8_t r = info.wifi_sta_disconnected.reason;
@@ -191,6 +208,12 @@ static void set_promiscuous(bool on)
 {
     // Not tried again when it fails, so as not to log it every loop.
     promiscuous_on = on;
+    if (on) {
+        wifi_promiscuous_filter_t filter = {};
+        filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous_rx_cb(beacon_rx);
+    }
     if (esp_wifi_set_promiscuous(on) != ESP_OK && on)
         port_log("beacons: cannot turn on promiscuous mode");
 }
@@ -223,9 +246,59 @@ static void wifi_scan_log(const char *ssid)
 
 #define WIFI_RESTART_RETRIES 3 // client.c retries every 20 s
 
+// Turns the radio on again after port_wifi_off(), joining the access point
+// of last time on its channel without scanning.
+static void wifi_resume(const char *ssid, const char *password, const char *hostname)
+{
+    radio_off = false;
+    wifi_retries = 0;
+    beacons_forget();
+    WiFi.setHostname(hostname);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    fast_join = join_channel > 0;
+    if (fast_join)
+        WiFi.begin(ssid, password, join_channel, join_bssid);
+    else
+        WiFi.begin(ssid, password);
+}
+
+extern "C" bool port_wifi_off(void)
+{
+    set_promiscuous(false);
+    WiFi.setAutoReconnect(false);
+    // Stops the radio and frees its driver; WiFi.mode(WIFI_STA) starts both.
+    bool ok = WiFi.mode(WIFI_OFF);
+    radio_off = true;
+    promiscuous_on = false;
+    memset(ap_bssid, 0, 6);
+    beacons_forget();
+    return ok;
+}
+
+extern "C" void port_idle_ms(uint32_t ms)
+{
+    // The idle task runs meanwhile, which waits for an interrupt: the CPU
+    // rests instead of spinning through the loop.
+    vTaskDelay(pdMS_TO_TICKS(ms) ? pdMS_TO_TICKS(ms) : 1);
+}
+
 extern "C" void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
 {
     static bool started;
+    if (started && radio_off) {
+        wifi_resume(ssid, password, hostname);
+        return;
+    }
+    if (started && fast_join) {
+        // The access point was not where it was last time: scan for it.
+        fast_join = false;
+        port_log("wifi: the access point of last time did not answer; scanning");
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
+        return;
+    }
     if (started) {
         wifi_retries++;
         uint8_t r = wifi_reason;
@@ -270,9 +343,12 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
 
 extern "C" bool port_wifi_up(void)
 {
+    if (radio_off)
+        return false;
     bool up = WiFi.status() == WL_CONNECTED;
     if (up) {
         wifi_retries = 0;
+        fast_join = false;
         if (!promiscuous_on)
             set_promiscuous(true);
     }
@@ -467,19 +543,84 @@ extern "C" bool port_i2c_xfer(uint8_t addr, const uint8_t *tx, size_t tx_len, ui
 #define SD_RETRY_MS 5000
 #define SD_CHECK_MS 5000
 
-enum { SD_WRITE, SD_CLOSE };
+enum { SD_WRITE, SD_CLOSE, SD_REMOVE, SD_READ, SD_LIST };
 
 typedef struct {
     uint8_t op;
     bool append;
-    char path[62]; // relative to the card's root
-} sd_item;         // the bytes to write follow
+    char path[62];   // relative to the card's root
+    uint32_t offset; // SD_READ
+    uint32_t len;    // SD_READ
+} sd_item;           // the bytes to write follow (SD_LIST: the suffix)
 
 static RingbufHandle_t sd_q;
 static StaticRingbuffer_t sd_q_struct;
 static int sd_cs = -1;
 static portMUX_TYPE sd_mux = portMUX_INITIALIZER_UNLOCKED;
 static port_sd_info sd_info; // under sd_mux
+
+// The outcome of the latest read or listing: set by the card's task, with
+// the bytes in place first.
+static uint8_t sd_result_buf[PORT_SD_READ_MAX];
+static int sd_result = -1;
+static uint32_t sd_result_total;
+
+static void sd_done(int n, uint32_t total)
+{
+    sd_result_total = total;
+    __atomic_store_n(&sd_result, n, __ATOMIC_RELEASE);
+}
+
+// Lists the names in `dir` ending in `suffix` into the result.
+static void sd_list(const char *dir, const char *suffix)
+{
+    char path[sizeof(((sd_item *)0)->path) + 1];
+    snprintf(path, sizeof path, "/%s", dir);
+    File d = SD.open(path);
+    if (!d || !d.isDirectory()) {
+        sd_done(-1, 0);
+        return;
+    }
+    size_t len = 0, slen = strlen(suffix);
+    uint32_t total = 0;
+    for (;;) {
+        bool is_dir = false;
+        String full = d.getNextFileName(&is_dir);
+        if (!full.length())
+            break;
+        const char *name = strrchr(full.c_str(), '/');
+        name = name ? name + 1 : full.c_str();
+        size_t n = strlen(name);
+        if (is_dir || n < slen || strcmp(name + n - slen, suffix) != 0)
+            continue;
+        total++;
+        if (len + n + 1 <= sizeof sd_result_buf) {
+            memcpy(sd_result_buf + len, name, n);
+            len += n;
+            sd_result_buf[len++] = '\n';
+        }
+    }
+    d.close();
+    sd_done((int)len, total);
+}
+
+// Reads part of a file into the result. `open` is the file being written,
+// if any: what it holds so far is flushed first.
+static void sd_read(File &open, const char *open_path, const sd_item *it)
+{
+    if (open && strcmp(open_path, it->path) == 0)
+        open.flush();
+    char path[sizeof(((sd_item *)0)->path) + 1];
+    snprintf(path, sizeof path, "/%s", it->path);
+    File r = SD.open(path, FILE_READ);
+    size_t len = it->len < sizeof sd_result_buf ? it->len : sizeof sd_result_buf;
+    int n = -1;
+    if (r && r.seek(it->offset))
+        n = (int)r.read(sd_result_buf, len);
+    if (r)
+        r.close();
+    sd_done(n, 0);
+}
 
 static void sd_count(uint64_t dropped, uint32_t errors)
 {
@@ -573,7 +714,8 @@ static void sd_task(void *)
         int64_t now = esp_timer_get_time() / 1000;
         if (!mounted && now >= next_try) {
             next_try = now + SD_RETRY_MS;
-            if (sd_answers() && SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 2)) {
+            // Files open at once: one being written, one read, a directory listed.
+            if (sd_answers() && SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 4)) {
                 mounted = true;
                 next_check = now + SD_CHECK_MS;
                 sd_refresh();
@@ -589,11 +731,28 @@ static void sd_task(void *)
         if (it) {
             size_t len = size - sizeof *it;
             if (!mounted) {
-                sd_count(len, 0);
+                if (it->op == SD_READ || it->op == SD_LIST)
+                    sd_done(-1, 0);
+                else
+                    sd_count(len, 0);
             } else if (it->op == SD_CLOSE) {
                 if (f)
                     f.close();
                 open_path[0] = 0;
+            } else if (it->op == SD_REMOVE) {
+                if (f && strcmp(open_path, it->path) == 0) {
+                    f.close();
+                    open_path[0] = 0;
+                }
+                char path[sizeof open_path + 1];
+                snprintf(path, sizeof path, "/%s", it->path);
+                SD.remove(path);
+            } else if (it->op == SD_READ) {
+                sd_read(f, open_path, it);
+            } else if (it->op == SD_LIST) {
+                char suffix[16];
+                snprintf(suffix, sizeof suffix, "%.*s", (int)len, (const char *)(it + 1));
+                sd_list(it->path, suffix);
             } else {
                 if (!f || !it->append || strcmp(open_path, it->path) != 0) {
                     if (f)
@@ -656,7 +815,8 @@ extern "C" void port_sd_info_get(port_sd_info *out)
     portEXIT_CRITICAL(&sd_mux);
 }
 
-static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, bool append)
+static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, bool append,
+                    uint32_t offset = 0, uint32_t rlen = 0)
 {
     void *mem = nullptr;
     if (!sd_q || !sd_info.present ||
@@ -667,6 +827,8 @@ static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, b
     sd_item *it = (sd_item *)mem;
     it->op = op;
     it->append = append;
+    it->offset = offset;
+    it->len = rlen;
     snprintf(it->path, sizeof it->path, "%s", path);
     if (len)
         memcpy(it + 1, buf, len);
@@ -680,6 +842,40 @@ extern "C" bool port_sd_write(const char *path, const void *buf, size_t len, boo
 }
 
 extern "C" void port_sd_close(void) { sd_send(SD_CLOSE, "", nullptr, 0, false); }
+
+extern "C" bool port_sd_remove(const char *path) { return sd_send(SD_REMOVE, path, nullptr, 0, false); }
+
+// One read or listing at a time: the result has one buffer.
+static bool sd_request(uint8_t op, const char *path, const void *buf, size_t len, uint32_t offset,
+                       uint32_t rlen)
+{
+    if (__atomic_load_n(&sd_result, __ATOMIC_ACQUIRE) == PORT_SD_PENDING)
+        return false;
+    __atomic_store_n(&sd_result, PORT_SD_PENDING, __ATOMIC_RELEASE);
+    if (!sd_send(op, path, buf, len, false, offset, rlen)) {
+        __atomic_store_n(&sd_result, -1, __ATOMIC_RELEASE);
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool port_sd_read(const char *path, uint32_t offset, size_t len)
+{
+    return sd_request(SD_READ, path, nullptr, 0, offset, (uint32_t)len);
+}
+
+extern "C" bool port_sd_list(const char *dir, const char *suffix)
+{
+    return sd_request(SD_LIST, dir, suffix, strlen(suffix), 0, 0);
+}
+
+extern "C" int port_sd_result(const void **data, uint32_t *total)
+{
+    int r = __atomic_load_n(&sd_result, __ATOMIC_ACQUIRE);
+    *data = sd_result_buf;
+    *total = sd_result_total;
+    return r;
+}
 
 // ---- LED and button ----
 

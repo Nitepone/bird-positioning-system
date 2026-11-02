@@ -43,7 +43,10 @@ bool bps_upload_idle(void);
 /* The ring index just past the current (or latest) chunk. */
 uint32_t bps_upload_end(void);
 /* Gives up the upload in progress (the client is reconnecting); the next one
- * continues where it stopped. */
+ * continues where it stopped. A chunk being saved on the card goes on. */
 void bps_upload_drop(void);
+/* From the next chunk on, save chunks on the card (spool.h) instead of
+ * uploading them: batch mode. */
+void bps_upload_set_spool(bool on);
 
 #endif

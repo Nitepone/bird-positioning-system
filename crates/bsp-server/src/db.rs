@@ -5,8 +5,8 @@
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
-    BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, RegisterRequest,
-    StorageStatus, Timestamp, Uuid,
+    BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, ModeSetting,
+    ModeStatus, RegisterRequest, StorageStatus, Timestamp, Uuid,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ pub struct ClientRecord {
     pub clock: Option<ClockStatus>,
     /// From the latest heartbeat.
     pub health: Option<ClientHealth>,
+    /// The mode the operator set, which heartbeat replies pass on; the mode
+    /// the client runs in is in its health.
+    pub mode: ModeSetting,
 }
 
 /// What a client's latest heartbeat said about the client itself (its clock
@@ -52,6 +55,8 @@ pub struct ClientHealth {
     pub storage: Option<StorageStatus>,
     #[serde(default)]
     pub devices: Vec<DeviceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeStatus>,
 }
 
 impl ClientHealth {
@@ -64,6 +69,7 @@ impl ClientHealth {
             battery: hb.battery,
             storage: hb.storage,
             devices: hb.devices.clone(),
+            mode: hb.mode.clone(),
         }
     }
 }
@@ -134,7 +140,8 @@ CREATE TABLE IF NOT EXISTS clients (
     last_seen INTEGER NOT NULL,
     last_addr TEXT NOT NULL DEFAULT '',
     clock TEXT,
-    health TEXT
+    health TEXT,
+    mode TEXT
 );
 CREATE TABLE IF NOT EXISTS detections (
     id TEXT PRIMARY KEY,
@@ -193,6 +200,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
     let caps: Option<String> = r.get("capabilities")?;
     let clock: Option<String> = r.get("clock")?;
     let health: Option<String> = r.get("health")?;
+    let mode: Option<String> = r.get("mode")?;
     Ok(ClientRecord {
         id: id.parse().unwrap_or_default(),
         name: r.get("name")?,
@@ -209,6 +217,9 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
         last_addr: r.get("last_addr")?,
         clock: clock.and_then(|c| serde_json::from_str(&c).ok()),
         health: health.and_then(|h| serde_json::from_str(&h).ok()),
+        mode: mode
+            .and_then(|m| serde_json::from_str(&m).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -235,6 +246,7 @@ impl Db {
             "TEXT NOT NULL DEFAULT ''",
         )?;
         add_column_if_missing(&conn, "clients", "health", "TEXT")?;
+        add_column_if_missing(&conn, "clients", "mode", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -330,6 +342,16 @@ impl Db {
                 pos.map(|p| p.y),
                 pos.map(|p| p.z)
             ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Sets the mode the client is to run in. Returns false if unknown.
+    pub fn set_client_mode(&self, id: ClientId, mode: &ModeSetting) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE clients SET mode = ?2 WHERE id = ?1",
+            params![id.to_string(), json(mode)],
         )?;
         Ok(n > 0)
     }
@@ -637,6 +659,7 @@ impl Db {
 mod tests {
     use super::*;
     use bsp_core::identifier::{Call, Species};
+    use bsp_proto::OperationMode;
 
     fn register_request(id: ClientId) -> RegisterRequest {
         RegisterRequest {
@@ -715,6 +738,17 @@ mod tests {
                 address: 0x36,
                 present: true,
             }],
+            mode: Some(ModeStatus {
+                mode: OperationMode::Batch,
+                interval_s: 300,
+                backlog: 3,
+                backlog_bytes: 120_000,
+                delivered_through: Some(9),
+                next_contact_s: Some(290),
+                radio_on_pct: Some(4.5),
+                gap: None,
+                note: None,
+            }),
         };
         assert!(
             db.record_heartbeat(id, "addr2", Some(&clock), &health)
@@ -738,6 +772,29 @@ mod tests {
             !db.record_heartbeat(Uuid::from_u128(2), "a", None, &health)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn keeps_the_mode_set_for_a_client() {
+        let db = Db::in_memory().unwrap();
+        let id = Uuid::from_u128(1);
+        db.register_client(&register_request(id), "", "addr", 1)
+            .unwrap();
+        assert_eq!(
+            db.get_client(id).unwrap().unwrap().mode,
+            ModeSetting::default()
+        );
+        let batch = ModeSetting {
+            mode: OperationMode::Batch,
+            interval_s: 120,
+        };
+        assert!(db.set_client_mode(id, &batch).unwrap());
+        assert_eq!(db.get_client(id).unwrap().unwrap().mode, batch);
+        // Registering again keeps it.
+        db.register_client(&register_request(id), "", "addr", 2)
+            .unwrap();
+        assert_eq!(db.get_client(id).unwrap().unwrap().mode, batch);
+        assert!(!db.set_client_mode(Uuid::from_u128(2), &batch).unwrap());
     }
 
     #[test]

@@ -170,6 +170,7 @@ pub async fn heartbeat_loop(
             battery: None,
             storage: None,
             devices: Vec::new(),
+            mode: None,
         };
         if let Err(e) = session.heartbeat(&hb).await {
             stats

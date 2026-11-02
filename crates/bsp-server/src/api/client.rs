@@ -14,8 +14,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
-    AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat, NANOS_PER_SEC,
-    RegisterRequest, RegisterResponse, now_ns,
+    AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
+    HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -106,6 +106,15 @@ fn health_events(
     if low(Some(now)) && !low(before) {
         events.push(("battery_low", json!({ "battery": now.battery })));
     }
+    // A client that reports no mode runs live.
+    let mode = |h: Option<&ClientHealth>| h.and_then(|h| h.mode.as_ref()).map(|m| m.mode);
+    let (was, is) = (mode(before).unwrap_or_default(), mode(Some(now)));
+    if let Some(m) = now.mode.as_ref().filter(|_| is.is_some_and(|is| is != was)) {
+        events.push((
+            "mode_changed",
+            json!({ "from": was, "to": m.mode, "interval_s": m.interval_s, "note": m.note }),
+        ));
+    }
     events
 }
 
@@ -132,7 +141,7 @@ async fn heartbeat(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<ClientId>,
     Json(hb): Json<Heartbeat>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Json<HeartbeatResponse>> {
     let now = now_ns();
     let before = state
         .db
@@ -176,7 +185,7 @@ async fn heartbeat(
             json!({ "count": hb.capture_dropouts }),
         );
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(HeartbeatResponse { mode: after.mode }))
 }
 
 async fn upload_audio(
@@ -285,7 +294,7 @@ async fn position_request(
 mod tests {
     use super::{clean_name, health_events, parse_tsf};
     use crate::db::ClientHealth;
-    use bsp_proto::{BatteryStatus, StorageStatus};
+    use bsp_proto::{BatteryStatus, ModeStatus, OperationMode, StorageStatus};
 
     fn health(battery: Option<f32>, card: Option<(bool, u64)>) -> ClientHealth {
         ClientHealth {
@@ -308,6 +317,7 @@ mod tests {
                 dropped_bytes: 0,
             }),
             devices: Vec::new(),
+            mode: None,
         }
     }
 
@@ -340,6 +350,35 @@ mod tests {
         assert!(kinds(Some(&low), &health(Some(18.0), roomy)).is_empty());
         // No gauge, no card: nothing.
         assert!(kinds(None, &health(None, None)).is_empty());
+    }
+
+    #[test]
+    fn reports_mode_changes() {
+        let with_mode = |mode| ClientHealth {
+            mode: Some(ModeStatus {
+                mode,
+                interval_s: 300,
+                backlog: 0,
+                backlog_bytes: 0,
+                delivered_through: None,
+                next_contact_s: None,
+                radio_on_pct: None,
+                gap: None,
+                note: None,
+            }),
+            ..health(None, None)
+        };
+        let (live, batch) = (
+            with_mode(OperationMode::Live),
+            with_mode(OperationMode::Batch),
+        );
+        // Live is what a client without modes runs.
+        assert!(kinds(None, &live).is_empty());
+        assert!(kinds(Some(&health(None, None)), &live).is_empty());
+        assert_eq!(kinds(Some(&live), &batch), ["mode_changed"]);
+        assert!(kinds(Some(&batch), &batch).is_empty());
+        assert_eq!(kinds(Some(&batch), &live), ["mode_changed"]);
+        assert_eq!(kinds(None, &batch), ["mode_changed"]);
     }
 
     #[test]

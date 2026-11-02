@@ -200,6 +200,63 @@ void bps_json_bool(bps_json *j, const char *key, bool v)
     bps_json_raw(j, v ? "true" : "false");
 }
 
+/* Where the value of the first `"key":` at or after `from` starts, or 0 (it
+ * cannot start a document). */
+static size_t json_value_at(const char *json, size_t len, const char *key, size_t from)
+{
+    size_t klen = strlen(key);
+    for (size_t i = from; i + klen + 2 <= len; i++) {
+        if (json[i] != '"' || memcmp(json + i + 1, key, klen) != 0 || json[i + klen + 1] != '"')
+            continue;
+        size_t p = i + klen + 2;
+        while (p < len && json[p] == ' ')
+            p++;
+        if (p >= len || json[p] != ':')
+            continue; /* a string value equal to the key, not a key */
+        p++;
+        while (p < len && json[p] == ' ')
+            p++;
+        return p;
+    }
+    return 0;
+}
+
+bool bps_json_int(const char *json, size_t len, const char *key, int64_t *out)
+{
+    size_t p = json_value_at(json, len, key, 0);
+    if (!p)
+        return false;
+    bool neg = p < len && json[p] == '-';
+    p += neg;
+    uint64_t v = 0;
+    size_t digits = 0;
+    for (; p < len && json[p] >= '0' && json[p] <= '9' && digits < 19; p++, digits++)
+        v = v * 10 + (uint64_t)(json[p] - '0');
+    if (!digits || (p < len && strchr(".eE0123456789", json[p])))
+        return false; /* not an integer, or too long for one */
+    *out = neg ? -(int64_t)v : (int64_t)v;
+    return true;
+}
+
+bool bps_json_string(const char *json, size_t len, const char *key, char *out, size_t cap)
+{
+    for (size_t p = json_value_at(json, len, key, 0); p; p = json_value_at(json, len, key, p)) {
+        if (json[p] != '"')
+            continue; /* not a string: perhaps an object of the same name */
+        size_t n = 0;
+        for (p++; p < len && json[p] != '"'; p++) {
+            if (json[p] == '\\' || n + 1 >= cap)
+                return false; /* escapes are not needed here */
+            out[n++] = json[p];
+        }
+        if (p >= len)
+            return false;
+        out[n] = 0;
+        return true;
+    }
+    return false;
+}
+
 bool bps_json_number(const char *json, size_t len, const char *key, double *out)
 {
     size_t klen = strlen(key);

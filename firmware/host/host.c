@@ -11,8 +11,10 @@
  * -b hears beacons of a pretend access point whose clock (TSF) is this
  * computer's real-time clock, so host clients on one computer share it.
  * -d DIR stands in a directory for a storage card: recordings are saved there.
+ * The radio can be turned off (batch mode); joining again takes a second.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,14 +52,30 @@ void port_log(const char *fmt, ...)
     va_end(ap);
 }
 
+/* While the radio is "off" there is no network; joining takes a second. */
+static bool radio_off;
+static uint64_t joined_at_us;
+
 void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
 {
     (void)ssid;
     (void)password;
     (void)hostname;
+    if (radio_off) {
+        radio_off = false;
+        joined_at_us = port_mono_us() + 1000000;
+    }
 }
 
-bool port_wifi_up(void) { return true; }
+bool port_wifi_up(void) { return !radio_off && port_mono_us() >= joined_at_us; }
+
+bool port_wifi_off(void)
+{
+    radio_off = true;
+    return true;
+}
+
+void port_idle_ms(uint32_t ms) { usleep(ms * 1000); }
 
 int port_wifi_rssi(void) { return 0; }
 
@@ -164,7 +182,7 @@ static bool fake_beacons;
 bool port_beacon_take(port_beacon *out)
 {
     static uint64_t last_tbtt;
-    if (!fake_beacons)
+    if (!fake_beacons || !port_wifi_up())
         return false;
     struct timespec rt, mono;
     clock_gettime(CLOCK_REALTIME, &rt);
@@ -254,6 +272,78 @@ void port_sd_close(void)
         fclose(sd_file);
     sd_file = NULL;
     sd_path[0] = 0;
+}
+
+bool port_sd_remove(const char *path)
+{
+    char full[sizeof sd_path];
+    if (!sd_dir)
+        return false;
+    snprintf(full, sizeof full, "%s/%s", sd_dir, path);
+    if (strcmp(full, sd_path) == 0)
+        port_sd_close();
+    return remove(full) == 0;
+}
+
+/* Reads and listings happen at once; the result waits to be taken. */
+static uint8_t sd_result_buf[PORT_SD_READ_MAX];
+static int sd_result = -1;
+static uint32_t sd_result_total;
+
+bool port_sd_read(const char *path, uint32_t offset, size_t len)
+{
+    char full[sizeof sd_path];
+    if (!sd_dir)
+        return false;
+    snprintf(full, sizeof full, "%s/%s", sd_dir, path);
+    if (strcmp(full, sd_path) == 0 && sd_file)
+        fflush(sd_file);
+    FILE *f = fopen(full, "rb");
+    sd_result = -1;
+    if (f) {
+        if (len > sizeof sd_result_buf)
+            len = sizeof sd_result_buf;
+        if (fseek(f, (long)offset, SEEK_SET) == 0)
+            sd_result = (int)fread(sd_result_buf, 1, len, f);
+        fclose(f);
+    }
+    return true;
+}
+
+bool port_sd_list(const char *dir, const char *suffix)
+{
+    char full[sizeof sd_path];
+    if (!sd_dir)
+        return false;
+    snprintf(full, sizeof full, "%s/%s", sd_dir, dir);
+    DIR *d = opendir(full);
+    sd_result = -1;
+    sd_result_total = 0;
+    if (!d)
+        return true;
+    size_t len = 0, slen = strlen(suffix);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < slen || strcmp(e->d_name + n - slen, suffix) != 0)
+            continue;
+        sd_result_total++;
+        if (len + n + 1 <= sizeof sd_result_buf) {
+            memcpy(sd_result_buf + len, e->d_name, n);
+            len += n;
+            sd_result_buf[len++] = '\n';
+        }
+    }
+    closedir(d);
+    sd_result = (int)len;
+    return true;
+}
+
+int port_sd_result(const void **data, uint32_t *total)
+{
+    *data = sd_result_buf;
+    *total = sd_result_total;
+    return sd_result;
 }
 
 void port_led(bool on) { (void)on; }

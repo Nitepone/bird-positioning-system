@@ -19,6 +19,12 @@ static void restart(bps_beacon *b)
     b->restarts++;
 }
 
+void bps_beacon_forget(bps_beacon *b)
+{
+    b->head = b->n = 0;
+    b->has_fit = false;
+}
+
 static void refit(bps_beacon *b)
 {
     const bps_beacon_point *p0 = &b->pts[b->head];

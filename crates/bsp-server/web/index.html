@@ -369,7 +369,7 @@
   <p class="hint" id="clients-intro"></p>
   <div class="scroll-x">
   <table id="client-list">
-    <thead><tr><th>Client</th><th>Status</th><th>Timestamp error</th><th>Best RTT</th><th>Battery</th>
+    <thead><tr><th>Client</th><th>Status</th><th>Mode</th><th>Timestamp error</th><th>Best RTT</th><th>Battery</th>
       <th>SD card</th><th>Up for</th><th>Last heard</th></tr></thead>
     <tbody></tbody>
   </table>
@@ -381,6 +381,18 @@
       <p class="hint" id="client-meta"></p>
       <h4>Health</h4>
       <div class="tiles" id="health-tiles"></div>
+      <h4>Operation mode</h4>
+      <form class="filters" id="mode-form" onsubmit="saveMode(event)">
+        <label>Mode <select id="mode-select" onchange="modeFormChanged()">
+          <option value="live">Live: always connected</option>
+          <option value="batch">Batch: radio off between contacts</option>
+        </select></label>
+        <label id="mode-interval-label">contact every <input id="mode-interval" type="number" min="30" max="3600"
+          step="30" style="width: 6em" oninput="modeFormChanged()"> s</label>
+        <button type="submit">Set</button>
+        <span id="mode-msg"></span>
+      </form>
+      <p class="hint" id="mode-hint"></p>
       <h4>Clock</h4>
       <div class="filters">
         <label>Range <select id="clock-range" onchange="refreshClientsPage()">
@@ -1614,6 +1626,35 @@ function batteryView(c) {
   return null;
 }
 
+/// "5 min", "90 s"
+function fmtInterval(s) { return s % 60 === 0 ? `${s / 60} min` : `${s} s`; }
+
+/// The client's operation mode as { text, sub, cls }: as it runs, and the
+/// mode set for it while it has yet to switch.
+function modeView(c) {
+  const m = c.health?.mode, want = c.mode;
+  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : "live";
+  if (!m) return { text: "live", cls: "muted", sub: "does not report a mode: it cannot switch" };
+  const parts = [];
+  if (m.note) parts.push(m.note);
+  else if (name(want) !== name(m))
+    parts.push(`switching to ${name(want)} at its next ${m.mode === "batch" ? "contact" : "heartbeat"}`);
+  if (m.mode === "batch") {
+    if (m.radio_on_pct != null) parts.push(`radio on ${m.radio_on_pct.toFixed(1)}% of the time`);
+    if (m.next_contact_s != null && c.health) {
+      const due = c.health.at + m.next_contact_s * 1e9 - Date.now() * 1e6;
+      parts.push(due > 0 ? `next contact in ${fmtDuration(due / 1e9)}` : "contact due");
+    }
+  }
+  if (m.backlog) parts.push(`${m.backlog} recording${m.backlog === 1 ? "" : "s"} (${fmtBytes(m.backlog_bytes)}) on the card to upload`);
+  if (m.gap) {
+    const us = ns => (ns / 1e3).toFixed(0) + " µs";
+    parts.push(`after ${fmtDuration(m.gap.off_s)} off, its clock was ${us(m.gap.clock_ns)} from where its drift put it` +
+      (m.gap.tsf_ns != null ? ` (${us(m.gap.tsf_ns)} against its access point)` : ""));
+  }
+  return { text: name(m), sub: parts.join(" · "), cls: m.note ? "bad" : "" };
+}
+
 /// The storage card as { text, sub, cls }, or null if the client has no slot.
 function storageView(c) {
   const s = c.health?.storage;
@@ -1651,13 +1692,16 @@ function renderClientTable() {
     `case left in them; clients over the limit (±${fmtNsMs(clockLimitNs(), 1)}) are left out of positioning. ` +
     "Clients that follow their Wi-Fi access point's clock by its beacons (ESP32 boards) also line up with that " +
     "AP's other clients to microseconds, and can be used with them even when over the limit. " +
-    "Battery and SD card are from boards that have them. Select a client for its details.";
+    "Battery and SD card are from boards that have them. Clients in batch mode turn their radio off between " +
+    "contacts, keeping audio on their SD card meanwhile; detections wait for their uploads. " +
+    "Select a client for its details and to set its mode.";
   document.querySelector("#client-list tbody").innerHTML = clients.map(c => {
-    const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c);
+    const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c), md = modeView(c);
     const cell = (v, short) => v ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}</td>` : "<td>-</td>";
     return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
       <td><a href="#/clients?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
       <td class="${st.cls}">${st.text}</td>
+      ${cell(md)}
       <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}${c.ap_error_ns != null
         ? `<br><span class="muted" title="against the other clients of access point ${esc(k.beacon.bssid)}">&plusmn;${fmtNsUs(c.ap_error_ns)} within its AP</span>` : ""}</td>
       <td class="num">${fmtNsMs(k?.rtt_ns)}</td>
@@ -1684,22 +1728,83 @@ function renderClientDetail() {
   document.getElementById("client-meta").textContent = [
     c.hostname, c.version, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : "",
     `clock source: ${c.capabilities?.clock_source || "unknown"}`, c.last_addr,
-    `heartbeat every ${data.heartbeat_interval_s} s, last heard ${fmtAgo(c.last_seen)}`,
+    c.health?.mode?.mode === "batch"
+      ? `in contact every ${fmtInterval(c.health.mode.interval_s)}, last heard ${fmtAgo(c.last_seen)}`
+      : `heartbeat every ${data.heartbeat_interval_s} s, last heard ${fmtAgo(c.last_seen)}`,
   ].filter(Boolean).join(" · ");
 
-  const bat = batteryView(c), card = storageView(c);
+  const bat = batteryView(c), card = storageView(c), md = modeView(c);
   const asOf = h && !c.active ? ` (as of ${fmtAgo(h.at)})` : "";
   document.getElementById("health-tiles").innerHTML = !h
     ? tile("Health", "-", "no heartbeat stored yet")
     : [
       bat ? tile("Battery" + asOf, bat.text, bat.sub, bat.cls) : "",
       card ? tile("SD card" + asOf, card.text, card.sub, card.cls) : "",
+      tile("Mode" + asOf, esc(md.text), esc(md.sub), md.cls),
       tile("Audio", `${h.chunks_sent} sent`, `${h.chunks_gated} chunks gated (quiet) since it started`),
       tile("Up for" + asOf, fmtDuration(h.uptime_s), `since ${fmtTime(h.at - h.uptime_s * 1e9)}`),
       h.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
         h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
     ].join("");
+  fillModeForm(c);
   renderClockDetail();
+}
+
+// The mode form keeps what is being typed while the page refreshes; it is
+// filled from the client when another is selected, or after saving.
+let modeFormFor = null, modeDirty = false;
+
+function fillModeForm(c) {
+  if (modeFormFor === c.id && modeDirty) return;
+  if (modeFormFor !== c.id) document.getElementById("mode-msg").textContent = "";
+  modeFormFor = c.id;
+  modeDirty = false;
+  document.getElementById("mode-select").value = c.mode.mode;
+  document.getElementById("mode-interval").value = c.mode.interval_s;
+  showModeForm(c);
+}
+
+function showModeForm(c) {
+  const batch = document.getElementById("mode-select").value === "batch";
+  document.getElementById("mode-interval-label").hidden = !batch;
+  document.getElementById("mode-hint").textContent = !c.health?.mode
+    ? "This client does not report a mode, so it cannot be switched (older firmware, or the computer client)."
+    : batch
+      ? "Batch: the client turns its Wi-Fi radio off and keeps its audio on its SD card, then at each contact " +
+        "measures its clock again, uploads what it recorded (deleting it from the card), and turns the radio off " +
+        "again. Audio is timestamped between the clock measurements either side, so it can still be located; " +
+        "detections involving it are made once its audio is in, up to an interval later. Needs an SD card."
+      : "Live: the client stays connected and uploads audio as it records it.";
+}
+
+function modeFormChanged() {
+  modeDirty = true;
+  const c = clients.find(c => c.id === modeFormFor);
+  if (c) showModeForm(c);
+}
+
+async function saveMode(ev) {
+  ev.preventDefault();
+  const msg = document.getElementById("mode-msg"), id = modeFormFor;
+  const mode = document.getElementById("mode-select").value;
+  const interval_s = Number(document.getElementById("mode-interval").value);
+  if (!Number.isInteger(interval_s) || interval_s < 30 || interval_s > 3600) {
+    msg.textContent = "The interval must be 30 to 3600 s.";
+    return;
+  }
+  try {
+    await api(`/clients/${id}/mode`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode, interval_s }),
+    });
+    const c = clients.find(c => c.id === id);
+    msg.textContent = c?.health?.mode?.mode === "batch"
+      ? "Set: the client switches at its next contact." : "Set: the client switches at its next heartbeat.";
+    modeDirty = false;
+    await refreshClients();
+    refreshClientsPage();
+  } catch (e) { msg.textContent = e.message; }
 }
 
 /// The reports as chart rows, with a gap row wherever heartbeats stopped.

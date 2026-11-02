@@ -5,7 +5,7 @@ use crate::config::ServerConfig;
 use crate::db::{ClientRecord, Db};
 use crate::settings::{LocalSpeciesStatus, Settings};
 use bsp_core::identifier::{Call, Identifier, LocalSpeciesFilter, RangeModel};
-use bsp_proto::{Bssid, ClientId, ClockStatus, NANOS_PER_SEC, Timestamp, now_ns};
+use bsp_proto::{Bssid, ClientId, ClockStatus, NANOS_PER_SEC, OperationMode, Timestamp, now_ns};
 use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
@@ -32,6 +32,22 @@ pub struct AppState {
     pub started_at: Timestamp,
 }
 
+/// How long past its interval a batch client may take to make contact:
+/// joining Wi-Fi, measuring its clock, and uploading what it recorded.
+pub const BATCH_CONTACT_SLACK_NS: i64 = 120 * NANOS_PER_SEC;
+
+/// What batch clients' late uploads mean for grouping calls: another client's
+/// call may only be grouped once every batch client has delivered its audio
+/// up to the call's end, or has kept the call waiting for `max_wait_ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchHold {
+    /// The earliest time up to which some active batch client has not yet
+    /// delivered all its audio (server clock).
+    pub delivered_through: Timestamp,
+    /// The longest a call is kept waiting for it.
+    pub max_wait_ns: i64,
+}
+
 /// The client most recently asking to have its position configured.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PositioningRequest {
@@ -53,7 +69,29 @@ impl AppState {
     }
 
     pub fn is_active(&self, c: &ClientRecord, now: Timestamp) -> bool {
-        now - c.last_seen <= self.cfg.active_timeout_s as i64 * NANOS_PER_SEC
+        now - c.last_seen <= self.cfg.active_timeout_s as i64 * NANOS_PER_SEC + quiet_ns(c)
+    }
+
+    /// Batch clients that are active: the earliest time up to which one has
+    /// not delivered its audio, and how long calls may wait for it.
+    pub fn batch_hold(&self, clients: &[ClientRecord], now: Timestamp) -> Option<BatchHold> {
+        let window = self.cfg.group_window_s as i64 * NANOS_PER_SEC;
+        clients
+            .iter()
+            .filter(|c| self.is_active(c, now))
+            .filter_map(|c| {
+                let m = c.health.as_ref()?.mode.as_ref()?;
+                (m.mode == OperationMode::Batch).then(|| BatchHold {
+                    delivered_through: m.delivered_through.unwrap_or(c.first_seen),
+                    max_wait_ns: m.interval_s as i64 * NANOS_PER_SEC
+                        + BATCH_CONTACT_SLACK_NS
+                        + window,
+                })
+            })
+            .reduce(|a, b| BatchHold {
+                delivered_through: a.delivered_through.min(b.delivered_through),
+                max_wait_ns: a.max_wait_ns.max(b.max_wait_ns),
+            })
     }
 
     /// The line converting the TSF of the access point the client follows,
@@ -95,7 +133,7 @@ impl AppState {
     fn clock_fresh(&self, c: &ClientRecord, now: Timestamp) -> bool {
         self.is_active(c, now)
             && c.clock
-                .is_some_and(|k| now - k.measured_at <= 60 * NANOS_PER_SEC)
+                .is_some_and(|k| now - k.measured_at <= 60 * NANOS_PER_SEC + quiet_ns(c))
     }
 
     /// Whether the client's audio timestamps are within the limit of the
@@ -127,5 +165,16 @@ impl AppState {
             *slot = None;
         }
         *slot
+    }
+}
+
+/// How long a client may be out of contact on purpose: a batch client's
+/// interval, and the slack its contacts take.
+fn quiet_ns(c: &ClientRecord) -> i64 {
+    match c.health.as_ref().and_then(|h| h.mode.as_ref()) {
+        Some(m) if m.mode == OperationMode::Batch => {
+            m.interval_s as i64 * NANOS_PER_SEC + BATCH_CONTACT_SLACK_NS
+        }
+        _ => 0,
     }
 }

@@ -59,6 +59,11 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
     WiFi.beginNoBlock(ssid, password);
 }
 
+// Batch mode also needs a storage card, which these boards do not have yet.
+extern "C" bool port_wifi_off(void) { return false; }
+
+extern "C" void port_idle_ms(uint32_t ms) { delay(ms); }
+
 extern "C" bool port_wifi_up(void)
 {
     static bool was_up;
@@ -261,6 +266,15 @@ extern "C" bool port_sd_begin(int, int, int, int) { return false; }
 extern "C" void port_sd_info_get(port_sd_info *out) { *out = port_sd_info{}; }
 extern "C" bool port_sd_write(const char *, const void *, size_t, bool) { return false; }
 extern "C" void port_sd_close(void) {}
+extern "C" bool port_sd_remove(const char *) { return false; }
+extern "C" bool port_sd_read(const char *, uint32_t, size_t) { return false; }
+extern "C" bool port_sd_list(const char *, const char *) { return false; }
+extern "C" int port_sd_result(const void **data, uint32_t *total)
+{
+    *data = nullptr;
+    *total = 0;
+    return -1;
+}
 
 // ---- LED and button ----
 

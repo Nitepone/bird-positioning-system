@@ -6,6 +6,7 @@
 #include "flac.h"
 #include "port.h"
 #include "record.h"
+#include "spool.h"
 
 #define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 
@@ -18,8 +19,12 @@ enum { UP_IDLE, UP_SEND, UP_RESP };
 /* The client's state and helpers, from bps_upload_init(). */
 static bps_upload_ctx c;
 
+/* Chunks from the next one on are saved on the card (batch mode). */
+static bool to_spool;
+
 static struct {
     int state, h;
+    bool spool; /* this chunk goes to the card, not the server */
     uint32_t start, end, next, segs;
     bool has_prev;
     uint32_t prev_end;
@@ -188,6 +193,31 @@ static void put_chunk_size(uint8_t *out, size_t n)
     out[5] = '\n';
 }
 
+/* Starts saving the chunk from ring index `start` on the card instead. */
+static void spool_begin(uint32_t start, int64_t mono_ts, int64_t mono_end, int64_t start_ns,
+                        int64_t end_ns, uint64_t now)
+{
+    uint8_t head[BPS_FLAC_HEADER_LEN];
+    bps_flac_header(head, c.cfg->sample_rate, c.chunk_len);
+    if (!bps_spool_begin(mono_ts + *c.epoch_ns, mono_end + *c.epoch_ns, start_ns, end_ns,
+                         c.cfg->sample_rate, c.chunk_len, head, sizeof head)) {
+        /* No card with room: the chunk is lost. */
+        up.has_prev = true;
+        up.prev_end = start + c.chunk_len;
+        up.retry_us = now + 1000000;
+        return;
+    }
+    up.spool = true;
+    up.start = start;
+    up.end = start + c.chunk_len;
+    up.next = start;
+    up.segs = LOAD(&c.ring->n_segs);
+    up.lost = 0;
+    up.frame = 0;
+    up.off = up.len = 0;
+    up.state = UP_SEND;
+}
+
 /* Starts uploading `chunk_len` samples from ring index `start`. */
 static void upload_begin(uint32_t start, uint64_t now)
 {
@@ -217,6 +247,10 @@ static void upload_begin(uint32_t start, uint64_t now)
     bps_clock_correct(c.clk, mono_ts + *c.epoch_ns, mono_end - mono_ts);
     int64_t start_ns = bps_clock_at(c.clk, mono_ts + *c.epoch_ns);
     int64_t end_ns = bps_clock_at(c.clk, mono_end + *c.epoch_ns);
+    if (to_spool) {
+        spool_begin(start, mono_ts, mono_end, start_ns, end_ns, now);
+        return;
+    }
 
     char extra[192], path[96];
     bps_json x;
@@ -268,6 +302,7 @@ static void upload_begin(uint32_t start, uint64_t now)
     up.lost = 0;
     up.rx_len = 0;
     up.progress_us = now;
+    up.spool = false;
     up.state = UP_SEND;
     bps_record_begin(start_ns, end_ns, tsf[0] ? tsf : NULL, c.cfg->sample_rate, c.chunk_len,
                      up.buf + head + 6, BPS_FLAC_HEADER_LEN);
@@ -307,7 +342,14 @@ static int upload_refill(void)
         uint32_t nx;
         if (!bps_ring_locate(c.ring, up.start, &t, &has_next, &nx) ||
             (has_next && bps_idx_diff(nx, up.end) < 0)) {
-            upload_abort("capture timeline jumped");
+            if (up.spool) {
+                bps_spool_abort();
+                up.prev_end = up.next;
+                up.state = UP_IDLE;
+                up.has_prev = true;
+            } else {
+                upload_abort("capture timeline jumped");
+            }
             return -1;
         }
         up.segs = LOAD(&c.ring->n_segs);
@@ -319,6 +361,11 @@ static int upload_refill(void)
     uint64_t t0 = port_mono_us();
     size_t n = bps_flac_frame(up.buf + 6, up.pcm, want, up.frame++, c.cfg->sample_rate);
     diag_upload_encode((uint32_t)(port_mono_us() - t0));
+    if (up.spool) {
+        bps_spool_frame(up.buf + 6, n);
+        up.len = 0;
+        return 1;
+    }
     bps_record_frame(up.buf + 6, n);
     put_chunk_size(up.buf, n);
     memcpy(up.buf + 6 + n, "\r\n", 2);
@@ -367,8 +414,28 @@ static void upload_pump(uint64_t now)
         upload_abort("stalled");
 }
 
+/* Saves what has been captured of the chunk; once complete, its .json too. */
+static void spool_pump(void)
+{
+    for (int i = 0; i < 16 && up.next != up.end; i++)
+        if (upload_refill() <= 0)
+            return;
+    if (up.next != up.end)
+        return;
+    if (up.lost)
+        (*c.overruns)++;
+    bps_spool_end(up.end - up.start, up.lost);
+    up.prev_end = up.end;
+    up.state = UP_IDLE;
+    up.has_prev = true;
+}
+
 void bps_upload_poll(uint64_t now)
 {
+    if (up.state == UP_SEND && up.spool) {
+        spool_pump();
+        return;
+    }
     if (up.state == UP_SEND) {
         upload_pump(now);
         return;
@@ -425,9 +492,12 @@ bool bps_upload_idle(void) { return up.state == UP_IDLE; }
 
 uint32_t bps_upload_end(void) { return up.end; }
 
+void bps_upload_set_spool(bool on) { to_spool = on; }
+
 void bps_upload_drop(void)
 {
-    if (up.state != UP_IDLE) {
+    /* Saving on the card goes on without the network. */
+    if (up.state != UP_IDLE && !up.spool) {
         bps_record_end(up.next - up.start, up.lost, "dropped (reconnecting)");
         port_tcp_close(up.h);
         up.h = -1;

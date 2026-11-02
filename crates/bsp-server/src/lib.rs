@@ -159,7 +159,8 @@ pub fn web_router(state: SharedState) -> Router {
         .with_state(state)
 }
 
-/// Logs a raw event whenever a client stops sending heartbeats.
+/// Logs a raw event whenever a client stops sending heartbeats, and keeps
+/// audio long enough for batch clients' late uploads to be located.
 async fn monitor_clients(state: SharedState) {
     let mut was_active: HashMap<ClientId, bool> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -169,6 +170,10 @@ async fn monitor_clients(state: SharedState) {
             continue;
         };
         let now = now_ns();
+        let hold = state.batch_hold(&clients, now);
+        state
+            .audio
+            .set_extra_retention(hold.map_or(0, |h| h.max_wait_ns));
         for c in clients {
             let active = state.is_active(&c, now);
             if was_active.insert(c.id, active) == Some(true) && !active {

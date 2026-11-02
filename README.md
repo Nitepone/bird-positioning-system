@@ -141,7 +141,8 @@ A detection shows a direction (e.g. `NE (47°)`) only when **at least 3** client
 and each of them:
 
 - has a position set,
-- is **active** (sent a heartbeat in the last 15 s), and
+- is **active** (sent a heartbeat in the last 15 s; a client in batch mode, its interval plus
+  two minutes), and
 - is **synced** (its audio timestamps are within 2 ms of the server's clock, worst case).
 
 The **Logs** page shows the raw activity log, which is useful when something isn't working.
@@ -241,6 +242,30 @@ from its own task, so a slow card never holds up the network; it can be pulled o
 while the board runs (with no card-detect pin, the board notices within a few seconds). Use a
 FAT32-formatted card. The heartbeat reports whether a card is in, its free space,
 and the recordings saved since the board started.
+
+**Operation modes: saving power.** A board with an SD card can run in **batch** mode instead of
+**live**: it turns its Wi-Fi radio off and keeps its audio on the card, and every few minutes (5
+by default, 30 s to an hour) makes a contact. It turns the radio on, joins the access point it
+used last (no scan), measures its clock against the server's (and the access point's clock, from
+its beacons) for a few seconds, uploads what it recorded, deleting each chunk from the card once the
+server has it, and turns the radio off again. A contact takes about 6-10 s, so the radio is on
+for 2-3% of the time at 5 minutes. Audio recorded with the radio off is timestamped by
+interpolating between the clock measurements either side of it, which takes out the drift
+over the gap. What is left is how far the drift *changed* (microseconds over minutes), so it can
+still be located. The heartbeat reports that change (`gap`), and the Clients page shows it.
+
+Set a client's mode on the **Clients** page (select it; *Operation mode*), or with `PUT
+/api/v1/control/clients/{id}/mode`. The client hears of it in the reply to its next heartbeat:
+a client already in batch mode, at its next contact. Detections involving a batch client wait
+for its upload: the server holds other clients' calls until every batch client has delivered its
+audio past them (at most its interval plus two minutes), and keeps every client's audio that much
+longer for locating them. A board without a card stays live and says why; if the card goes or
+fills up while the radio is off, it makes contact at once and runs live until the card is back.
+Chunks waiting on the card are in `spool/` (`<start ms>.flac`, and a `.json` with its times once
+complete). After a restart they go up with the timestamps estimated when they were recorded,
+without the access point's clock. In batch mode chunks are not also copied to `recordings/`.
+Batch mode needs an ESP32 board (a Pico board has no card slot yet). A board starts in live mode
+and switches at its first heartbeat.
 
 **Configure, build and flash.** Two scripts in `firmware/` do it:
 
@@ -425,7 +450,8 @@ firmware/host/bps-host-client -s SERVER -w birds.wav -n "Host test"   # 16-bit P
 With `-b` it also hears beacons of a pretend access point whose clock is the computer's real-time
 clock, so several host clients on one computer (each with its own `-i UUID`) share an AP, as ESP32
 boards on one access point do. With `-d DIR` a directory stands in for an SD card: recordings are
-saved there as on a board, and taking the directory away and back acts as pulling the card.
+saved there as on a board, and taking the directory away and back acts as pulling the card. Host
+clients can run in batch mode too (turning the "radio" off cuts them off from the server).
 
 ## Developer notes
 
@@ -467,8 +493,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `POST /register`: the response's `flac_uploads` says whether the server takes FLAC uploads
   - `POST /{id}/heartbeat`: clock status and counts, and from boards that have them `battery`
     (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
-    `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`) and `devices` (`kind`, `bus`,
-    `address`, `present`)
+    `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`), `devices` (`kind`, `bus`,
+    `address`, `present`) and `mode` (`mode`: `live` or `batch`, `interval_s`, `backlog`,
+    `backlog_bytes`, `delivered_through`, `next_contact_s`, `radio_on_pct`, `gap`, `note`). The
+    reply is `{"mode": {"mode": ..., "interval_s": ...}}`, the mode set for the client
   - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
     client always sends FLAC, about a quarter the size, with chunked encoding). Optional:
     `x-bps-end-ns`, when the sample after the last was captured (the chunk's real duration), and
@@ -484,6 +512,7 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /local-species`: species expected at the site
   - `GET /clients`
   - `GET|PUT|DELETE /clients/{id}`
+  - `PUT /clients/{id}/mode`: `{"mode": "live" | "batch", "interval_s": 30-3600}`
   - `GET /clients/{id}/clock?minutes=`: the client's clock reports (one per heartbeat) over the
     last `minutes` (default 30, at most 60)
   - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
