@@ -11,6 +11,16 @@ use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::time::Duration;
+
+/// How long a connection may go quiet before the kernel probes the peer...
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// ...how often it probes...
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// ...and how many unanswered probes mean the peer is gone.
+const KEEPALIVE_PROBES: u32 = 3;
+/// How long sent data may go unacknowledged before the connection is dropped.
+const USER_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Binds a TCP listener, explaining the usual fix when a privileged port is refused.
 pub fn bind(addr: &str, what: &str) -> anyhow::Result<TcpListener> {
@@ -26,8 +36,27 @@ pub fn bind(addr: &str, what: &str) -> anyhow::Result<TcpListener> {
             anyhow::Error::new(e).context(format!("binding {what} on {addr}"))
         }
     })?;
+    detect_dead_peers(&listener).with_context(|| format!("configuring {what} on {addr}"))?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// Makes connections to peers that vanished without closing (a client whose
+/// Wi-Fi dropped mid-upload, a phone put to sleep) fail instead of waiting for
+/// them forever: each one holds a file descriptor, and enough of them stop the
+/// server accepting anything ("Too many open files"). Connections accepted
+/// from `listener` inherit these options.
+fn detect_dead_peers(listener: &TcpListener) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(listener);
+    sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL)
+            .with_retries(KEEPALIVE_PROBES),
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))?;
+    Ok(())
 }
 
 fn host_name() -> Option<String> {
@@ -179,6 +208,21 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn accepted_connections_detect_dead_peers() {
+        let listener = bind("127.0.0.1:0", "test").unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (conn, _) = listener.accept().unwrap();
+        let sock = socket2::SockRef::from(&conn);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(USER_TIMEOUT));
     }
 
     #[tokio::test]

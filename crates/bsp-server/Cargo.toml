@@ -28,6 +28,7 @@ rcgen = "0.14"
 flacenc = { version = "0.5", default-features = false }
 claxon = "0.4"
 hound.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
