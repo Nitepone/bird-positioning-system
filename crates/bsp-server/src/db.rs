@@ -761,6 +761,7 @@ mod tests {
                 percent: 87.5,
                 voltage_v: 4.0,
                 rate_pct_per_h: Some(-1.04),
+                charging: Some(false),
             }),
             storage: Some(StorageStatus {
                 present: true,

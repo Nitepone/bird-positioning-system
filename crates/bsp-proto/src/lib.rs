@@ -137,6 +137,19 @@ mod tests {
         assert!("04:f4:1c:07:93:52:00".parse::<Bssid>().is_err());
         assert!("04:f4:1c:07:93:zz".parse::<Bssid>().is_err());
     }
+
+    #[test]
+    fn battery_charging_is_optional() {
+        // As the MAX17048 driver reports it today: no charger status.
+        let b: BatteryStatus =
+            serde_json::from_str(r#"{"percent":87.5,"voltage_v":4.0,"rate_pct_per_h":-1.04}"#)
+                .unwrap();
+        assert_eq!(b.charging, None);
+        assert!(!serde_json::to_string(&b).unwrap().contains("charging"));
+        let b: BatteryStatus =
+            serde_json::from_str(r#"{"percent":60,"voltage_v":3.9,"charging":true}"#).unwrap();
+        assert_eq!(b.charging, Some(true));
+    }
 }
 
 impl ClockStatus {
@@ -361,9 +374,14 @@ pub struct BatteryStatus {
     pub percent: f32,
     /// Cell voltage.
     pub voltage_v: f32,
-    /// How fast the charge changes, percent per hour (positive: charging).
+    /// How fast the gauge's charge estimate changes, percent per hour. A rise
+    /// does not prove the cell is charging (see `charging`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_pct_per_h: Option<f32>,
+    /// Whether the charger says it is charging the cell, from boards that can
+    /// read its status. Never inferred from the rate; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
 }
 
 /// A storage card and what the client has written to it.

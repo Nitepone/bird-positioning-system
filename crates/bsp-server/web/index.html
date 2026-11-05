@@ -218,6 +218,10 @@
   .client-section > summary .summary-note { font-weight: normal; font-size: 13px; color: var(--ink-2); margin-left: 0.6em; }
   .client-section > .section-body { padding-bottom: 0.6em; }
   .info { cursor: help; color: var(--ink-2); font-weight: normal; }
+  /* A charging battery, as its charger reports it. */
+  .charging { color: var(--ok); border: 1px solid currentColor; border-radius: 1em; padding: 0 6px;
+              font-size: 12px; font-weight: 600; white-space: nowrap; vertical-align: 2px; }
+  td .charging { padding: 0 4px; margin-left: 4px; vertical-align: 0; }
 </style>
 </head>
 <body>
@@ -1728,15 +1732,25 @@ function batteryView(c) {
   const h = c.health, b = h?.battery;
   if (b) {
     const r = b.rate_pct_per_h;
-    const trend = r == null ? "" : r > 0.2 ? `charging, +${r.toFixed(1)} %/h` : r < -0.2 ? `${r.toFixed(1)} %/h` : "steady";
+    // The gauge has no current sensor: its rate is how its charge estimate (made from the
+    // cell's voltage) moves, which goes on settling for a while after a charger is
+    // unplugged. So a rise says the estimate is rising, not that the cell is charging.
+    const trend = r == null ? "" : r > 0.2 ? `rising, +${r.toFixed(1)} %/h` : r < -0.2 ? `falling, ${r.toFixed(1)} %/h` : "steady";
     return {
       text: `${Math.min(100, b.percent).toFixed(0)}%`, cls: b.percent < BATTERY_LOW_PCT ? "bad" : "",
       sub: `${b.voltage_v.toFixed(2)} V` + (trend ? ` · ${trend}` : ""),
+      // Only what the device reports from its charger; never inferred from the trend.
+      charging: b.charging === true,
     };
   }
   if (h?.devices?.some(d => GAUGE_KINDS.includes(d.kind)))
     return { text: "no reading", cls: "muted", sub: "gauge not answering: no battery connected?" };
   return null;
+}
+
+/// The charging badge, with the label spelled out or (compact) as a tooltip only.
+function chargingBadge(compact) {
+  return `<span class="charging" title="Charging" aria-label="Charging">&#9889;${compact ? "" : " Charging"}</span>`;
 }
 
 /// A small ⓘ whose tooltip carries an explanation.
@@ -1813,7 +1827,8 @@ function renderClientTable() {
     "that AP's other clients to microseconds and is used with them.";
   document.querySelector("#client-list tbody").innerHTML = clients.map(c => {
     const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c), md = modeView(c);
-    const cell = (v, short) => v ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}</td>` : "<td>-</td>";
+    const cell = (v, short, extra = "") => v
+      ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}${extra}</td>` : "<td>-</td>";
     return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
       <td><a href="#/clients?client=${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</a></td>
       <td class="${st.cls}">${st.text}</td>
@@ -1821,7 +1836,7 @@ function renderClientTable() {
       <td class="num">${k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-"}${c.ap_error_ns != null
         ? `<br><span class="muted" title="against the other clients of access point ${esc(k.beacon.bssid)}">&plusmn;${fmtNsUs(c.ap_error_ns)} within its AP</span>` : ""}</td>
       <td class="num">${fmtNsMs(k?.rtt_ns)}</td>
-      ${cell(bat)}
+      ${cell(bat, null, bat?.charging ? chargingBadge(true) : "")}
       ${cell(card)}
       <td>${c.health ? fmtDuration(c.health.uptime_s) : "-"}</td>
       <td>${fmtAgo(c.last_seen)}</td>
@@ -1886,12 +1901,12 @@ function renderClientDetail() {
   const interval = c.health?.mode?.mode === "batch"
     ? `in contact every ${fmtInterval(c.health.mode.interval_s)}` : `heartbeat every ${data.heartbeat_interval_s} s`;
   document.getElementById("sum-hardware").innerHTML = [
-    bat ? `battery ${esc(bat.text)}` : "",
+    bat ? `battery ${esc(bat.text)}${bat.charging ? " " + chargingBadge(true) : ""}` : "",
     card ? `SD ${esc(card.text)}` : "",
   ].filter(Boolean).join(" · ");
   document.getElementById("hardware-tiles").innerHTML = [
     !h ? tile("Health", "-", "no heartbeat stored yet") : "",
-    bat ? tile("Battery" + asOf, esc(bat.text), esc(bat.sub), bat.cls) : "",
+    bat ? tile("Battery" + asOf, esc(bat.text) + (bat.charging ? " " + chargingBadge(false) : ""), esc(bat.sub), bat.cls) : "",
     card ? tile("SD card" + asOf, esc(card.text), esc(card.sub), card.cls) : "",
     tile("Mode" + asOf, esc(md.text), [md.sub, interval].filter(Boolean).map(esc).join(" · "), md.cls),
     h?.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,

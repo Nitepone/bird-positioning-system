@@ -306,6 +306,7 @@ mod tests {
                 percent,
                 voltage_v: 3.7,
                 rate_pct_per_h: None,
+                charging: None,
             }),
             storage: card.map(|(present, free)| StorageStatus {
                 present,
