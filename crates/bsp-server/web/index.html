@@ -217,6 +217,7 @@
   .client-section > summary { cursor: pointer; padding: 6px 0; font-weight: 600; font-size: 15px; }
   .client-section > summary .summary-note { font-weight: normal; font-size: 13px; color: var(--ink-2); margin-left: 0.6em; }
   .client-section > .section-body { padding-bottom: 0.6em; }
+  .info { cursor: help; color: var(--ink-2); font-weight: normal; }
 </style>
 </head>
 <body>
@@ -408,10 +409,11 @@
 
 <section id="page-clients">
   <h2>Clients</h2>
-  <p class="hint" id="clients-intro"></p>
   <div class="scroll-x">
   <table id="client-list">
-    <thead><tr><th>Client</th><th>Status</th><th>Mode</th><th>Timestamp error</th><th>Best RTT</th><th>Battery</th>
+    <thead><tr><th>Client</th><th>Status</th>
+      <th title="Batch: the radio is off between contacts and audio waits on the SD card, so detections wait for its uploads.">Mode</th>
+      <th id="th-error">Timestamp error</th><th>Best RTT</th><th>Battery</th>
       <th>SD card</th><th>Up for</th><th>Last heard</th></tr></thead>
     <tbody></tbody>
   </table>
@@ -433,7 +435,7 @@
         <summary>Hardware Info <span class="summary-note" id="sum-hardware"></span></summary>
         <div class="section-body">
           <div class="tiles" id="hardware-tiles"></div>
-          <h4>Operation mode</h4>
+          <h4>Operation mode <span class="info" id="mode-info" tabindex="0"></span></h4>
           <form class="filters" id="mode-form" onsubmit="saveMode(event)">
             <label>Mode <select id="mode-select" onchange="modeFormChanged()">
               <option value="live">Live: always connected</option>
@@ -457,10 +459,10 @@
               <option value="30" selected>last 30 min</option>
               <option value="60">last hour</option>
             </select></label>
+            <span class="hint" id="clock-foot"></span>
           </div>
           <div class="tiles" id="clock-tiles"></div>
           <div id="clock-chart"></div>
-          <p class="hint" id="clock-foot"></p>
         </div>
       </details>
     </div>
@@ -1733,9 +1735,12 @@ function batteryView(c) {
     };
   }
   if (h?.devices?.some(d => GAUGE_KINDS.includes(d.kind)))
-    return { text: "no reading", cls: "muted", sub: "the gauge does not answer: no battery connected?" };
+    return { text: "no reading", cls: "muted", sub: "gauge not answering: no battery connected?" };
   return null;
 }
+
+/// A small ⓘ whose tooltip carries an explanation.
+function info(text) { return `<span class="info" tabindex="0" title="${esc(text)}">&#9432;</span>`; }
 
 /// "5 min", "90 s"
 function fmtInterval(s) { return s % 60 === 0 ? `${s / 60} min` : `${s} s`; }
@@ -1745,7 +1750,7 @@ function fmtInterval(s) { return s % 60 === 0 ? `${s / 60} min` : `${s} s`; }
 function modeView(c) {
   const m = c.health?.mode, want = c.mode;
   const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : "live";
-  if (!m) return { text: "live", cls: "muted", sub: "does not report a mode: it cannot switch" };
+  if (!m) return { text: "live", cls: "muted", sub: "reports no mode: cannot switch" };
   const parts = [];
   if (m.note) parts.push(m.note);
   else if (name(want) !== name(m))
@@ -1757,7 +1762,7 @@ function modeView(c) {
       parts.push(due > 0 ? `next contact in ${fmtDuration(due / 1e9)}` : "contact due");
     }
   }
-  if (m.backlog) parts.push(`${m.backlog} recording${m.backlog === 1 ? "" : "s"} (${fmtBytes(m.backlog_bytes)}) on the card to upload`);
+  if (m.backlog) parts.push(`${m.backlog} recording${m.backlog === 1 ? "" : "s"} (${fmtBytes(m.backlog_bytes)}) to upload`);
   return { text: name(m), sub: parts.join(" · "), cls: m.note ? "bad" : "" };
 }
 
@@ -1777,9 +1782,9 @@ function storageView(c) {
   const problems = [s.errors ? `${s.errors} write error${s.errors === 1 ? "" : "s"}` : "",
     s.dropped_bytes ? `${fmtBytes(s.dropped_bytes)} not written` : ""]
     .filter(Boolean).join(", ");
-  const saved = `${s.recordings} recording${s.recordings === 1 ? "" : "s"} (${fmtBytes(s.recorded_bytes)}) saved since it started`;
+  const saved = `${s.recordings} recording${s.recordings === 1 ? "" : "s"} (${fmtBytes(s.recorded_bytes)}) saved since boot`;
   if (!s.present)
-    return { text: "no card", cls: "muted", sub: "recordings are not being kept" + (problems ? ` · ${problems}` : "") };
+    return { text: "no card", cls: "muted", sub: "not keeping recordings" + (problems ? ` · ${problems}` : "") };
   return {
     text: `${fmtBytes(s.free_bytes)} free`, cls: s.free_bytes < STORAGE_LOW_BYTES ? "bad" : "",
     sub: `of ${fmtBytes(s.total_bytes)} · ${saved}` + (problems ? ` · ${problems}` : ""),
@@ -1802,14 +1807,10 @@ async function refreshClientsPage() {
 
 function renderClientTable() {
   document.getElementById("clients-none").hidden = clients.length > 0;
-  document.getElementById("clients-intro").textContent =
-    "Direction finding needs every client's audio timestamps on the server's clock. Timestamp error is the worst " +
-    `case left in them; clients over the limit (±${fmtNsMs(clockLimitNs(), 1)}) are left out of positioning. ` +
-    "Clients that follow their Wi-Fi access point's clock by its beacons (ESP32 boards) also line up with that " +
-    "AP's other clients to microseconds, and can be used with them even when over the limit. " +
-    "Battery and SD card are from boards that have them. Clients in batch mode turn their radio off between " +
-    "contacts, keeping audio on their SD card meanwhile; detections wait for their uploads. " +
-    "Select a client for its details and to set its mode.";
+  document.getElementById("th-error").title =
+    `Worst-case error left in the client's audio timestamps. Over ±${fmtNsMs(clockLimitNs(), 1)} it is left out ` +
+    "of positioning, unless it follows its Wi-Fi access point's beacons (ESP32 boards): then it lines up with " +
+    "that AP's other clients to microseconds and is used with them.";
   document.querySelector("#client-list tbody").innerHTML = clients.map(c => {
     const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c), md = modeView(c);
     const cell = (v, short) => v ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}</td>` : "<td>-</td>";
@@ -1877,7 +1878,7 @@ function renderClientDetail() {
   document.getElementById("sum-stats").textContent = h ? `${h.chunks_sent} chunks sent` : "";
   document.getElementById("stats-tiles").innerHTML = h
     ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
-      `${h.chunks_gated} chunks gated (quiet) since it started`)
+      `${h.chunks_gated} gated ${info("Gated: quiet chunks the client did not send. Counted since it started.")}`)
     : tile("Audio chunks", "-", "no heartbeat stored yet");
 
   // Hardware Info: power, storage, radio, devices, firmware.
@@ -1920,14 +1921,13 @@ function fillModeForm(c) {
 function showModeForm(c) {
   const batch = document.getElementById("mode-select").value === "batch";
   document.getElementById("mode-interval-label").hidden = !batch;
-  document.getElementById("mode-hint").textContent = !c.health?.mode
-    ? "This client does not report a mode, so it cannot be switched (older firmware, or the computer client)."
-    : batch
-      ? "Batch: the client turns its Wi-Fi radio off and keeps its audio on its SD card, then at each contact " +
-        "measures its clock again, uploads what it recorded (deleting it from the card), and turns the radio off " +
-        "again. Audio is timestamped between the clock measurements either side, so it can still be located; " +
-        "detections involving it are made once its audio is in, up to an interval later. Needs an SD card."
-      : "Live: the client stays connected and uploads audio as it records it.";
+  document.getElementById("mode-hint").textContent = c.health?.mode
+    ? "" : "Reports no mode (older firmware, or the computer client): cannot be switched.";
+  document.getElementById("mode-info").innerHTML = info(
+    "Live: stays connected and uploads audio as it records.\n" +
+    "Batch (needs an SD card): the Wi-Fi radio is off between contacts and audio is kept on the card. At each " +
+    "contact the client measures its clock again and uploads what it recorded, so the audio can still be " +
+    "located; detections involving it are made up to an interval later.");
 }
 
 function modeFormChanged() {
@@ -1991,7 +1991,9 @@ function renderClockDetail() {
   const requests = dets.reduce((n, x) => n + x.requests, 0), replies = dets.reduce((n, x) => n + x.replies, 0);
   const medians = dets.map(x => x.rtt_median_ns).filter(v => v != null).sort((a, b) => a - b);
   document.getElementById("clock-tiles").innerHTML = [
-    tile("Timestamp error now", k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-",
+    tile("Timestamp error now " + info("What is left after the client's correction, plus half the fastest round " +
+      "trip (a measurement cannot tell how delay splits between directions) and drift within half a chunk."),
+      k ? "&plusmn;" + fmtNsMs(c.clock_error_ns) : "-",
       k ? `<span class="${st.cls}">${st.text}</span> (limit &plusmn;${fmtNsMs(limit, 1)})` : "no measurement"),
     tile(`Within limit, last ${minutes} min`, errors.length ? (100 * within / errors.length).toFixed(1) + "%" : "-",
       errors.length ? `p95 &plusmn;${fmtNsMs(percentile(errors, 0.95))}, worst &plusmn;${fmtNsMs(errors.at(-1))}` : "no reports"),
@@ -2012,9 +2014,7 @@ function renderClockDetail() {
     gap ? tile("Last radio-off gap", fmtDuration(c.health.mode.gap.off_s), esc(gap)) : "",
   ].join("");
   document.getElementById("clock-foot").textContent =
-    `${reports.length} reports from ${fmtTime(data.from)} to ${fmtTime(data.server_time)}. ` +
-    "Timestamp error: what is left after the client's correction, plus half the fastest round trip (a measurement " +
-    "cannot tell how delay splits between directions) and drift within half a chunk.";
+    `${reports.length} reports, ${fmtClock(data.from / 1e6)}–${fmtClock(data.server_time / 1e6)}`;
   renderClockChart(data);
 }
 
