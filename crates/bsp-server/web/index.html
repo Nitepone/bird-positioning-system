@@ -198,6 +198,8 @@
     .config-nav a + a { border-top: 0; border-left: 1px solid var(--cell-border); }
     .config-nav a.current { border-bottom-color: var(--tick); }
   }
+  td.actions { white-space: nowrap; }
+  button.danger { color: var(--bad); }
   /* Microphone map (Config page) */
   #mic-map { width: 100%; max-width: 440px; border: 1px solid var(--cell-border); display: block; }
   #mic-map .ring { fill: none; stroke: var(--grid); }
@@ -411,10 +413,13 @@
 
   <div class="config-section" data-section="clients">
   <h2>Clients</h2>
+  <div class="scroll-x">
   <table id="clients">
     <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Position (E, N, Up) m</th><th>Timestamp error / RTT</th><th>Address</th><th>Last seen</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
+  </div>
+  <p id="clients-msg" role="status"></p>
 
   <div class="side-by-side">
   <div>
@@ -931,8 +936,12 @@ async function refreshStatus() {
     `${s.identifier} | ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} monitors`;
 }
 
+/// Bumped when the client list changes here (a deletion), so a fetch begun before it can't undo it.
+let clientsEpoch = 0;
 async function refreshClients() {
-  clients = await api("/clients");
+  const epoch = clientsEpoch;
+  const list = await api("/clients");
+  if (epoch === clientsEpoch) clients = list;
   positioning = await api("/positioning-request");
 
   const banner = document.getElementById("banner");
@@ -1618,7 +1627,8 @@ function renderConfigPage() {
       <td>${clock}</td>
       <td class="mono">${esc(c.last_addr)}</td>
       <td>${fmtAgo(c.last_seen)}</td>
-      <td><button onclick="selectClient('${c.id}')">Edit</button></td>
+      <td class="actions"><button onclick="selectClient('${c.id}')">Edit</button>
+        <button class="danger" onclick="deleteClient('${c.id}', this)">Delete</button></td>
     </tr>`;
   }).join("");
 
@@ -1641,6 +1651,35 @@ function configureRequested() {
   showPage(); // now, so the form is visible to scroll to
   renderConfigPage(); // make sure the form's client list is populated before selecting
   selectClient(positioning.client_id);
+}
+
+/// Deletes a client after asking; the list updates in place, and on failure the client stays.
+async function deleteClient(id, button) {
+  const c = clients.find(c => c.id === id);
+  const name = (c && displayName(c)) || `client ${id.slice(0, 8)}`;
+  if (!confirm(`Delete ${name} (${id})?\n\n` +
+      "Its name, position and battery history are removed; detections it heard are kept. " +
+      "If the device is still running, it shows up again, without a name or position, the next time it contacts the server.")) return;
+  const msg = document.getElementById("clients-msg");
+  msg.textContent = "";
+  msg.className = "";
+  button.disabled = true;
+  try {
+    await api(`/clients/${id}`, { method: "DELETE" });
+  } catch (e) {
+    button.disabled = false;
+    msg.textContent = `Could not delete ${name}: ${e.message}`;
+    msg.className = "bad";
+    return;
+  }
+  clientsEpoch++;
+  clients = clients.filter(c => c.id !== id);
+  if (positioning && positioning.client_id === id) positioning = null;
+  if (document.getElementById("cfg-id").value === id) configDirty = false;
+  renderConfigPage();
+  msg.textContent = `Deleted ${name}.`;
+  msg.className = "ok";
+  refresh();
 }
 
 function selectClient(id) {

@@ -59,7 +59,9 @@ Click **Save settings**. Settings are stored in the server's database.
 ```
 
 The client shows up in the **Clients** section of the **Config** page. Its ID is stored in `./state/client_id`,
-so it stays the same across restarts.
+so it stays the same across restarts. **Delete** next to a client removes it (its name, position and
+battery history; detections it heard are kept). A device that is still running shows up again, unnamed,
+the next time it contacts the server.
 
 **Or use a browser as a client:** open `https://SERVER/client` on the device (phone, laptop) and
 click **Start**. The page shows the microphone in use and whether the browser really turned its

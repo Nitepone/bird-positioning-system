@@ -193,6 +193,11 @@ async fn delete_client(
     }
     state.event(Some(id), "deleted", json!({}));
     state.clock_history.forget(id);
+    // Its request to have its position set goes with it.
+    let mut slot = state.positioning.lock().unwrap();
+    if slot.is_some_and(|r| r.client_id == id) {
+        *slot = None;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
