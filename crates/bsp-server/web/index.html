@@ -179,6 +179,25 @@
   .side-by-side { display: flex; flex-wrap: wrap; gap: 0 3em; align-items: flex-start; }
   .side-by-side > .map-column { flex: 0 1 440px; min-width: 260px; }
 
+  /* Config page: a sidebar of sections, one shown at a time. */
+  .config-layout { display: flex; gap: 0 2em; align-items: flex-start; }
+  .config-nav { flex: 0 0 9em; display: flex; flex-direction: column; position: sticky; top: 1em;
+                border: 1px solid var(--cell-border); }
+  .config-nav a { padding: 6px 10px; color: var(--ink); text-decoration: none; border-left: 3px solid transparent; }
+  .config-nav a + a { border-top: 1px solid var(--cell-border); }
+  .config-nav a:hover, .config-nav a:focus-visible { background: var(--th); }
+  .config-nav a.current { font-weight: 600; background: var(--th); border-left-color: var(--tick); }
+  .config-main { flex: 1 1 auto; min-width: 0; }
+  .config-section > h2:first-child { margin-top: 0; }
+  /* Narrow screens: the sections as a row of tabs above the content. */
+  @media (max-width: 640px) {
+    .config-layout { flex-direction: column; }
+    .config-layout { align-items: stretch; }
+    .config-nav { flex-direction: row; position: static; flex-basis: auto; margin-bottom: 1em; }
+    .config-nav a { flex: 1; text-align: center; border-left: 0; border-bottom: 3px solid transparent; }
+    .config-nav a + a { border-top: 0; border-left: 1px solid var(--cell-border); }
+    .config-nav a.current { border-bottom-color: var(--tick); }
+  }
   /* Microphone map (Config page) */
   #mic-map { width: 100%; max-width: 440px; border: 1px solid var(--cell-border); display: block; }
   #mic-map .ring { fill: none; stroke: var(--grid); }
@@ -354,6 +373,13 @@
 </section>
 
 <section id="page-config">
+  <div class="config-layout">
+  <nav class="config-nav" aria-label="Configuration sections">
+    <a href="#/config?section=server" data-section="server">Server</a>
+    <a href="#/config?section=clients" data-section="clients">Clients</a>
+  </nav>
+  <div class="config-main">
+  <div class="config-section" data-section="server">
   <h2>Server settings</h2>
   <form id="settings" onsubmit="saveSettings(event)">
     <fieldset>
@@ -381,7 +407,9 @@
     <summary>Expected species list</summary>
     <table><thead><tr><th>Species</th><th>Scientific name</th><th>Year-round likelihood</th></tr></thead><tbody></tbody></table>
   </details>
+  </div>
 
+  <div class="config-section" data-section="clients">
   <h2>Clients</h2>
   <table id="clients">
     <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Position (E, N, Up) m</th><th>Timestamp error / RTT</th><th>Address</th><th>Last seen</th><th></th></tr></thead>
@@ -411,6 +439,9 @@
     <p class="hint" id="mic-map-missing"></p>
     <p class="hint">Seen from above, centred on the site origin; height is not shown. The client selected in the
       form is highlighted, and a position being typed shows as "unsaved" until it is saved.</p>
+  </div>
+  </div>
+  </div>
   </div>
   </div>
 </section>
@@ -568,6 +599,7 @@ function showPage() {
   const { page, params } = route();
   for (const p of PAGES) document.getElementById("page-" + p).style.display = p === page ? "" : "none";
   for (const a of document.querySelectorAll("#titlebar a")) a.classList.toggle("current", a.dataset.page === page);
+  if (page === "config") showConfigSection(params.get("section"));
   if (page === "config" && !settingsDirty) loadSettings();
   if (page === "home") { renderDashboard(); timelineFetchedAt = 0; }
   if (page === "detections") enterDetections(params);
@@ -1552,6 +1584,21 @@ async function loadSpeciesList() {
       <td>${Math.round(s.probability * 100)}%</td></tr>`).join("");
 }
 
+// ---- config page: sections ----
+const CONFIG_SECTIONS = ["server", "clients"];
+/// Shows one section of the Config page (the first when `name` is not one of them).
+function showConfigSection(name) {
+  const section = CONFIG_SECTIONS.includes(name) ? name : CONFIG_SECTIONS[0];
+  for (const el of document.querySelectorAll("#page-config .config-section")) {
+    el.hidden = el.dataset.section !== section;
+  }
+  for (const a of document.querySelectorAll("#page-config .config-nav a")) {
+    const current = a.dataset.section === section;
+    a.classList.toggle("current", current);
+    if (current) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  }
+}
+
 // ---- config page: clients ----
 function renderConfigPage() {
   document.querySelector("#clients tbody").innerHTML = clients.map(c => {
@@ -1590,9 +1637,10 @@ function renderConfigPage() {
 
 function configureRequested() {
   if (!positioning) return;
+  location.hash = "#/config?section=clients";
+  showPage(); // now, so the form is visible to scroll to
   renderConfigPage(); // make sure the form's client list is populated before selecting
   selectClient(positioning.client_id);
-  location.hash = "#/config";
 }
 
 function selectClient(id) {

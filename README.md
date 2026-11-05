@@ -15,7 +15,7 @@ sudo setcap cap_net_bind_service=+ep target/release/bsp-server   # allow ports 8
 ```
 
 Open the web UI at `https://SERVER/` (plain `http://` redirects there). Its pages are
-**Dashboard** and **Detections** (what was heard), **Config** (clients and settings), **Clients**
+**Dashboard** and **Detections** (what was heard), **Config** (settings, in a **Server** and a **Clients** section), **Clients**
 (each client's clock synchronisation, battery and SD card) and **Logs** (raw events).
 
 On first start the server creates a self-signed certificate in `tls/`, so your browser warns
@@ -37,7 +37,7 @@ model has been downloaded.
 
 ### 2. Set the site location and confidence levels
 
-On the **Config** page under **Server settings**:
+On the **Config** page, in the **Server** section:
 
 - **Site location:** enter latitude and longitude, or click **Detect location** (your browser
   will ask for permission).
@@ -58,7 +58,7 @@ Click **Save settings**. Settings are stored in the server's database.
 ./target/release/bsp-client -s http://SERVER:2473 -n "North fence" # suggest a name (optional)
 ```
 
-The client shows up in the **Clients** table on the **Config** page. Its ID is stored in `./state/client_id`,
+The client shows up in the **Clients** section of the **Config** page. Its ID is stored in `./state/client_id`,
 so it stays the same across restarts.
 
 **Or use a browser as a client:** open `https://SERVER/client` on the device (phone, laptop) and
@@ -94,7 +94,7 @@ I2S microphone such as the Adafruit ICS-43434, or the bps XIAO board, makes a ch
 ### 4. Set each client's name and position
 
 1. Press **Enter** in the client's terminal. A banner appears on every page; click
-   **Configure** to open that client in the **Config** page's form.
+   **Configure** to open that client in the form in the **Config** page's **Clients** section.
 2. Enter a name and its position in metres from a reference point you choose:
    **East (x), North (y), Up (z)**. A client started with `-n` (or given a name on the browser
    client) is already shown by that suggested name. A name entered here takes precedence, and
