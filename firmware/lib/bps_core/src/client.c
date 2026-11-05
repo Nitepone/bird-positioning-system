@@ -1192,7 +1192,10 @@ void bps_client_setup(const bps_settings *s)
         bps_uuid_from_chip(chip, client_id);
     }
     bps_uuid_format(client_id, id_str);
-    snprintf(hostname, sizeof hostname, "bps-%s-%.8s", cfg.board, id_str);
+    /* Named by the id's bytes 3-5: on an ESP32, the last half of the MAC, the part that
+     * differs from board to board (boards from one batch share the first four bytes). */
+    snprintf(hostname, sizeof hostname, "bps-%s-%02x%02x%02x", cfg.board, client_id[3],
+             client_id[4], client_id[5]);
     bps_clock_init(&clk, true);
     bps_anchors_init(&anchors);
     bps_spool_ctx sc = {
