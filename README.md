@@ -521,8 +521,12 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /species`: every species detected so far
   - `GET /detections/{id}/audio/{client_id}`: that client's clip as 16-bit FLAC (clips stored
     before FLAC are converted when the server starts), with an `x-call-range: start,end` header
-    giving the identified call in seconds from the clip's start
+    giving the identified call in seconds from the clip's start. `?format=wav` gives the same
+    samples as 16-bit PCM WAV, for browsers that cannot decode FLAC (Safari on iOS)
   - `GET /detections/{id}/waveform[?client=]`: SVG waveform of the best (or given) clip
+  - `GET /samples/{client_id}/audio?from=&to=[&format=wav]`: what that client recorded over
+    `from..to` (ns, at most 120 s), pieced together from its stored clips; FLAC, or WAV as above
+  - `GET /samples/{client_id}/waveform?from=&to=`: the same as an SVG waveform
   - `GET /events`
   - `GET|DELETE /positioning-request`
 

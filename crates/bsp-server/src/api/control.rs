@@ -464,10 +464,30 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 /// as `start,end` (for drawing it over the clip in the browser).
 const CALL_RANGE: &str = "x-call-range";
 
+#[derive(Deserialize)]
+struct AudioQuery {
+    /// `wav` for 16-bit PCM WAV instead of the stored FLAC, for browsers
+    /// without a FLAC decoder (Safari on iOS).
+    format: Option<String>,
+}
+
+/// Whether `format` asks for WAV (otherwise FLAC, the default).
+fn wants_wav(format: Option<&str>) -> ApiResult<bool> {
+    match format {
+        None | Some("flac") => Ok(false),
+        Some("wav") => Ok(true),
+        Some(f) => Err(ApiError::bad_request(format!(
+            "unknown format {f:?}: use flac or wav"
+        ))),
+    }
+}
+
 async fn detection_audio(
     State(state): State<SharedState>,
     Path((id, client)): Path<(Uuid, ClientId)>,
+    Query(q): Query<AudioQuery>,
 ) -> ApiResult<impl IntoResponse> {
+    let wav = wants_wav(q.format.as_deref())?;
     let clip = state
         .db
         .get_clip(id, client)?
@@ -480,13 +500,19 @@ async fn detection_audio(
         let secs = |t: Timestamp| (t - clip.start) as f64 / NANOS_PER_SEC as f64;
         format!("{:.3},{:.3}", secs(c.start), secs(c.end))
     });
+    let audio = if wav {
+        tokio::task::spawn_blocking(move || clip_audio::wav_from(clip.audio)).await??
+    } else {
+        clip.audio
+    };
+    let content_type = clip_audio::content_type(&audio);
     Ok((
         [
-            (header::CONTENT_TYPE, clip_audio::content_type(&clip.audio)),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, IMMUTABLE),
         ],
         [(CALL_RANGE, range)],
-        clip.audio,
+        audio,
     ))
 }
 
@@ -543,6 +569,8 @@ const MAX_SAMPLE_NS: i64 = 120 * NANOS_PER_SEC;
 struct SampleQuery {
     from: Timestamp,
     to: Timestamp,
+    /// As in [`AudioQuery`]; only `/samples/.../audio` uses it.
+    format: Option<String>,
 }
 
 /// One client's stored audio of `from..to`, pieced together from the clips of
@@ -581,17 +609,27 @@ async fn sample_pcm(
 const SAMPLE_CACHE: &str = "private, max-age=300";
 
 /// `GET /samples/{client}/audio?from=&to=`: what `client` recorded over
-/// `from..to` (ns), as FLAC, for showing several detections on one recording.
+/// `from..to` (ns), as FLAC (or WAV with `format=wav`), for showing several
+/// detections on one recording.
 async fn sample_audio(
     State(state): State<SharedState>,
     Path(client): Path<ClientId>,
     Query(q): Query<SampleQuery>,
 ) -> ApiResult<impl IntoResponse> {
+    let wav = wants_wav(q.format.as_deref())?;
     let (rate, pcm) = sample_pcm(&state, client, &q).await?;
-    let audio = tokio::task::spawn_blocking(move || clip_audio::encode(rate, &pcm)).await?;
+    let audio = tokio::task::spawn_blocking(move || {
+        if wav {
+            bsp_core::audio::encode_wav(rate, &pcm)
+        } else {
+            clip_audio::encode(rate, &pcm)
+        }
+    })
+    .await?;
+    let content_type = clip_audio::content_type(&audio);
     Ok((
         [
-            (header::CONTENT_TYPE, clip_audio::content_type(&audio)),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, SAMPLE_CACHE),
         ],
         audio,

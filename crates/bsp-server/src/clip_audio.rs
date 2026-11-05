@@ -78,6 +78,33 @@ pub fn content_type(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// A stored clip as integer PCM WAV with identical samples (WAV clips are
+/// returned unchanged). For browsers that cannot decode FLAC: Safari on iOS
+/// has no FLAC decoder for Web Audio, but plays PCM WAV.
+pub fn wav_from(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    if !is_flac(&bytes) {
+        return Ok(bytes);
+    }
+    let mut reader = claxon::FlacReader::new(Cursor::new(&bytes)).context("invalid FLAC")?;
+    let info = reader.streaminfo();
+    let spec = hound::WavSpec {
+        channels: info.channels as u16,
+        sample_rate: info.sample_rate,
+        bits_per_sample: info.bits_per_sample as u16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let frames = info.samples.unwrap_or(0) as usize;
+    let mut out = Cursor::new(Vec::with_capacity(44 + frames * spec.channels as usize * 2));
+    {
+        let mut w = hound::WavWriter::new(&mut out, spec)?;
+        for s in reader.samples() {
+            w.write_sample(s?)?;
+        }
+        w.finalize()?;
+    }
+    Ok(out.into_inner())
+}
+
 /// Decodes a stored clip (FLAC or WAV) to mono f32 samples.
 pub fn decode(bytes: &[u8]) -> anyhow::Result<(u32, Vec<f32>)> {
     if !is_flac(bytes) {
@@ -184,6 +211,20 @@ mod tests {
             .map(|v| v as f32 / 32768.0)
             .collect();
         assert_eq!(decode(&flac).unwrap(), (48_000, want));
+    }
+
+    #[test]
+    fn converts_flac_to_wav_losslessly() {
+        let pcm = chirp(10_000);
+        let flac = encode(16_000, &pcm);
+        let wav = wav_from(flac.clone()).unwrap();
+        assert!(is_wav(&wav));
+        assert_eq!(content_type(&wav), "audio/wav");
+        assert_eq!(decode(&wav).unwrap(), decode(&flac).unwrap());
+        // Byte for byte what the WAV encoder writes for the same samples.
+        assert_eq!(wav, audio::encode_wav(16_000, &pcm));
+        // WAV clips pass through.
+        assert_eq!(wav_from(wav.clone()).unwrap(), wav);
     }
 
     #[test]

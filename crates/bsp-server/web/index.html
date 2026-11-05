@@ -592,13 +592,37 @@ function saveClipPrefs() {
 
 /// Fetches and decodes a stored clip: { buffer, call: [startS, endS] or null }.
 let decodeCtx = null;
+/// Recordings are FLAC, but Safari on iOS cannot decode FLAC with Web Audio (MDN: FLAC "is not
+/// supported at all on iOS"); it plays 16-bit PCM WAV, which the server sends with format=wav.
+/// Set once a FLAC fails to decode, so later recordings are fetched as WAV straight away.
+let clipsAsWav = false;
+function withFormat(url, format) { return url + (url.includes("?") ? "&" : "?") + "format=" + format; }
 async function fetchClip(url) {
+  if (!clipsAsWav) {
+    try {
+      return await fetchAndDecode(url);
+    } catch (e) {
+      if (!(e instanceof DecodeError)) throw e;
+      clipsAsWav = true;
+    }
+  }
+  return fetchAndDecode(withFormat(url, "wav"));
+}
+class DecodeError extends Error {}
+async function fetchAndDecode(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   const range = (r.headers.get("x-call-range") || "").split(",").map(parseFloat);
   // An offline context decodes without needing a user gesture first.
   decodeCtx = decodeCtx || new OfflineAudioContext(1, 1, 48000);
-  const buffer = await decodeCtx.decodeAudioData(await r.arrayBuffer());
+  const data = await r.arrayBuffer();
+  let buffer;
+  try {
+    buffer = await decodeCtx.decodeAudioData(data);
+  } catch (e) {
+    // Safari has rejected with null instead of an EncodingError.
+    throw new DecodeError(`cannot decode ${r.headers.get("content-type") || "audio"}: ${e ? e.message || e.name : "unknown error"}`);
+  }
   return { buffer, call: range.length === 2 && range.every(Number.isFinite) ? range : null };
 }
 
