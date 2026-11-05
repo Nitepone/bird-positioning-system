@@ -3,6 +3,7 @@
 
 use anyhow::{Context, bail};
 use bsp_core::audio;
+use bsp_proto::{NANOS_PER_SEC, Timestamp};
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use std::io::Cursor;
@@ -94,6 +95,37 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<(u32, Vec<f32>)> {
     Ok((info.sample_rate, mono))
 }
 
+/// One continuous recording of `from..to` pieced together from decoded clips
+/// `(start, sample_rate, pcm)` of one client: a detection sample holding every
+/// call heard in it. Clips of one client come from the same audio, so where
+/// they overlap they agree; time no clip covers is silent. Clips at another
+/// sample rate than the first are left out. `None` when there are no clips.
+pub fn stitch(
+    clips: &[(Timestamp, u32, Vec<f32>)],
+    from: Timestamp,
+    to: Timestamp,
+) -> Option<(u32, Vec<f32>)> {
+    let sample_rate = clips.first()?.1;
+    let index = |t: Timestamp| {
+        ((t - from) as i128 * sample_rate as i128).div_euclid(NANOS_PER_SEC as i128) as i64
+    };
+    let len = index(to).max(0) as usize;
+    let mut out = vec![0.0f32; len];
+    for (start, rate, pcm) in clips {
+        if *rate != sample_rate {
+            continue;
+        }
+        let offset = index(*start);
+        for (i, &v) in pcm.iter().enumerate() {
+            let j = offset + i as i64;
+            if (0..len as i64).contains(&j) {
+                out[j as usize] = v;
+            }
+        }
+    }
+    Some((sample_rate, out))
+}
+
 /// Re-encodes an integer PCM WAV as FLAC with identical samples.
 pub fn flac_from_wav(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut reader = hound::WavReader::new(Cursor::new(wav)).context("invalid WAV")?;
@@ -159,6 +191,33 @@ mod tests {
         let wav = audio::encode_wav(16_000, &chirp(10_000));
         let flac = flac_from_wav(&wav).unwrap();
         assert_eq!(decode(&flac).unwrap(), decode(&wav).unwrap());
+    }
+
+    #[test]
+    fn stitches_overlapping_clips_into_one_sample() {
+        const S: i64 = NANOS_PER_SEC;
+        // 10 samples/s; the source is 0.0, 0.1, 0.2, ... from t = 0.
+        let src = |from: usize, n: usize| -> Vec<f32> {
+            (from..from + n).map(|i| i as f32 / 10.0).collect()
+        };
+        let clips = vec![
+            (S, 10, src(10, 20)),          // 1.0..3.0 s
+            (2 * S, 10, src(20, 20)),      // 2.0..4.0 s, overlapping the first
+            (6 * S, 10, src(60, 10)),      // 6.0..7.0 s, after a gap
+            (2 * S, 16_000, vec![9.0; 5]), // another sample rate: ignored
+        ];
+        let (rate, pcm) = stitch(&clips, S, 8 * S).unwrap();
+        assert_eq!(rate, 10);
+        assert_eq!(pcm.len(), 70);
+        let mut want: Vec<f32> = src(10, 30);
+        want.extend([0.0; 20]);
+        want.extend(src(60, 10));
+        want.extend([0.0; 10]);
+        assert_eq!(pcm, want);
+        // Cropped to the requested span, which may start inside a clip.
+        let (_, pcm) = stitch(&clips, 3 * S / 2, 2 * S).unwrap();
+        assert_eq!(pcm, src(15, 5));
+        assert!(stitch(&[], 0, S).is_none());
     }
 
     #[test]

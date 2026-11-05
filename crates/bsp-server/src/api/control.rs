@@ -40,6 +40,8 @@ pub fn router() -> Router<SharedState> {
         .route("/species", get(species_seen))
         .route("/detections/{id}/audio/{client_id}", get(detection_audio))
         .route("/detections/{id}/waveform", get(detection_waveform))
+        .route("/samples/{client_id}/audio", get(sample_audio))
+        .route("/samples/{client_id}/waveform", get(sample_waveform))
         .route("/events", get(list_events))
         .route(
             "/positioning-request",
@@ -249,6 +251,33 @@ struct DetectionView {
     detection: Detection,
     /// Clients with a playable clip, best first (see [`clip_order`]).
     clips: Vec<ClientId>,
+    /// Where each of those clips lies in time, for grouping the detections
+    /// one client heard close together into one sample (see `/samples`).
+    clip_spans: Vec<ClipSpan>,
+}
+
+/// The time a stored clip covers.
+#[derive(Serialize)]
+struct ClipSpan {
+    client_id: ClientId,
+    start: Timestamp,
+    /// The end of the audio asked for; the clip may stop short of it.
+    end: Timestamp,
+}
+
+fn clip_spans(d: &Detection, starts: Vec<(ClientId, Timestamp)>) -> Vec<ClipSpan> {
+    starts
+        .into_iter()
+        .filter_map(|(client_id, start)| {
+            let call = d.calls.iter().find(|c| c.client_id == client_id)?;
+            let end = crate::pipeline::clip_window(call).1.max(start);
+            Some(ClipSpan {
+                client_id,
+                start,
+                end,
+            })
+        })
+        .collect()
 }
 
 /// Orders the clients that have clips: the locator's reference (loudest)
@@ -277,8 +306,10 @@ async fn list_detections(
         .list_detections(&filter, q.limit.unwrap_or(100).min(1000))?;
     let mut out = Vec::with_capacity(detections.len());
     for d in detections {
-        let clips = clip_order(&d, state.db.clip_clients(d.id)?);
+        let starts = state.db.clip_starts(d.id)?;
+        let clips = clip_order(&d, starts.iter().map(|(c, _)| *c).collect());
         out.push(DetectionView {
+            clip_spans: clip_spans(&d, starts),
             detection: d,
             clips,
         });
@@ -452,6 +483,86 @@ async fn detection_waveform(
         [
             (header::CONTENT_TYPE, "image/svg+xml"),
             (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        svg,
+    ))
+}
+
+/// Longest sample `/samples/.../audio` pieces together.
+const MAX_SAMPLE_NS: i64 = 120 * NANOS_PER_SEC;
+
+#[derive(Deserialize)]
+struct SampleQuery {
+    from: Timestamp,
+    to: Timestamp,
+}
+
+/// One client's stored audio of `from..to`, pieced together from the clips of
+/// every detection it heard then (see [`clip_audio::stitch`]).
+async fn sample_pcm(
+    state: &SharedState,
+    client: ClientId,
+    q: &SampleQuery,
+) -> ApiResult<(u32, Vec<f32>)> {
+    if q.to <= q.from || q.to - q.from > MAX_SAMPLE_NS {
+        return Err(ApiError::bad_request(format!(
+            "`to` must be after `from`, by at most {} s",
+            MAX_SAMPLE_NS / NANOS_PER_SEC
+        )));
+    }
+    let clips =
+        state
+            .db
+            .clips_starting_between(client, q.from - crate::pipeline::MAX_CLIP_NS, q.to)?;
+    let (from, to) = (q.from, q.to);
+    tokio::task::spawn_blocking(move || {
+        let decoded: Vec<_> = clips
+            .into_iter()
+            .filter_map(|c| {
+                let (rate, pcm) = clip_audio::decode(&c.audio).ok()?;
+                Some((c.start, rate, pcm))
+            })
+            .collect();
+        clip_audio::stitch(&decoded, from, to)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found("audio"))
+}
+
+/// Samples change only when a detection's clip is added in their span.
+const SAMPLE_CACHE: &str = "private, max-age=300";
+
+/// `GET /samples/{client}/audio?from=&to=`: what `client` recorded over
+/// `from..to` (ns), as FLAC, for showing several detections on one recording.
+async fn sample_audio(
+    State(state): State<SharedState>,
+    Path(client): Path<ClientId>,
+    Query(q): Query<SampleQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let (rate, pcm) = sample_pcm(&state, client, &q).await?;
+    let audio = tokio::task::spawn_blocking(move || clip_audio::encode(rate, &pcm)).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, clip_audio::content_type(&audio)),
+            (header::CACHE_CONTROL, SAMPLE_CACHE),
+        ],
+        audio,
+    ))
+}
+
+/// `GET /samples/{client}/waveform?from=&to=`: the same as a waveform image,
+/// without highlights (the web UI draws one per detection over it).
+async fn sample_waveform(
+    State(state): State<SharedState>,
+    Path(client): Path<ClientId>,
+    Query(q): Query<SampleQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let (_, pcm) = sample_pcm(&state, client, &q).await?;
+    let svg = tokio::task::spawn_blocking(move || waveform::render_svg(&pcm, None)).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, SAMPLE_CACHE),
         ],
         svg,
     ))

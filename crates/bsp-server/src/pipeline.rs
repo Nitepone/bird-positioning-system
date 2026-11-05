@@ -18,7 +18,7 @@ const LOCATOR_CONTEXT_NS: i64 = 500 * NANOS_PER_MS;
 /// Context kept around each call in the stored playback clips.
 const CLIP_CONTEXT_NS: i64 = 500 * NANOS_PER_MS;
 /// Upper bound on a stored clip's length.
-const MAX_CLIP_NS: i64 = 10 * NANOS_PER_SEC;
+pub const MAX_CLIP_NS: i64 = 10 * NANOS_PER_SEC;
 
 pub async fn run(
     state: SharedState,
@@ -162,11 +162,17 @@ fn usable_together<T>(items: impl IntoIterator<Item = (T, bool, Option<Bssid>)>)
         .collect()
 }
 
+/// The span of audio stored as `call`'s clip (the clip may be shorter, if the
+/// client's buffered audio did not reach that far).
+pub fn clip_window(call: &Call) -> (Timestamp, Timestamp) {
+    let from = call.start - CLIP_CONTEXT_NS;
+    (from, (call.end + CLIP_CONTEXT_NS).min(from + MAX_CLIP_NS))
+}
+
 /// Saves each client's audio around its call, for playback in the web UI.
 fn store_clips(state: &SharedState, d: &Detection) {
     for call in &d.calls {
-        let from = call.start - CLIP_CONTEXT_NS;
-        let to = (call.end + CLIP_CONTEXT_NS).min(from + MAX_CLIP_NS);
+        let (from, to) = clip_window(call);
         let Some((start, sample_rate, pcm)) = state.audio.extract(call.client_id, from, to) else {
             continue;
         };

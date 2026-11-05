@@ -37,6 +37,8 @@ use tokio::sync::mpsc;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 /// Charting library for the web UI, embedded so the UI works offline.
 const ECHARTS_JS: &str = include_str!("../web/vendor/echarts-6.1.0/echarts.min.js");
+/// Detections page: grouping detections into the audio samples they were heard in.
+const DETECTION_SAMPLES_JS: &str = include_str!("../web/detection-samples.js");
 const CLIENT_HTML: &str = include_str!("../web/client.html");
 const CLIENT_WORKLET_JS: &str = include_str!("../web/client-worklet.js");
 
@@ -136,6 +138,15 @@ pub fn web_router(state: SharedState) -> Router {
                         ),
                     ],
                     ECHARTS_JS,
+                )
+            }),
+        )
+        .route(
+            "/static/detection-samples.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    DETECTION_SAMPLES_JS,
                 )
             }),
         )
@@ -272,4 +283,30 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         result = &mut web_task => result??,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The web UI's own unit tests (`web/*.test.js`), when node is installed.
+    #[test]
+    fn web_ui_js_tests() {
+        let web = concat!(env!("CARGO_MANIFEST_DIR"), "/web");
+        let out = match std::process::Command::new("node")
+            .args(["--test", "detection-samples.test.js"])
+            .current_dir(web)
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping the web UI's tests: cannot run node: {e}");
+                return;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "web UI tests failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

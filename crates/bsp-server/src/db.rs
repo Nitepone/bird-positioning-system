@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS detection_clips (
     audio BLOB NOT NULL,
     PRIMARY KEY (detection_id, client_id)
 );
+CREATE INDEX IF NOT EXISTS detection_clips_client_start ON detection_clips(client_id, start);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -534,6 +535,44 @@ impl Db {
             conn.prepare_cached("SELECT client_id FROM detection_clips WHERE detection_id = ?1")?;
         let rows = stmt.query_map([detection.to_string()], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()?.parse().ok()).collect())
+    }
+
+    /// Start of each stored clip of `detection`, by client.
+    pub fn clip_starts(&self, detection: Uuid) -> rusqlite::Result<Vec<(ClientId, Timestamp)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT client_id, start FROM detection_clips WHERE detection_id = ?1",
+        )?;
+        let rows = stmt.query_map([detection.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Timestamp>(1)?))
+        })?;
+        Ok(rows
+            .filter_map(|r| {
+                let (c, start) = r.ok()?;
+                Some((c.parse().ok()?, start))
+            })
+            .collect())
+    }
+
+    /// `client`'s clips (of any detection) starting in `from..to`, oldest first.
+    pub fn clips_starting_between(
+        &self,
+        client: ClientId,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> rusqlite::Result<Vec<Clip>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT start, audio FROM detection_clips
+             WHERE client_id = ?1 AND start >= ?2 AND start < ?3 ORDER BY start",
+        )?;
+        stmt.query_map(params![client.to_string(), from, to], |r| {
+            Ok(Clip {
+                start: r.get(0)?,
+                audio: r.get(1)?,
+            })
+        })?
+        .collect()
     }
 
     /// Removes detections (and their clips) below `min_confidence`, re-encodes
