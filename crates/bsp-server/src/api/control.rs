@@ -4,7 +4,7 @@ use super::{ApiError, ApiResult};
 use crate::beacon_clock::TsfLine;
 use crate::clip_audio;
 use crate::clock_history::{self, ClockReport};
-use crate::db::{ClientRecord, DetectionFilter, Event, SpeciesSeen};
+use crate::db::{self, BatteryPoint, ClientRecord, DetectionFilter, Event, SpeciesSeen};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
 use crate::state::{PositioningRequest, SharedState};
 use crate::waveform;
@@ -35,6 +35,8 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/clients/{id}/clock", get(client_clock))
         .route("/clients/{id}/mode", put(set_client_mode))
+        .route("/clients/{id}/battery_history", get(battery_history))
+        .route("/clients/{id}/detections_hourly", get(detections_hourly))
         .route("/detections", get(list_detections))
         .route("/timeline", get(timeline))
         .route("/species", get(species_seen))
@@ -237,6 +239,52 @@ async fn client_clock(
         "max_clock_offset_us": state.cfg.max_clock_offset_us,
         "heartbeat_interval_s": state.cfg.clients.heartbeat_interval_s,
         "reports": reports,
+    })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    hours: Option<u32>,
+}
+
+/// `GET /clients/{id}/battery_history?hours=`: the client's battery readings
+/// over the last `hours` (default 24, at most the retained week), oldest first.
+async fn battery_history(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+    Query(q): Query<HistoryQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if state.db.get_client(id)?.is_none() {
+        return Err(ApiError::not_found("client"));
+    }
+    let now = now_ns();
+    let span_ns =
+        (q.hours.unwrap_or(24).max(1) as i64 * db::HOUR_NS).min(db::BATTERY_HISTORY_RETENTION_NS);
+    let points: Vec<BatteryPoint> = state.db.battery_history(id, now - span_ns)?;
+    Ok(Json(json!({
+        "server_time": now,
+        "from": now - span_ns,
+        "points": points,
+    })))
+}
+
+/// `GET /clients/{id}/detections_hourly`: the detections the client heard
+/// over the last 24 hours, in 24 hourly buckets ending now, oldest first
+/// (see [`db::Db::detections_hourly`]).
+async fn detections_hourly(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if state.db.get_client(id)?.is_none() {
+        return Err(ApiError::not_found("client"));
+    }
+    let now = now_ns();
+    let counts = state.db.detections_hourly(id, now)?;
+    Ok(Json(json!({
+        "server_time": now,
+        "from": now - 24 * db::HOUR_NS,
+        "bucket_ns": db::HOUR_NS,
+        "counts": counts,
     })))
 }
 

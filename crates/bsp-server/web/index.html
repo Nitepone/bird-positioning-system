@@ -217,6 +217,10 @@
   .client-section > summary { cursor: pointer; padding: 6px 0; font-weight: 600; font-size: 15px; }
   .client-section > summary .summary-note { font-weight: normal; font-size: 13px; color: var(--ink-2); margin-left: 0.6em; }
   .client-section > .section-body { padding-bottom: 0.6em; }
+  .chart-head { font-weight: 600; font-size: 13px; margin: 0.4em 0 2px; }
+  .chart-head select { font-weight: normal; margin-left: 0.6em; }
+  .mini-chart { width: 100%; height: 200px; }
+  .mini-chart + .empty { padding: 1em 0; }
   .info { cursor: help; color: var(--ink-2); font-weight: normal; }
   /* A charging battery, as its charger reports it. */
   .charging { color: var(--ok); border: 1px solid currentColor; border-radius: 1em; padding: 0 6px;
@@ -432,6 +436,9 @@
         <summary>Statistics <span class="summary-note" id="sum-stats"></span></summary>
         <div class="section-body">
           <div class="tiles" id="stats-tiles"></div>
+          <div class="chart-head">Detections per hour, last 24 h</div>
+          <div id="det-chart" class="mini-chart"></div>
+          <p class="empty" id="det-chart-empty" hidden></p>
         </div>
       </details>
 
@@ -439,6 +446,14 @@
         <summary>Hardware Info <span class="summary-note" id="sum-hardware"></span></summary>
         <div class="section-body">
           <div class="tiles" id="hardware-tiles"></div>
+          <div class="chart-head">Battery level
+            <select id="battery-range" onchange="refreshClientsPage()" aria-label="Battery chart range">
+              <option value="24" selected>last 24 h</option>
+              <option value="72">last 3 days</option>
+              <option value="168">last 7 days</option>
+            </select></div>
+          <div id="battery-chart" class="mini-chart"></div>
+          <p class="empty" id="battery-chart-empty" hidden></p>
           <h4>Operation mode <span class="info" id="mode-info" tabindex="0"></span></h4>
           <form class="filters" id="mode-form" onsubmit="saveMode(event)">
             <label>Mode <select id="mode-select" onchange="modeFormChanged()">
@@ -1810,12 +1825,36 @@ function deviceWhere(d) {
   return d.address >= 0 ? `SPI, chip select ${d.address}` : "SPI";
 }
 
+// The selected client's battery history and hourly detections, fetched when
+// the client or range changes and every HISTORY_REFRESH_MS otherwise.
+const HISTORY_REFRESH_MS = 30000;
+let historyData = null;  // { key, battery, detections }
+let historyAt = 0;
+let batteryChart = null, detChart = null;
+
+function historyKey(id) { return `${id}/${document.getElementById("battery-range").value}`; }
+
+async function refreshClientHistory(id) {
+  const key = historyKey(id);
+  if (historyData?.key === key && Date.now() - historyAt < HISTORY_REFRESH_MS) return;
+  const hours = document.getElementById("battery-range").value;
+  const [battery, detections] = await Promise.all([
+    api(`/clients/${id}/battery_history?hours=${hours}`),
+    api(`/clients/${id}/detections_hourly`),
+  ]);
+  if (historyKey(clockClient) !== key) return;  // another client or range was chosen meanwhile
+  historyData = { key, battery, detections };
+  historyAt = Date.now();
+}
+
 async function refreshClientsPage() {
   if (!clients.some(c => c.id === clockClient)) clockClient = (clients.find(c => c.active) || clients[0])?.id ?? null;
   renderClientTable();
   if (!clockClient) { clockData = null; renderClientDetail(); return; }
-  const minutes = document.getElementById("clock-range").value;
-  clockData = await api(`/clients/${clockClient}/clock?minutes=${minutes}`);
+  const id = clockClient, minutes = document.getElementById("clock-range").value;
+  const [clock] = await Promise.all([api(`/clients/${id}/clock?minutes=${minutes}`), refreshClientHistory(id)]);
+  if (id !== clockClient) return;
+  clockData = clock;
   renderClientDetail();
 }
 
@@ -1890,11 +1929,14 @@ function renderClientDetail() {
   ].join("");
 
   // Statistics: what the device collected.
-  document.getElementById("sum-stats").textContent = h ? `${h.chunks_sent} chunks sent` : "";
-  document.getElementById("stats-tiles").innerHTML = h
-    ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
-      `${h.chunks_gated} gated ${info("Gated: quiet chunks the client did not send. Counted since it started.")}`)
-    : tile("Audio chunks", "-", "no heartbeat stored yet");
+  const det = historyData?.key === historyKey(c.id) ? historyData.detections : null;
+  const detTotal = det ? det.counts.reduce((a, b) => a + b, 0) : null;
+  document.getElementById("sum-stats").textContent = detTotal == null ? "" : `${detTotal} detections in 24 h`;
+  document.getElementById("stats-tiles").innerHTML = [
+    tile("Detections, 24 h", detTotal ?? "-", det ? `peak ${Math.max(...det.counts)} in an hour` : "loading"),
+    h ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
+      `${h.chunks_gated} gated ${info("Gated: quiet chunks the client did not send. Counted since it started.")}`) : "",
+  ].join("");
 
   // Hardware Info: power, storage, radio, devices, firmware.
   const bat = batteryView(c), card = storageView(c), md = modeView(c);
@@ -1916,7 +1958,93 @@ function renderClientDetail() {
   ].join("");
   fillModeForm(c);
 
+  const charts = typeof echarts !== "undefined";
+  const bh = historyData?.key === historyKey(c.id) ? historyData.battery : null;
+  renderBatteryChart(charts && bh, bh ? (bh.points.length ? "" : "No battery readings in this range.") : "Loading…");
+  renderDetChart(charts && det, det ? (detTotal ? "" : "No detections by this client in the last 24 h.") : "Loading…");
   renderClockDetail();
+}
+
+/// Shows `chartId` or, when `empty` is set, the message in its place.
+function chartOrEmpty(chartId, empty) {
+  const el = document.getElementById(chartId), msg = document.getElementById(chartId + "-empty");
+  if (typeof echarts === "undefined") empty = "The charting library failed to load.";
+  el.hidden = !!empty;
+  msg.hidden = !empty;
+  msg.textContent = empty;
+  return !empty && el.offsetWidth > 0;  // false while its section is closed
+}
+
+function chartColors() {
+  return { surface: cssVar("--surface"), ink: cssVar("--ink"), ink2: cssVar("--ink-2"),
+           grid: cssVar("--grid"), axis: cssVar("--axis"), s1: cssVar("--tick"), ok: cssVar("--ok") };
+}
+
+function renderBatteryChart(data, empty) {
+  if (!chartOrEmpty("battery-chart", empty) || !data) return;
+  if (!batteryChart) batteryChart = echarts.init(document.getElementById("battery-chart"));
+  batteryChart.resize();
+  const k = chartColors();
+  // A break in the line where readings stopped for a while (client off or out of reach).
+  const GAP_MS = 30 * 60e3, rows = [];
+  for (const p of data.points) {
+    const prev = rows.at(-1);
+    if (prev && p.at / 1e6 - prev.ms > GAP_MS) rows.push({ ms: (prev.ms + p.at / 1e6) / 2, gap: true });
+    rows.push({ ms: p.at / 1e6, p });
+  }
+  batteryChart.setOption({
+    animation: false,
+    textStyle: { fontFamily: getComputedStyle(document.body).fontFamily },
+    grid: { left: 48, right: 24, top: 12, bottom: 28 },
+    xAxis: { type: "time", min: data.from / 1e6, max: data.server_time / 1e6,
+             axisLabel: { color: k.ink2, hideOverlap: true }, axisLine: { lineStyle: { color: k.axis } },
+             axisTick: { lineStyle: { color: k.axis } }, splitLine: { show: false } },
+    yAxis: { type: "value", min: 0, max: 100, interval: 25, axisLabel: { color: k.ink2, formatter: "{value}%" },
+             splitLine: { lineStyle: { color: k.grid } } },
+    tooltip: {
+      trigger: "axis", confine: true, backgroundColor: k.surface, borderColor: k.axis, textStyle: { color: k.ink },
+      axisPointer: { lineStyle: { color: k.axis } },
+      formatter: ps => {
+        const r = rows[ps[0]?.dataIndex];
+        if (!r || r.gap) return "";
+        return `<b>${fmtTime(r.p.at)}</b><br>${Math.min(100, r.p.percent).toFixed(1)}% · ${r.p.voltage_v.toFixed(2)} V` +
+          (r.p.charging ? "<br>Charging" : "");
+      },
+    },
+    series: [{
+      name: "Battery", type: "line", data: rows.map(r => [r.ms, r.gap ? null : Math.min(100, r.p.percent)]),
+      showSymbol: data.points.length === 1, symbolSize: 8, connectNulls: false,
+      lineStyle: { width: 2, color: k.s1 }, itemStyle: { color: k.s1 },
+    }],
+  }, { replaceMerge: ["series"] });
+}
+
+function renderDetChart(data, empty) {
+  if (!chartOrEmpty("det-chart", empty) || !data) return;
+  if (!detChart) detChart = echarts.init(document.getElementById("det-chart"));
+  detChart.resize();
+  const k = chartColors();
+  const hhmm = ns => fmtClock(ns / 1e6, false);
+  const starts = data.counts.map((_, i) => data.from + i * data.bucket_ns);
+  detChart.setOption({
+    animation: false,
+    textStyle: { fontFamily: getComputedStyle(document.body).fontFamily },
+    grid: { left: 48, right: 24, top: 12, bottom: 28 },
+    xAxis: { type: "category", data: starts.map(hhmm), axisLabel: { color: k.ink2, interval: 3 },
+             axisLine: { lineStyle: { color: k.axis } }, axisTick: { alignWithLabel: true, lineStyle: { color: k.axis } } },
+    yAxis: { type: "value", minInterval: 1, axisLabel: { color: k.ink2 }, splitLine: { lineStyle: { color: k.grid } } },
+    tooltip: {
+      trigger: "item", confine: true, backgroundColor: k.surface, borderColor: k.axis, textStyle: { color: k.ink },
+      formatter: p => `${hhmm(starts[p.dataIndex])}–${hhmm(starts[p.dataIndex] + data.bucket_ns)}<br>` +
+        `<b>${p.value}</b> detection${p.value === 1 ? "" : "s"}`,
+    },
+    series: [{
+      name: "Detections", type: "bar", data: data.counts, barCategoryGap: "20%",
+      itemStyle: { color: k.s1, borderRadius: [4, 4, 0, 0] },
+      // Hovering anywhere in an hour's column, not just on its bar.
+      showBackground: true, backgroundStyle: { color: "transparent" },
+    }],
+  }, { replaceMerge: ["series"] });
 }
 
 // The mode form keeps what is being typed while the page refreshes; it is

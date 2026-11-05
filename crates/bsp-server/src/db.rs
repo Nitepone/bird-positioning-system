@@ -6,7 +6,7 @@ use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
     BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, ModeSetting,
-    ModeStatus, RegisterRequest, StorageStatus, Timestamp, Uuid,
+    ModeStatus, NANOS_PER_SEC, RegisterRequest, StorageStatus, Timestamp, Uuid,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,26 @@ pub struct Clip {
     pub audio: Vec<u8>,
 }
 
+/// How long battery readings are kept, for the client page's battery chart.
+pub const BATTERY_HISTORY_RETENTION_NS: i64 = 7 * 86_400 * NANOS_PER_SEC;
+/// At most one battery reading is kept per this interval and client (plus
+/// any reading where the reported charging state changes), so a client's
+/// week of heartbeats stays a few thousand rows.
+pub const BATTERY_HISTORY_STEP_NS: i64 = 60 * NANOS_PER_SEC;
+/// The width of [`Db::detections_hourly`]'s buckets.
+pub const HOUR_NS: i64 = 3600 * NANOS_PER_SEC;
+
+/// A battery reading from a heartbeat, as kept in the history.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct BatteryPoint {
+    /// When the heartbeat arrived.
+    pub at: Timestamp,
+    pub percent: f32,
+    pub voltage_v: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+}
+
 /// What [`Db::maintain`] changed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Maintenance {
@@ -161,6 +181,14 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS battery_history (
+    client_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    percent REAL NOT NULL,
+    voltage_v REAL NOT NULL,
+    charging INTEGER
+);
+CREATE INDEX IF NOT EXISTS battery_history_client_ts ON battery_history(client_id, ts);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -191,6 +219,43 @@ fn add_column_if_missing(
     if !column_exists(conn, table, column)? {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     }
+    Ok(())
+}
+
+/// Adds a heartbeat's battery reading to the history (unless one was kept
+/// less than [`BATTERY_HISTORY_STEP_NS`] before it with the same charging
+/// state), and drops the client's readings past the retention.
+fn record_battery(
+    conn: &Connection,
+    id: ClientId,
+    at: Timestamp,
+    b: &BatteryStatus,
+) -> rusqlite::Result<()> {
+    let id = id.to_string();
+    let last: Option<(i64, Option<bool>)> = conn
+        .prepare_cached(
+            "SELECT ts, charging FROM battery_history WHERE client_id = ?1 ORDER BY ts DESC LIMIT 1",
+        )?
+        .query_row([&id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    if last
+        .is_some_and(|(ts, charging)| at - ts < BATTERY_HISTORY_STEP_NS && charging == b.charging)
+    {
+        return Ok(());
+    }
+    conn.prepare_cached(
+        "INSERT INTO battery_history (client_id, ts, percent, voltage_v, charging)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        id,
+        at,
+        b.percent as f64,
+        b.voltage_v as f64,
+        b.charging
+    ])?;
+    conn.prepare_cached("DELETE FROM battery_history WHERE client_id = ?1 AND ts < ?2")?
+        .execute(params![id, at - BATTERY_HISTORY_RETENTION_NS])?;
     Ok(())
 }
 
@@ -323,7 +388,54 @@ impl Db {
                 json(health)
             ],
         )?;
+        if n > 0
+            && let Some(b) = health.battery
+        {
+            record_battery(&conn, id, health.at, &b)?;
+        }
         Ok(n > 0)
+    }
+
+    /// The client's battery readings at or after `since`, oldest first.
+    pub fn battery_history(
+        &self,
+        id: ClientId,
+        since: Timestamp,
+    ) -> rusqlite::Result<Vec<BatteryPoint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT ts, percent, voltage_v, charging FROM battery_history
+             WHERE client_id = ?1 AND ts >= ?2 ORDER BY ts",
+        )?;
+        stmt.query_map(params![id.to_string(), since], |r| {
+            Ok(BatteryPoint {
+                at: r.get(0)?,
+                percent: r.get::<_, f64>(1)? as f32,
+                voltage_v: r.get::<_, f64>(2)? as f32,
+                charging: r.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Detections the client heard over the 24 hours up to `now`, counted in
+    /// hourly buckets, oldest first: bucket `i` covers
+    /// `(now - (24 - i) h, now - (23 - i) h]`. Every bucket is present, empty
+    /// hours as 0; older detections (and any after `now`) are left out.
+    pub fn detections_hourly(&self, id: ClientId, now: Timestamp) -> rusqlite::Result<[u32; 24]> {
+        let from = now - 24 * HOUR_NS;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT time FROM detections
+             WHERE time > ?1 AND time <= ?2 AND EXISTS (
+                 SELECT 1 FROM json_each(body, '$.calls') WHERE json_extract(value, '$.client_id') = ?3)",
+        )?;
+        let mut counts = [0u32; 24];
+        for t in stmt.query_map(params![from, now, id.to_string()], |r| r.get::<_, i64>(0))? {
+            let i = ((t? - from - 1) / HOUR_NS).clamp(0, 23) as usize;
+            counts[i] += 1;
+        }
+        Ok(counts)
     }
 
     /// Sets the user-configured name and position. Returns false if unknown.
@@ -375,6 +487,10 @@ impl Db {
 
     pub fn delete_client(&self, id: ClientId) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM battery_history WHERE client_id = ?1",
+            [id.to_string()],
+        )?;
         Ok(conn.execute("DELETE FROM clients WHERE id = ?1", [id.to_string()])? > 0)
     }
 
@@ -1084,5 +1200,113 @@ mod tests {
                 ("Common Raven", 1, 200)
             ]
         );
+    }
+
+    #[test]
+    fn counts_a_clients_detections_by_hour_over_the_last_day() {
+        let db = Db::in_memory().unwrap();
+        let now = 100 * HOUR_NS + 123;
+        let ago = |h: f64| now - (h * HOUR_NS as f64) as i64;
+        for d in [
+            detection(ago(30.0), "a", "A", &[1], 0.9, false), // over a day ago
+            detection(now - 24 * HOUR_NS, "a", "A", &[1], 0.9, false), // exactly a day: out
+            detection(ago(23.5), "a", "A", &[1, 2], 0.9, false), // oldest bucket
+            detection(ago(2.5), "a", "A", &[1], 0.9, false),
+            detection(ago(2.2), "a", "A", &[1], 0.9, false),
+            detection(ago(2.1), "a", "A", &[2], 0.9, false), // another client's
+            detection(ago(0.1), "a", "A", &[1], 0.9, false), // newest bucket
+            detection(now, "a", "A", &[1], 0.9, false),
+            detection(now + 5, "a", "A", &[1], 0.9, false), // after now: out
+        ] {
+            db.insert_detection(&d).unwrap();
+        }
+        let counts = db.detections_hourly(Uuid::from_u128(1), now).unwrap();
+        assert_eq!(counts.len(), 24);
+        let mut want = [0u32; 24];
+        want[0] = 1; // 23.5 h ago
+        want[21] = 2; // 2.5 and 2.2 h ago
+        want[23] = 2; // 0.1 h ago, and now
+        assert_eq!(counts, want);
+        // Hours with nothing are there, as zero.
+        assert_eq!(counts.iter().filter(|&&n| n == 0).count(), 21);
+        let other = db.detections_hourly(Uuid::from_u128(2), now).unwrap();
+        assert_eq!(other.iter().sum::<u32>(), 2);
+        assert_eq!((other[0], other[21]), (1, 1));
+        assert_eq!(
+            db.detections_hourly(Uuid::from_u128(9), now).unwrap(),
+            [0; 24]
+        );
+    }
+
+    #[test]
+    fn keeps_battery_history_per_client() {
+        let db = Db::in_memory().unwrap();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for id in [a, b] {
+            db.register_client(&register_request(id), "", "addr", 1)
+                .unwrap();
+        }
+        let s = 1_000_000_000i64;
+        let beat = |id, at: i64, percent: f32, charging: Option<bool>| {
+            let health = ClientHealth {
+                at,
+                uptime_s: 0,
+                chunks_sent: 0,
+                chunks_gated: 0,
+                battery: Some(BatteryStatus {
+                    percent,
+                    voltage_v: 3.8,
+                    rate_pct_per_h: None,
+                    charging,
+                }),
+                storage: None,
+                devices: Vec::new(),
+                mode: None,
+            };
+            db.record_heartbeat(id, "addr", None, &health).unwrap();
+        };
+        beat(a, 1000 * s, 80.0, None);
+        beat(a, 1010 * s, 79.9, None); // within a minute: not kept
+        beat(a, 1020 * s, 79.8, Some(true)); // charging state changed: kept
+        beat(a, 1090 * s, 81.0, Some(true));
+        beat(b, 1000 * s, 50.0, Some(false));
+        let no_battery = ClientHealth {
+            at: 1200 * s,
+            uptime_s: 0,
+            chunks_sent: 0,
+            chunks_gated: 0,
+            battery: None,
+            storage: None,
+            devices: Vec::new(),
+            mode: None,
+        };
+        db.record_heartbeat(a, "addr", None, &no_battery).unwrap();
+
+        let h = db.battery_history(a, 0).unwrap();
+        let at: Vec<i64> = h.iter().map(|p| p.at / s).collect();
+        assert_eq!(at, [1000, 1020, 1090]);
+        assert_eq!(h[1].charging, Some(true));
+        assert_eq!(h[0].charging, None);
+        assert_eq!(db.battery_history(a, 1050 * s).unwrap().len(), 1);
+        assert_eq!(db.battery_history(b, 0).unwrap().len(), 1);
+
+        // Readings older than the retention go as new ones come in.
+        beat(
+            a,
+            1090 * s + BATTERY_HISTORY_RETENTION_NS - s,
+            70.0,
+            Some(true),
+        );
+        let at: Vec<i64> = db
+            .battery_history(a, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.at)
+            .collect();
+        assert_eq!(at, [1090 * s, 1090 * s + BATTERY_HISTORY_RETENTION_NS - s]);
+
+        db.delete_client(a).unwrap();
+        assert!(db.battery_history(a, 0).unwrap().is_empty());
+        assert_eq!(db.battery_history(b, 0).unwrap().len(), 1);
     }
 }
