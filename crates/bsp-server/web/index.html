@@ -211,6 +211,12 @@
   #client-detail .tile { min-width: 9em; }
   #client-detail .tile .value { font-size: 20px; font-variant-numeric: tabular-nums; }
   #clock-chart { width: 100%; height: 540px; }
+  .client-top { display: flex; flex-wrap: wrap; gap: 0.3em 2em; margin-bottom: 0.6em; }
+  .client-top .label { color: var(--ink-2); font-size: 12px; margin-right: 0.4em; }
+  .client-section { border-top: 1px solid var(--cell-border); }
+  .client-section > summary { cursor: pointer; padding: 6px 0; font-weight: 600; font-size: 15px; }
+  .client-section > summary .summary-note { font-weight: normal; font-size: 13px; color: var(--ink-2); margin-left: 0.6em; }
+  .client-section > .section-body { padding-bottom: 0.6em; }
 </style>
 </head>
 <body>
@@ -414,32 +420,49 @@
   <div class="card" id="client-detail" hidden>
     <h3 id="client-title"></h3>
     <div class="body">
-      <p class="hint" id="client-meta"></p>
-      <h4>Health</h4>
-      <div class="tiles" id="health-tiles"></div>
-      <h4>Operation mode</h4>
-      <form class="filters" id="mode-form" onsubmit="saveMode(event)">
-        <label>Mode <select id="mode-select" onchange="modeFormChanged()">
-          <option value="live">Live: always connected</option>
-          <option value="batch">Batch: radio off between contacts</option>
-        </select></label>
-        <label id="mode-interval-label">contact every <input id="mode-interval" type="number" min="30" max="3600"
-          step="30" style="width: 6em" oninput="modeFormChanged()"> s</label>
-        <button type="submit">Set</button>
-        <span id="mode-msg"></span>
-      </form>
-      <p class="hint" id="mode-hint"></p>
-      <h4>Clock</h4>
-      <div class="filters">
-        <label>Range <select id="clock-range" onchange="refreshClientsPage()">
-          <option value="15">last 15 min</option>
-          <option value="30" selected>last 30 min</option>
-          <option value="60">last hour</option>
-        </select></label>
-      </div>
-      <div class="tiles" id="clock-tiles"></div>
-      <div id="clock-chart"></div>
-      <p class="hint" id="clock-foot"></p>
+      <div class="client-top" id="client-top"></div>
+
+      <details class="client-section" id="sec-stats" open>
+        <summary>Statistics <span class="summary-note" id="sum-stats"></span></summary>
+        <div class="section-body">
+          <div class="tiles" id="stats-tiles"></div>
+        </div>
+      </details>
+
+      <details class="client-section" id="sec-hardware" open>
+        <summary>Hardware Info <span class="summary-note" id="sum-hardware"></span></summary>
+        <div class="section-body">
+          <div class="tiles" id="hardware-tiles"></div>
+          <h4>Operation mode</h4>
+          <form class="filters" id="mode-form" onsubmit="saveMode(event)">
+            <label>Mode <select id="mode-select" onchange="modeFormChanged()">
+              <option value="live">Live: always connected</option>
+              <option value="batch">Batch: radio off between contacts</option>
+            </select></label>
+            <label id="mode-interval-label">contact every <input id="mode-interval" type="number" min="30" max="3600"
+              step="30" style="width: 6em" oninput="modeFormChanged()"> s</label>
+            <button type="submit">Set</button>
+            <span id="mode-msg"></span>
+          </form>
+          <p class="hint" id="mode-hint"></p>
+        </div>
+      </details>
+
+      <details class="client-section" id="sec-clocks" open>
+        <summary>Clocks <span class="summary-note" id="sum-clocks"></span></summary>
+        <div class="section-body">
+          <div class="filters">
+            <label>Range <select id="clock-range" onchange="refreshClientsPage()">
+              <option value="15">last 15 min</option>
+              <option value="30" selected>last 30 min</option>
+              <option value="60">last hour</option>
+            </select></label>
+          </div>
+          <div class="tiles" id="clock-tiles"></div>
+          <div id="clock-chart"></div>
+          <p class="hint" id="clock-foot"></p>
+        </div>
+      </details>
     </div>
   </div>
 </section>
@@ -1735,12 +1758,16 @@ function modeView(c) {
     }
   }
   if (m.backlog) parts.push(`${m.backlog} recording${m.backlog === 1 ? "" : "s"} (${fmtBytes(m.backlog_bytes)}) on the card to upload`);
-  if (m.gap) {
-    const us = ns => (ns / 1e3).toFixed(0) + " µs";
-    parts.push(`after ${fmtDuration(m.gap.off_s)} off, its clock was ${us(m.gap.clock_ns)} from where its drift put it` +
-      (m.gap.tsf_ns != null ? ` (${us(m.gap.tsf_ns)} against its access point)` : ""));
-  }
   return { text: name(m), sub: parts.join(" · "), cls: m.note ? "bad" : "" };
+}
+
+/// How far a batch client's clock moved while its radio was last off, or "".
+function radioGapText(c) {
+  const g = c.health?.mode?.gap;
+  if (!g) return "";
+  const us = ns => (ns / 1e3).toFixed(0) + " µs";
+  return `after ${fmtDuration(g.off_s)} off, its clock was ${us(g.clock_ns)} from where its drift put it` +
+    (g.tsf_ns != null ? ` (${us(g.tsf_ns)} against its access point)` : "");
 }
 
 /// The storage card as { text, sub, cls }, or null if the client has no slot.
@@ -1805,36 +1832,74 @@ function tile(label, value, sub, cls) {
   return `<div class="tile"><div class="label">${label}</div><div class="value ${cls || ""}">${value}</div><div class="sub">${sub}</div></div>`;
 }
 
+/// "10.0.0.7" from "10.0.0.7:51234" or "[fe80::1]:51234".
+function addrHost(addr) {
+  const m = /^\[(.*)\]:\d+$/.exec(addr) || /^([^:]*):\d+$/.exec(addr);
+  return m ? m[1] : addr;
+}
+
+// Which sections of the client detail are open, kept across reloads; the
+// periodic re-render leaves the <details> elements alone.
+const SECTIONS_KEY = "bps.clientSections";
+function restoreSections() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(SECTIONS_KEY) || "{}"); } catch { /* ignore */ }
+  for (const d of document.querySelectorAll("#client-detail details.client-section")) {
+    if (d.id in saved) d.open = saved[d.id];
+    d.addEventListener("toggle", () => {
+      const now = Object.fromEntries([...document.querySelectorAll("#client-detail details.client-section")]
+        .map(x => [x.id, x.open]));
+      localStorage.setItem(SECTIONS_KEY, JSON.stringify(now));
+      // Charts drawn while their section was closed have no size: redraw them.
+      if (d.open && clockData) renderClientDetail();
+    });
+  }
+}
+
 function renderClientDetail() {
   const box = document.getElementById("client-detail");
   const data = clockData;
   box.hidden = !data;
   if (!data || currentPage() !== "clients") return;
-  const c = data.client, h = c.health, st = clockState(c);
-  document.getElementById("client-title").innerHTML =
-    `${esc(displayName(c) || "unnamed")} <span class="mono">${esc(c.id)}</span> &middot; <span class="${st.cls}">${st.text}</span>`;
-  document.getElementById("client-meta").textContent = [
-    c.hostname, c.version, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : "",
-    `clock source: ${c.capabilities?.clock_source || "unknown"}`, c.last_addr,
-    c.health?.mode?.mode === "batch"
-      ? `in contact every ${fmtInterval(c.health.mode.interval_s)}, last heard ${fmtAgo(c.last_seen)}`
-      : `heartbeat every ${data.heartbeat_interval_s} s, last heard ${fmtAgo(c.last_seen)}`,
-  ].filter(Boolean).join(" · ");
-
-  const bat = batteryView(c), card = storageView(c), md = modeView(c);
+  const c = data.client, h = c.health;
   const asOf = h && !c.active ? ` (as of ${fmtAgo(h.at)})` : "";
-  document.getElementById("health-tiles").innerHTML = !h
-    ? tile("Health", "-", "no heartbeat stored yet")
-    : [
-      bat ? tile("Battery" + asOf, bat.text, bat.sub, bat.cls) : "",
-      card ? tile("SD card" + asOf, card.text, card.sub, card.cls) : "",
-      tile("Mode" + asOf, esc(md.text), esc(md.sub), md.cls),
-      tile("Audio", `${h.chunks_sent} sent`, `${h.chunks_gated} chunks gated (quiet) since it started`),
-      tile("Up for" + asOf, fmtDuration(h.uptime_s), `since ${fmtTime(h.at - h.uptime_s * 1e9)}`),
-      h.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
-        h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
-    ].join("");
+  document.getElementById("client-title").textContent = displayName(c) || "unnamed";
+  const item = (label, html, title) =>
+    `<span${title ? ` title="${esc(title)}"` : ""}><span class="label">${label}</span>${html}</span>`;
+  document.getElementById("client-top").innerHTML = [
+    item("Hardware ID", `<span class="mono">${esc(c.id)}</span>`),
+    item("IP", esc(addrHost(c.last_addr) || "-"), c.last_addr),
+    item("Up for", h ? fmtDuration(h.uptime_s) + asOf : "-", h ? `since ${fmtTime(h.at - h.uptime_s * 1e9)}` : ""),
+    item("Last heard", fmtAgo(c.last_seen), fmtTime(c.last_seen)),
+  ].join("");
+
+  // Statistics: what the device collected.
+  document.getElementById("sum-stats").textContent = h ? `${h.chunks_sent} chunks sent` : "";
+  document.getElementById("stats-tiles").innerHTML = h
+    ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
+      `${h.chunks_gated} chunks gated (quiet) since it started`)
+    : tile("Audio chunks", "-", "no heartbeat stored yet");
+
+  // Hardware Info: power, storage, radio, devices, firmware.
+  const bat = batteryView(c), card = storageView(c), md = modeView(c);
+  const interval = c.health?.mode?.mode === "batch"
+    ? `in contact every ${fmtInterval(c.health.mode.interval_s)}` : `heartbeat every ${data.heartbeat_interval_s} s`;
+  document.getElementById("sum-hardware").innerHTML = [
+    bat ? `battery ${esc(bat.text)}` : "",
+    card ? `SD ${esc(card.text)}` : "",
+  ].filter(Boolean).join(" · ");
+  document.getElementById("hardware-tiles").innerHTML = [
+    !h ? tile("Health", "-", "no heartbeat stored yet") : "",
+    bat ? tile("Battery" + asOf, esc(bat.text), esc(bat.sub), bat.cls) : "",
+    card ? tile("SD card" + asOf, esc(card.text), esc(card.sub), card.cls) : "",
+    tile("Mode" + asOf, esc(md.text), [md.sub, interval].filter(Boolean).map(esc).join(" · "), md.cls),
+    h?.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
+      h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
+    tile("Firmware", esc(c.version || "-"),
+      [c.hostname, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : ""].filter(Boolean).map(esc).join("<br>")),
+  ].join("");
   fillModeForm(c);
+
   renderClockDetail();
 }
 
@@ -1914,6 +1979,9 @@ function percentile(sorted, p) { return sorted.length ? sorted[Math.min(sorted.l
 function renderClockDetail() {
   const data = clockData;
   const c = data.client, k = c.clock, d = k?.detail, st = clockState(c), limit = clockLimitNs();
+  document.getElementById("sum-clocks").innerHTML = `<span class="${st.cls}">${st.text}</span>` +
+    (k ? ` · &plusmn;${fmtNsMs(c.clock_error_ns)}` : "");
+  const gap = radioGapText(c);
   const minutes = Math.round((data.server_time - data.from) / 60e9);
 
   const reports = data.reports.filter(r => r.clock);
@@ -1940,6 +2008,8 @@ function renderClockDetail() {
       `${k.beacon.drift_ppm.toFixed(2)} ppm against it)` + (c.beacon_line
         ? `; the AP's line: ${c.beacon_line.clients} client(s), &plusmn;${fmtNsMs(c.beacon_line.error_ns)} to the server clock`
         : "; the server has no line for this AP yet")) : "",
+    tile("Clock source", esc(c.capabilities?.clock_source || "unknown"), ""),
+    gap ? tile("Last radio-off gap", fmtDuration(c.health.mode.gap.off_s), esc(gap)) : "",
   ].join("");
   document.getElementById("clock-foot").textContent =
     `${reports.length} reports from ${fmtTime(data.from)} to ${fmtTime(data.server_time)}. ` +
@@ -2063,6 +2133,7 @@ for (const k of ["name", "x", "y", "z"]) {
 }
 window.addEventListener("hashchange", showPage);
 loadDashPrefs();
+restoreSections();
 showPage();
 setInterval(refresh, 2000);
 </script>
