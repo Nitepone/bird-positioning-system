@@ -37,6 +37,13 @@ typedef struct {
     uint64_t level_sum[2]; /* squares of the top 16 bits */
     uint32_t level_frames;
     uint32_t block_start; /* ring index of the block being gated */
+
+    /* A new gate from the network side (bps_capture_set_gate), taken by the
+     * capture side before its next block: requested when gate_req moves on,
+     * done when gate_ack catches up. */
+    bps_gate next_gate;
+    bool next_keep_floor;
+    uint32_t gate_req, gate_ack;
     int16_t pcm[BPS_CAPTURE_MAX_FRAMES]; /* not on core 1's 2 KB stack */
 } bps_capture;
 
@@ -47,5 +54,12 @@ void bps_capture_init(bps_capture *c, bps_ring *ring, uint32_t sample_rate, int 
  * samples left-aligned) just read from I2S; `read_us` is the monotonic time
  * the read returned, when the last frame had been captured at the latest. */
 void bps_capture_frames(const int32_t *lr, size_t frames, uint64_t read_us);
+
+/* Network side: runs the gate with new settings from the next block on. The
+ * frame length stays as it is (the upload's look-back was sized for it), and
+ * so does the noise floor if the band does. The coefficients are worked out
+ * here, not on the capture side, which only copies them (the RP2040 has no
+ * FPU). False while an earlier change has not been taken yet: try again. */
+bool bps_capture_set_gate(bps_capture *c, const bps_gate_config *gate, bool same_band);
 
 #endif

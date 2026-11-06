@@ -167,11 +167,34 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // This client runs only the energy trigger and no validation, and takes
+    // its settings at registration only.
+    let gate_cfg = match reg.trigger() {
+        bsp_proto::TriggerConfig::Energy(g) => g,
+        bsp_proto::TriggerConfig::Unknown => {
+            tracing::warn!(
+                "the server asks for a trigger this client does not know; using the energy trigger"
+            );
+            bsp_proto::GateConfig::default()
+        }
+    };
+    if reg.validation() != bsp_proto::ValidationConfig::None {
+        tracing::warn!(
+            "the server asks for a validation this client does not support; uploading every triggered chunk"
+        );
+    }
+    tracing::info!(
+        threshold_db = gate_cfg.threshold_db,
+        band_low_hz = gate_cfg.band_low_hz,
+        band_high_hz = gate_cfg.band_high_hz,
+        "trigger: energy; validation: none"
+    );
     tokio::spawn(uplink::heartbeat_loop(
         session.clone(),
         Duration::from_secs(reg.heartbeat_interval_s.max(1) as u64),
         clock.clone(),
         stats.clone(),
+        bsp_proto::TriggerConfig::Energy(gate_cfg.clone()),
     ));
     let queue = Arc::new(UploadQueue::new(50));
     {
@@ -180,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     }
     keypress::spawn(session.clone());
 
-    let mut gate = gate::NoiseGate::new(reg.gate.clone(), source.sample_rate);
+    let mut gate = gate::NoiseGate::new(gate_cfg, source.sample_rate);
     let mut chunker = Chunker {
         sample_rate: source.sample_rate,
         len: (reg.chunk_secs * source.sample_rate as f32) as usize,

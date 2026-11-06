@@ -710,6 +710,9 @@ struct LocalSpeciesSummary {
 #[derive(Serialize)]
 struct SettingsView {
     settings: Settings,
+    /// The trigger clients are asked to run: `settings.trigger`, else the
+    /// config file's gate.
+    trigger: bsp_proto::TriggerConfig,
     levels: Vec<LevelView>,
     local_species: LocalSpeciesSummary,
 }
@@ -739,6 +742,7 @@ async fn settings_view(state: &SharedState) -> SettingsView {
         },
     };
     SettingsView {
+        trigger: settings.trigger_or(&state.cfg.clients.gate),
         settings,
         levels: ConfidenceLevel::ALL
             .iter()

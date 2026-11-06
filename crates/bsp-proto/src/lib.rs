@@ -90,16 +90,81 @@ impl Default for GateConfig {
     }
 }
 
+/// What opens a recording on the client. The tag and the fields have names
+/// unique across the client's messages: the microcontroller client finds
+/// values by key anywhere in a reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "trigger_type", rename_all = "snake_case")]
+pub enum TriggerConfig {
+    /// Band-limited energy clearly above the adaptive noise floor: the noise
+    /// gate. Its `threshold_db` is the sensitivity (lower is more sensitive).
+    Energy(GateConfig),
+    /// A trigger type this build does not know (from a newer peer).
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self::Energy(GateConfig::default())
+    }
+}
+
+impl TriggerConfig {
+    /// The noise gate's settings for clients that know only the gate: the
+    /// energy trigger's own, else the defaults.
+    pub fn gate(&self) -> GateConfig {
+        match self {
+            Self::Energy(g) => g.clone(),
+            Self::Unknown => GateConfig::default(),
+        }
+    }
+}
+
+/// How the client checks a triggered recording before uploading it, e.g.
+/// with a model that hears whether a bird is calling in it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "validation_type", rename_all = "snake_case")]
+pub enum ValidationConfig {
+    /// Every triggered recording is uploaded.
+    #[default]
+    None,
+    /// A validation type this build does not know (from a newer peer); the
+    /// client uploads everything, as with `None`.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub udp_timesync_port: u16,
     pub heartbeat_interval_s: u32,
     pub chunk_secs: f32,
+    /// The energy trigger's settings, for clients that predate `trigger`.
     pub gate: GateConfig,
     /// The server accepts audio uploads as FLAC as well as WAV. Older
     /// servers leave it out, and clients then send WAV.
     #[serde(default)]
     pub flac_uploads: bool,
+    /// Older servers leave it out: the trigger is then the gate, as `gate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerConfig>,
+    /// Older servers leave it out: no validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationConfig>,
+}
+
+impl RegisterResponse {
+    /// The trigger to run: as sent, else (an older server) the gate.
+    pub fn trigger(&self) -> TriggerConfig {
+        self.trigger
+            .clone()
+            .unwrap_or_else(|| TriggerConfig::Energy(self.gate.clone()))
+    }
+
+    pub fn validation(&self) -> ValidationConfig {
+        self.validation.clone().unwrap_or_default()
+    }
 }
 
 /// Result of the client's clock measurement against the server.
@@ -136,6 +201,60 @@ mod tests {
         assert!("04:f4:1c:07:93".parse::<Bssid>().is_err());
         assert!("04:f4:1c:07:93:52:00".parse::<Bssid>().is_err());
         assert!("04:f4:1c:07:93:zz".parse::<Bssid>().is_err());
+    }
+
+    #[test]
+    fn trigger_and_validation_wire_format() {
+        let t = TriggerConfig::default();
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["trigger_type"], "energy");
+        assert_eq!(v["threshold_db"], 10.0);
+        assert_eq!(v["frame_ms"], 100);
+        assert_eq!(serde_json::from_value::<TriggerConfig>(v).unwrap(), t);
+        let v = serde_json::to_value(ValidationConfig::None).unwrap();
+        assert_eq!(v, serde_json::json!({ "validation_type": "none" }));
+        // Types from a newer peer are kept apart, not an error.
+        let t: TriggerConfig =
+            serde_json::from_str(r#"{"trigger_type":"spectral","x":1}"#).unwrap();
+        assert_eq!(t, TriggerConfig::Unknown);
+        assert_eq!(t.gate(), GateConfig::default());
+        let v: ValidationConfig =
+            serde_json::from_str(r#"{"validation_type":"model","threshold":0.5}"#).unwrap();
+        assert_eq!(v, ValidationConfig::Unknown);
+    }
+
+    #[test]
+    fn register_response_from_older_server_uses_the_gate() {
+        let r: RegisterResponse = serde_json::from_str(
+            r#"{"udp_timesync_port":2473,"heartbeat_interval_s":5,"chunk_secs":9.0,
+                "gate":{"band_low_hz":2000,"band_high_hz":8000,"threshold_db":6,"frame_ms":50}}"#,
+        )
+        .unwrap();
+        let g = GateConfig {
+            band_low_hz: 2000.0,
+            band_high_hz: 8000.0,
+            threshold_db: 6.0,
+            frame_ms: 50,
+        };
+        assert_eq!(r.trigger(), TriggerConfig::Energy(g));
+        assert_eq!(r.validation(), ValidationConfig::None);
+        // And an older client still finds `gate` in a new server's reply.
+        let new = RegisterResponse {
+            trigger: Some(TriggerConfig::default()),
+            validation: Some(ValidationConfig::None),
+            ..r
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert!(v["gate"].is_object());
+        assert_eq!(v["trigger"]["trigger_type"], "energy");
+    }
+
+    #[test]
+    fn heartbeat_response_from_older_server() {
+        let r: HeartbeatResponse =
+            serde_json::from_str(r#"{"mode":{"mode":"live","interval_s":300}}"#).unwrap();
+        assert_eq!(r.trigger, None);
+        assert_eq!(r.validation, None);
     }
 
     #[test]
@@ -272,13 +391,26 @@ pub struct Heartbeat {
     /// How the client uses its radio (clients that can switch modes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ModeStatus>,
+    /// The trigger the client runs (clients that report it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerConfig>,
+    /// The validation the client runs (clients that report it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationConfig>,
 }
 
 /// The server's answer to a heartbeat. Older servers answer with no body.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatResponse {
     /// The mode the operator wants the client in.
     pub mode: ModeSetting,
+    /// The trigger the operator wants the client to run; older servers leave
+    /// it out. Passed on at every heartbeat, so a change applies without the
+    /// client registering again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationConfig>,
 }
 
 /// How a client uses its radio.

@@ -186,6 +186,8 @@ async fn main() -> anyhow::Result<()> {
                 storage: None,
                 devices: Vec::new(),
                 mode: None,
+                trigger: None,
+                validation: None,
             };
             http.post(format!("{base}{CLIENT_API_PREFIX}/{id}/heartbeat"))
                 .json(&hb)

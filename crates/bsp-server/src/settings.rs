@@ -3,6 +3,7 @@
 
 use crate::state::SharedState;
 use bsp_core::identifier::{GeoSpecies, LocalSpecies, Thresholds};
+use bsp_proto::{GateConfig, TriggerConfig, ValidationConfig};
 use serde::{Deserialize, Serialize};
 
 pub const DB_KEY: &str = "settings";
@@ -56,6 +57,11 @@ pub struct Settings {
     pub min_confidence_expected: ConfidenceLevel,
     /// Minimum confidence for species not expected at the site.
     pub min_confidence_unexpected: ConfidenceLevel,
+    /// What opens a recording on the clients. Unset: the energy trigger with
+    /// the config file's `[clients.gate]`.
+    pub trigger: Option<TriggerConfig>,
+    /// How clients check a triggered recording before uploading it.
+    pub validation: ValidationConfig,
 }
 
 impl Default for Settings {
@@ -64,9 +70,16 @@ impl Default for Settings {
             site: None,
             min_confidence_expected: ConfidenceLevel::Medium,
             min_confidence_unexpected: ConfidenceLevel::High,
+            trigger: None,
+            validation: ValidationConfig::None,
         }
     }
 }
+
+/// Limits on the energy trigger's settings.
+pub const GATE_BAND_HZ: std::ops::RangeInclusive<f32> = 20.0..=24_000.0;
+pub const GATE_THRESHOLD_DB: std::ops::RangeInclusive<f32> = 0.0..=60.0;
+pub const GATE_FRAME_MS: std::ops::RangeInclusive<u32> = 10..=1000;
 
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
@@ -75,7 +88,23 @@ impl Settings {
         {
             return Err("latitude must be within -90..90 and longitude within -180..180".into());
         }
+        match &self.trigger {
+            None => {}
+            Some(TriggerConfig::Energy(g)) => validate_gate(g)?,
+            Some(TriggerConfig::Unknown) => return Err("unsupported trigger type".into()),
+        }
+        if self.validation == ValidationConfig::Unknown {
+            return Err("unsupported validation type".into());
+        }
         Ok(())
+    }
+
+    /// The trigger clients are asked to run: as set, else the energy trigger
+    /// with `gate` (the config file's).
+    pub fn trigger_or(&self, gate: &GateConfig) -> TriggerConfig {
+        self.trigger
+            .clone()
+            .unwrap_or_else(|| TriggerConfig::Energy(gate.clone()))
     }
 
     pub fn thresholds(&self) -> Thresholds {
@@ -84,6 +113,32 @@ impl Settings {
             unexpected: self.min_confidence_unexpected.value(),
         }
     }
+}
+
+fn validate_gate(g: &GateConfig) -> Result<(), String> {
+    let (lo, hi) = (g.band_low_hz, g.band_high_hz);
+    if !(GATE_BAND_HZ.contains(&lo) && GATE_BAND_HZ.contains(&hi)) || lo >= hi {
+        return Err(format!(
+            "the trigger's band must lie within {}..{} Hz, its lower edge below its upper",
+            GATE_BAND_HZ.start(),
+            GATE_BAND_HZ.end()
+        ));
+    }
+    if !GATE_THRESHOLD_DB.contains(&g.threshold_db) {
+        return Err(format!(
+            "the trigger's threshold must be within {}..{} dB",
+            GATE_THRESHOLD_DB.start(),
+            GATE_THRESHOLD_DB.end()
+        ));
+    }
+    if !GATE_FRAME_MS.contains(&g.frame_ms) {
+        return Err(format!(
+            "the trigger's frame length must be within {}..{} ms",
+            GATE_FRAME_MS.start(),
+            GATE_FRAME_MS.end()
+        ));
+    }
+    Ok(())
 }
 
 /// State of the expected-species list, for the UI.
@@ -172,5 +227,69 @@ pub fn load(state: &SharedState) -> Settings {
             tracing::error!("reading settings: {e}");
             Settings::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_before_triggers_load_with_defaults() {
+        let s: Settings = serde_json::from_str(
+            r#"{"site":null,"min_confidence_expected":"medium","min_confidence_unexpected":"high"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.trigger, None);
+        assert_eq!(s.validation, ValidationConfig::None);
+        let file = GateConfig {
+            threshold_db: 7.0,
+            ..GateConfig::default()
+        };
+        assert_eq!(s.trigger_or(&file), TriggerConfig::Energy(file));
+    }
+
+    #[test]
+    fn trigger_settings_are_checked() {
+        let with = |g: GateConfig| Settings {
+            trigger: Some(TriggerConfig::Energy(g)),
+            ..Settings::default()
+        };
+        let ok = GateConfig {
+            threshold_db: 6.0,
+            ..GateConfig::default()
+        };
+        assert!(with(ok.clone()).validate().is_ok());
+        for bad in [
+            GateConfig {
+                band_low_hz: 9000.0,
+                band_high_hz: 8000.0,
+                ..ok.clone()
+            },
+            GateConfig {
+                band_high_hz: 30_000.0,
+                ..ok.clone()
+            },
+            GateConfig {
+                threshold_db: -1.0,
+                ..ok.clone()
+            },
+            GateConfig {
+                frame_ms: 5,
+                ..ok.clone()
+            },
+        ] {
+            assert!(with(bad).validate().is_err());
+        }
+        let unknown = Settings {
+            trigger: Some(TriggerConfig::Unknown),
+            ..Settings::default()
+        };
+        assert!(unknown.validate().is_err());
+        let unknown = Settings {
+            validation: ValidationConfig::Unknown,
+            ..Settings::default()
+        };
+        assert!(unknown.validate().is_err());
     }
 }

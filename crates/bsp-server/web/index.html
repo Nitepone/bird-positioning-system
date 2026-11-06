@@ -402,6 +402,26 @@
       <legend>Minimum confidence: unexpected species</legend>
       <div id="set-conf-unexpected"></div>
     </fieldset>
+    <fieldset>
+      <legend>Recording trigger</legend>
+      Type <select id="set-trig-type">
+        <option value="energy">Energy: sound clearly above the noise floor</option>
+      </select><br>
+      Sensitivity <input id="set-trig-thr" type="number" min="0" max="60" step="0.5" style="width: 5em"> dB above the noise floor<br>
+      Band <input id="set-trig-lo" type="number" min="20" max="24000" step="10" style="width: 6em">
+      to <input id="set-trig-hi" type="number" min="20" max="24000" step="10" style="width: 6em"> Hz,
+      frames of <input id="set-trig-frame" type="number" min="10" max="1000" step="10" style="width: 5em"> ms<br>
+      <small>A lower threshold is more sensitive: fainter calls open a recording, and so does more noise.
+        Clients apply changes at their next heartbeat; a new frame length applies once a client restarts.</small>
+    </fieldset>
+    <fieldset>
+      <legend>Recording validation</legend>
+      <select id="set-validation">
+        <option value="none">None: upload every triggered recording</option>
+      </select><br>
+      <small>Checks a triggered recording on the client before it is uploaded, e.g. with a model that hears
+        whether a bird is calling. No checks are available yet.</small>
+    </fieldset>
     <button type="submit">Save settings</button>
     <span id="set-msg"></span>
   </form>
@@ -1500,6 +1520,16 @@ document.getElementById("f-q").addEventListener("input", () => {
   searchTimer = setTimeout(applyFilters, 400);
 });
 
+// A client's trigger and validation, as it reports running them.
+function triggerText(t) {
+  if (t.trigger_type === "energy") return `energy, ${t.threshold_db} dB`;
+  return t.trigger_type;
+}
+function validationText(v) {
+  const type = v?.validation_type ?? "none";
+  return type === "none" ? "no validation" : `validation: ${type}`;
+}
+
 // ---- config page: server settings ----
 let settingsDirty = false;
 
@@ -1527,6 +1557,15 @@ function renderSettings(v) {
     radios("conf-expected", v.levels, v.settings.min_confidence_expected);
   document.getElementById("set-conf-unexpected").innerHTML =
     radios("conf-unexpected", v.levels, v.settings.min_confidence_unexpected);
+  const t = v.trigger;
+  document.getElementById("set-trig-type").value = t.trigger_type;
+  if (t.trigger_type === "energy") {
+    document.getElementById("set-trig-thr").value = t.threshold_db;
+    document.getElementById("set-trig-lo").value = t.band_low_hz;
+    document.getElementById("set-trig-hi").value = t.band_high_hz;
+    document.getElementById("set-trig-frame").value = t.frame_ms;
+  }
+  document.getElementById("set-validation").value = v.settings.validation.validation_type;
   showSpeciesSummary(v.local_species);
   settingsDirty = false;
 }
@@ -1550,6 +1589,18 @@ async function saveSettings(ev) {
     }
   }
   const checked = name => document.querySelector(`input[name="${name}"]:checked`).value;
+  const num = id => Number(document.getElementById(id).value);
+  const trigger = {
+    trigger_type: document.getElementById("set-trig-type").value,
+    threshold_db: num("set-trig-thr"),
+    band_low_hz: num("set-trig-lo"),
+    band_high_hz: num("set-trig-hi"),
+    frame_ms: Math.round(num("set-trig-frame")),
+  };
+  if (![trigger.threshold_db, trigger.band_low_hz, trigger.band_high_hz, trigger.frame_ms].every(Number.isFinite)) {
+    msg.textContent = "Enter the trigger's settings as numbers.";
+    return;
+  }
   msg.textContent = "Saving...";
   try {
     renderSettings(await api("/settings", {
@@ -1559,6 +1610,8 @@ async function saveSettings(ev) {
         site,
         min_confidence_expected: checked("conf-expected"),
         min_confidence_unexpected: checked("conf-unexpected"),
+        trigger,
+        validation: { validation_type: document.getElementById("set-validation").value },
       }),
     }));
     msg.textContent = "Saved.";
@@ -2047,6 +2100,7 @@ function renderClientDetail() {
     tile("Detections, 24 h", detTotal ?? "-", det ? `peak ${Math.max(...det.counts)} in an hour` : "loading"),
     h ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
       `${h.chunks_gated} gated ${info("Gated: quiet chunks the client did not send. Counted since it started.")}`) : "",
+    h?.trigger ? tile("Trigger" + asOf, esc(triggerText(h.trigger)), esc(validationText(h.validation))) : "",
   ].join("");
 
   // Hardware Info: power, storage, radio, devices, firmware.

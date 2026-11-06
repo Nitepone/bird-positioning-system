@@ -15,7 +15,8 @@ use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
     AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
-    HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, now_ns,
+    HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, TriggerConfig,
+    ValidationConfig, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -45,13 +46,22 @@ async fn register(
                 "version": req.version, "capabilities": req.capabilities, "name": name }),
     );
     let d = &state.cfg.clients;
+    let (trigger, validation) = capture_settings(&state).await;
     Ok(Json(RegisterResponse {
         udp_timesync_port: state.udp_port,
         heartbeat_interval_s: d.heartbeat_interval_s,
         chunk_secs: d.chunk_secs,
-        gate: d.gate.clone(),
+        gate: trigger.gate(),
         flac_uploads: true,
+        trigger: Some(trigger),
+        validation: Some(validation),
     }))
+}
+
+/// The trigger and validation the operator wants clients to run.
+async fn capture_settings(state: &SharedState) -> (TriggerConfig, ValidationConfig) {
+    let s = state.settings.lock().await;
+    (s.trigger_or(&state.cfg.clients.gate), s.validation.clone())
 }
 
 /// `<bssid> <start> <end>` from [`HEADER_TSF`].
@@ -185,7 +195,12 @@ async fn heartbeat(
             json!({ "count": hb.capture_dropouts }),
         );
     }
-    Ok(Json(HeartbeatResponse { mode: after.mode }))
+    let (trigger, validation) = capture_settings(&state).await;
+    Ok(Json(HeartbeatResponse {
+        mode: after.mode,
+        trigger: Some(trigger),
+        validation: Some(validation),
+    }))
 }
 
 async fn upload_audio(
@@ -319,6 +334,8 @@ mod tests {
             }),
             devices: Vec::new(),
             mode: None,
+            trigger: None,
+            validation: None,
         }
     }
 

@@ -155,6 +155,7 @@ pub async fn heartbeat_loop(
     interval: Duration,
     clock: SharedClock,
     stats: Arc<Stats>,
+    trigger: bsp_proto::TriggerConfig,
 ) {
     let started = Instant::now();
     let mut tick = tokio::time::interval(interval);
@@ -171,6 +172,8 @@ pub async fn heartbeat_loop(
             storage: None,
             devices: Vec::new(),
             mode: None,
+            trigger: Some(trigger.clone()),
+            validation: Some(bsp_proto::ValidationConfig::None),
         };
         if let Err(e) = session.heartbeat(&hb).await {
             stats

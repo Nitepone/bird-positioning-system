@@ -14,6 +14,7 @@
 #include "ring.h"
 #include "spool.h"
 #include "timesync.h"
+#include "trigger.h"
 #include "upload.h"
 
 #define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
@@ -97,7 +98,16 @@ static bool capturing;
 static uint16_t udp_port;
 static uint64_t hb_interval_us;
 static uint32_t chunk_len, lookback;
+/* The gate as the capture side runs it (the energy trigger). */
 static bps_gate_config gate_cfg;
+
+/* The trigger and validation: as the server last asked, and as run. This
+ * build runs the energy trigger and no validation; other types fall back to
+ * those. A new frame length waits for a restart (see bps_capture_set_gate). */
+static struct {
+    bps_trigger_config want, run;
+    bps_validation_config want_v, run_v;
+} trig;
 
 static txn reg_txn, hb_txn, pos_txn;
 /* Heartbeats carry the clock, the devices' reports and the mode; the others
@@ -310,6 +320,75 @@ static void start_register(void)
     txn_start(&reg_txn, "registration", path, body, j.overflow ? 0 : j.len);
 }
 
+/* ---- Trigger and validation ---- */
+
+static void log_trigger(const char *what)
+{
+    char d[96];
+    bps_trigger_describe(&trig.run, d, sizeof d);
+    port_log("%s: %s; validation: %s", what, d, trig.run_v.name);
+}
+
+/* What runs for what the server asks: unknown types fall back. */
+static void trigger_runnable(const bps_trigger_config *t, const bps_validation_config *v,
+                             bps_trigger_config *run, bps_validation_config *run_v)
+{
+    if (t->type == BPS_TRIGGER_ENERGY)
+        *run = *t;
+    else
+        bps_trigger_default(run);
+    if (v->type == BPS_VALIDATION_NONE)
+        *run_v = *v;
+    else
+        bps_validation_default(run_v);
+    if (t->type != BPS_TRIGGER_ENERGY)
+        port_log("trigger: '%s' is not supported by this firmware; the energy trigger runs",
+                 t->name);
+    if (v->type != BPS_VALIDATION_NONE)
+        port_log("validation: '%s' is not supported by this firmware; every recording is "
+                 "uploaded",
+                 v->name);
+}
+
+/* Before capture starts: everything applies, the frame length included. */
+static void trigger_start(const bps_trigger_config *t, const bps_validation_config *v)
+{
+    trig.want = *t;
+    trig.want_v = *v;
+    trigger_runnable(t, v, &trig.run, &trig.run_v);
+    gate_cfg = trig.run.gate;
+    log_trigger("trigger");
+}
+
+/* While capturing, from a heartbeat reply or a later registration. */
+static void apply_trigger(const bps_trigger_config *t, const bps_validation_config *v)
+{
+    if (bps_trigger_equal(t, &trig.want) && bps_validation_equal(v, &trig.want_v))
+        return;
+    bps_trigger_config run;
+    bps_validation_config run_v;
+    trigger_runnable(t, v, &run, &run_v);
+    if (run.gate.frame_ms != gate_cfg.frame_ms) {
+        port_log("trigger: %lu ms frames apply after a restart; %lu ms meanwhile",
+                 (unsigned long)run.gate.frame_ms, (unsigned long)gate_cfg.frame_ms);
+        run.gate.frame_ms = gate_cfg.frame_ms;
+    }
+    const bps_gate_config *g = &run.gate;
+    if (g->band_low_hz != gate_cfg.band_low_hz || g->band_high_hz != gate_cfg.band_high_hz ||
+        g->threshold_db != gate_cfg.threshold_db) {
+        bool same_band =
+            g->band_low_hz == gate_cfg.band_low_hz && g->band_high_hz == gate_cfg.band_high_hz;
+        if (!bps_capture_set_gate(&cap, g, same_band))
+            return; /* the previous change is still on its way: next reply */
+        gate_cfg = *g;
+    }
+    trig.want = *t;
+    trig.want_v = *v;
+    trig.run = run;
+    trig.run_v = run_v;
+    log_trigger("trigger changed");
+}
+
 static void start_capture(void)
 {
     /* As much as asked for, but always leave some heap for the network stack. */
@@ -356,27 +435,27 @@ static bool apply_registration(void)
 {
     const char *body = reg_txn.rx + reg_txn.resp.body_off;
     size_t len = reg_txn.rx_len - reg_txn.resp.body_off;
-    double port, hb, chunk, lo, hi, thr, frame;
+    double port, hb, chunk;
     if (!bps_json_number(body, len, "udp_timesync_port", &port) ||
         !bps_json_number(body, len, "heartbeat_interval_s", &hb) ||
         !bps_json_number(body, len, "chunk_secs", &chunk))
         return false;
     udp_port = (uint16_t)port;
     hb_interval_us = (uint64_t)((hb < 1 ? 1 : hb) * 1e6);
-    /* The gate settings and chunk length apply from the first registration on. */
+    bps_trigger_config t;
+    bps_validation_config v;
+    if (!bps_trigger_parse(body, len, &t))
+        bps_trigger_default(&t);
+    if (!bps_validation_parse(body, len, &v))
+        bps_validation_default(&v);
+    /* The chunk length applies from the first registration on; the trigger
+     * and validation follow the server (as from heartbeat replies). */
     if (!capturing) {
         chunk_len = (uint32_t)(chunk * cfg.sample_rate);
-        bps_gate_config_default(&gate_cfg);
-        if (bps_json_number(body, len, "band_low_hz", &lo) &&
-            bps_json_number(body, len, "band_high_hz", &hi) &&
-            bps_json_number(body, len, "threshold_db", &thr) &&
-            bps_json_number(body, len, "frame_ms", &frame)) {
-            gate_cfg.band_low_hz = (float)lo;
-            gate_cfg.band_high_hz = (float)hi;
-            gate_cfg.threshold_db = (float)thr;
-            gate_cfg.frame_ms = (uint32_t)frame;
-        }
+        trigger_start(&t, &v);
         start_capture();
+    } else {
+        apply_trigger(&t, &v);
     }
     return true;
 }
@@ -843,6 +922,11 @@ static void heartbeat_reply(uint64_t now)
 {
     const char *body = hb_txn.rx + hb_txn.resp.body_off;
     size_t len = hb_txn.rx_len - hb_txn.resp.body_off;
+    bps_trigger_config t = trig.want;
+    bps_validation_config v = trig.want_v;
+    bool has_t = bps_trigger_parse(body, len, &t), has_v = bps_validation_parse(body, len, &v);
+    if (capturing && (has_t || has_v))
+        apply_trigger(&t, &v);
     char m[16];
     double interval = mode.interval_s;
     if (!bps_json_string(body, len, "mode", m, sizeof m))
@@ -980,6 +1064,10 @@ static void start_heartbeat(uint64_t now)
     bps_json_i64(&j, "capture_dropouts", stats.dropouts_sending - stats.dropouts_reported);
     bps_devices_heartbeat(&j);
     mode_json(&j, now);
+    if (capturing) {
+        bps_trigger_json(&j, &trig.run);
+        bps_validation_json(&j, &trig.run_v);
+    }
     bps_json_raw(&j, "}");
     mode.final_hb = mode.run == MODE_BATCH && mode.phase == C_FINAL;
     if (j.overflow)

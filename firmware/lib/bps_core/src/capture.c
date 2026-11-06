@@ -4,6 +4,7 @@
 #include <string.h>
 
 #define STORE(p, v) __atomic_store_n(p, v, __ATOMIC_RELEASE)
+#define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 
 static bps_capture *active;
 
@@ -17,6 +18,41 @@ void bps_capture_init(bps_capture *c, bps_ring *ring, uint32_t sample_rate, int 
     bps_gate_init(&c->gate, gate, sample_rate);
     bps_timestamper_init(&c->stamper, sample_rate);
     STORE(&active, c);
+}
+
+bool bps_capture_set_gate(bps_capture *c, const bps_gate_config *gate, bool same_band)
+{
+    if (LOAD(&c->gate_ack) != c->gate_req)
+        return false;
+    uint32_t frame_len = c->gate.frame_len; /* only ever changed here */
+    bps_gate_init(&c->next_gate, gate, c->sample_rate);
+    c->next_gate.frame_len = frame_len;
+    c->next_keep_floor = same_band;
+    STORE(&c->gate_req, c->gate_req + 1);
+    return true;
+}
+
+/* Capture side: takes a gate the network side has set up. */
+static void take_gate(bps_capture *c)
+{
+    uint32_t req = LOAD(&c->gate_req);
+    if (req == c->gate_ack)
+        return;
+    bps_gate *g = &c->gate, *n = &c->next_gate;
+    if (c->next_keep_floor) {
+        /* Only the threshold changed: the floor and the frame in progress
+         * still hold. */
+        n->in_frame = g->in_frame;
+        n->sum = g->sum;
+        n->hp = g->hp;
+        n->lp = g->lp;
+        n->has_floor = g->has_floor;
+        n->floor_db = g->floor_db;
+        n->n_warm = g->n_warm;
+        memcpy(n->warm, g->warm, sizeof n->warm);
+    }
+    *g = *n;
+    STORE(&c->gate_ack, req);
 }
 
 static void on_frame(void *ctx, size_t end, const bps_gate_frame *f)
@@ -59,6 +95,7 @@ static void process(bps_capture *c, const int32_t *lr, size_t frames, uint64_t r
 
     c->block_start = idx;
     bps_ring_write(c->ring, pcm, frames);
+    take_gate(c);
     bps_gate_process(&c->gate, pcm, frames, on_frame, c);
 
     /* Diagnostics: both channels' level over the first 2 s (which one is the mic?). */

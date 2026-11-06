@@ -6,7 +6,8 @@ use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
     BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, ModeSetting,
-    ModeStatus, NANOS_PER_SEC, RegisterRequest, StorageStatus, Timestamp, Uuid,
+    ModeStatus, NANOS_PER_SEC, RegisterRequest, StorageStatus, Timestamp, TriggerConfig, Uuid,
+    ValidationConfig,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,11 @@ pub struct ClientHealth {
     pub devices: Vec<DeviceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ModeStatus>,
+    /// The trigger and validation the client reports running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationConfig>,
 }
 
 impl ClientHealth {
@@ -70,6 +76,8 @@ impl ClientHealth {
             storage: hb.storage,
             devices: hb.devices.clone(),
             mode: hb.mode.clone(),
+            trigger: hb.trigger.clone(),
+            validation: hb.validation.clone(),
         }
     }
 }
@@ -905,6 +913,8 @@ mod tests {
                 gap: None,
                 note: None,
             }),
+            trigger: Some(TriggerConfig::default()),
+            validation: Some(ValidationConfig::None),
         };
         assert!(
             db.record_heartbeat(id, "addr2", Some(&clock), &health)
@@ -1262,6 +1272,8 @@ mod tests {
                 storage: None,
                 devices: Vec::new(),
                 mode: None,
+                trigger: None,
+                validation: None,
             };
             db.record_heartbeat(id, "addr", None, &health).unwrap();
         };
@@ -1279,6 +1291,8 @@ mod tests {
             storage: None,
             devices: Vec::new(),
             mode: None,
+            trigger: None,
+            validation: None,
         };
         db.record_heartbeat(a, "addr", None, &no_battery).unwrap();
 
