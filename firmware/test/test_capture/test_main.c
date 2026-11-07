@@ -228,6 +228,64 @@ static void test_ring_survives_index_wrap(void)
     TEST_ASSERT_EQUAL_INT32(3000, bps_idx_diff(bps_ring_written(&ring), first));
 }
 
+// A capture with no timeline jump keeps the segment it started at boot. Once
+// 2^31 samples were in (12.4 h at 48 kHz), that start compared as the future
+// and no sample could be located, so nothing was uploaded until a reboot
+// (a bps XIAO, Nov 6 2026). Refining the timeline, as the timestamper does
+// every second, must keep the segment's samples locatable past 2^31 and 2^32.
+static void test_ring_locates_a_segment_older_than_2_pow_31_samples(void)
+{
+    bps_ring_alloc(&ring, 48000, 2 * BPS_RING_BLOCK);
+    const int64_t ts0 = BPS_NANOS_PER_SEC;
+    bps_timeline m = line(0, ts0, 0);
+    bps_ring_timeline(&ring, &m, true, 0);
+    static int16_t in[1000];
+    bps_ring_write(&ring, in, 1000);
+    const uint64_t marks[] = {(1ull << 31) - 600000, (1ull << 31) + 500, (1ull << 31) + 3000000,
+                              (1ull << 32) - 500, (1ull << 32) + 3000000, (3ull << 31) + 500};
+    for (size_t k = 0; k < sizeof marks / sizeof marks[0]; k++) {
+        uint64_t end = marks[k]; // samples written since boot
+        ring.written = (uint32_t)(end - 1000);
+        bps_ring_write(&ring, in, 1000);
+        uint32_t ref = (uint32_t)(end - 1000);
+        m = line(ref, ts0 + (int64_t)((end - 1000) * BPS_NANOS_PER_SEC / 48000), 0);
+        bps_ring_timeline(&ring, &m, false, 0);
+        int64_t t;
+        bool has_next;
+        uint32_t next;
+        uint32_t idxs[] = {(uint32_t)(end - 400), bps_ring_oldest(&ring)};
+        for (int i = 0; i < 2; i++) {
+            uint64_t abs = end - (uint32_t)((uint32_t)end - idxs[i]);
+            TEST_ASSERT_TRUE_MESSAGE(bps_ring_locate(&ring, idxs[i], &t, &has_next, &next),
+                                     "a sample the ring holds is not located");
+            TEST_ASSERT_FALSE(has_next);
+            // To the ns, but for rounding on either side of the timeline's reference.
+            int64_t err = t - (ts0 + (int64_t)(abs * BPS_NANOS_PER_SEC / 48000));
+            TEST_ASSERT_TRUE(err >= -1 && err <= 1);
+        }
+    }
+}
+
+// The client's mark for counting gated chunks is not moved while the network
+// is down (nothing is polled then). Caught up every loop, it counts each chunk
+// as it leaves the ring, and stays close enough to compare after 13 hours.
+static void test_ring_catch_up_keeps_a_mark_through_13_hours(void)
+{
+    bps_ring_alloc(&ring, 48000, 2 * BPS_RING_BLOCK);
+    const uint32_t chunk = 432000, far = ring.capacity + chunk; // 9 s chunks
+    uint32_t mark = 0, counted = 0;
+    const uint64_t hour = 3600ull * 48000;
+    for (uint64_t t = hour; t <= 13 * hour; t += hour) {
+        ring.written = (uint32_t)t; // as many loops as you like in between
+        counted += bps_ring_catch_up(&ring, &mark, chunk, far);
+    }
+    int32_t behind = bps_idx_diff(bps_ring_written(&ring), mark);
+    TEST_ASSERT_TRUE(behind <= (int32_t)far && behind > (int32_t)(far - chunk));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)((13 * hour - (uint64_t)behind) / chunk), counted);
+    TEST_ASSERT_EQUAL_UINT32(0, bps_ring_catch_up(&ring, &mark, chunk, far));
+    TEST_ASSERT_EQUAL_UINT32(0, bps_ring_catch_up(&ring, &mark, 0, far)); // no chunks yet
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -238,5 +296,7 @@ int main(void)
     RUN_TEST(test_ring_reads_back_and_detects_overwrite);
     RUN_TEST(test_ring_starts_a_segment_at_a_timeline_jump);
     RUN_TEST(test_ring_survives_index_wrap);
+    RUN_TEST(test_ring_locates_a_segment_older_than_2_pow_31_samples);
+    RUN_TEST(test_ring_catch_up_keeps_a_mark_through_13_hours);
     return UNITY_END();
 }

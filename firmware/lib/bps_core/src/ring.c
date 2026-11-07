@@ -38,7 +38,15 @@ void bps_ring_timeline(bps_ring *r, const bps_timeline *tl, bool start_new, uint
         s->tl = *tl;
         STORE(&r->n_segs, n + 1);
     } else if (n > 0) {
-        r->segs[(n - 1) % BPS_RING_SEGMENTS].tl = *tl;
+        bps_ring_segment *s = &r->segs[(n - 1) % BPS_RING_SEGMENTS];
+        s->tl = *tl;
+        /* Index comparisons are signed 32-bit, so a start left at boot would
+         * look like the future after 2^31 samples (12.4 h at 48 kHz) and no
+         * sample would be found in its segment. Starts further back than the
+         * ring holds address nothing anyway: keep them within it. */
+        uint32_t back = r->capacity;
+        if (bps_idx_diff(r->written, s->idx) > (int32_t)back)
+            s->idx = r->written - back;
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
     STORE(&r->tseq, r->tseq + 1);
@@ -87,6 +95,18 @@ uint32_t bps_ring_oldest(const bps_ring *r)
     return LOAD(&r->written) - keep;
 }
 
+uint32_t bps_ring_catch_up(const bps_ring *r, uint32_t *mark, uint32_t step, uint32_t far)
+{
+    uint32_t w = LOAD(&r->written), n = 0;
+    if (step == 0)
+        return 0;
+    while (bps_idx_diff(w, *mark) > (int32_t)far) {
+        *mark += step;
+        n++;
+    }
+    return n;
+}
+
 bool bps_ring_read(const bps_ring *r, uint32_t idx, int16_t *out, size_t n)
 {
     if (r->capacity == 0)
@@ -106,7 +126,10 @@ bool bps_ring_read(const bps_ring *r, uint32_t idx, int16_t *out, size_t n)
         i += k;
         pos = (pos + (uint32_t)k) % r->capacity;
     }
-    /* Still valid only if the producer did not lap us while copying. */
+    /* Still valid only if the producer did not lap us while copying: the
+     * copy's loads must all be done before `written` is looked at again (an
+     * acquire load alone does not keep earlier loads before it). */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     w = LOAD(&r->written);
     return (uint32_t)bps_idx_diff(w, idx) + GUARD <= r->capacity;
 }

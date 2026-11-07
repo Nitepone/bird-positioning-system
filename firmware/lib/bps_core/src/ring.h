@@ -8,7 +8,9 @@
  * continuous timeline is a *segment*, which starts where the timestamper
  * started a timeline (at a jump of more than 0.5 ms, as bsp-client's Chunker
  * ends a chunk there). A segment's timeline is refined in place as the
- * timestamper learns more, so its samples' times are the latest estimate.
+ * timestamper learns more, so its samples' times are the latest estimate;
+ * each refinement also brings the segment's start up to the oldest sample the
+ * ring holds, so it never falls 2^31 samples behind (see bps_ring_timeline).
  */
 #ifndef BPS_RING_H
 #define BPS_RING_H
@@ -62,6 +64,11 @@ uint32_t bps_ring_written(const bps_ring *r);
 bool bps_ring_read(const bps_ring *r, uint32_t idx, int16_t *out, size_t n);
 /* The oldest sample still readable (older ones are gone or about to be). */
 uint32_t bps_ring_oldest(const bps_ring *r);
+/* Moves `*mark` on by whole `step`s until it is at most `far` samples behind
+ * the newest sample; returns the steps taken. A mark kept between polls must
+ * not fall 2^31 samples behind (12.4 h at 48 kHz), where it would compare as
+ * the future: calling this every loop keeps it within `far`. */
+uint32_t bps_ring_catch_up(const bps_ring *r, uint32_t *mark, uint32_t step, uint32_t far);
 /* The segment holding sample `idx`: its capture time, and the index where the
  * next segment starts (`*has_next` false when it is the current one). False
  * if `idx` is older than every remembered segment. */
