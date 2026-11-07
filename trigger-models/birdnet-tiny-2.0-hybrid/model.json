@@ -1,0 +1,20 @@
+{
+  "model_name": "birdnet-tiny-2.0-hybrid",
+  "model_file": "model.tflite",
+  "sample_rate": 24000,
+  "window_samples": 60000,
+  "frontend": "stft_sqrt_minmax",
+  "fft_length": 512,
+  "frames": 384,
+  "layout": "freq_time",
+  "output_kind": "logit",
+  "bird_output_first": 0,
+  "bird_output_count": 1007,
+  "score_threshold": 0.25,
+  "arena_bytes": 1048576,
+  "license": "Apache-2.0",
+  "source": "https://github.com/birdnet-team/birdnet-stm32/releases/tag/v2.0 (BirdNET_Tiny_N6_GLOBAL_1K_V2.0_Hybrid_INT8.tflite)",
+  "measured_arena_used_bytes": 932984,
+  "measured_invoke_ms_esp32s3_160mhz": 1584.3,
+  "model_bytes": 2063624
+}

@@ -9,3 +9,6 @@
 /firmware/.pio
 /firmware/host/bps-host-client
 /firmware/scripts/__pycache__
+/.venv-ml
+/trigger-models/birdnet-tiny-2.0-hybrid/model.tflite
+__pycache__/

@@ -1,0 +1,23 @@
+{
+  "model_name": "bps-micro-warblr",
+  "model_file": "model.tflite",
+  "sample_rate": 16000,
+  "window_samples": 48000,
+  "frontend": "logmel_db_minmax",
+  "fft_length": 1024,
+  "hop_length": 256,
+  "frames": 184,
+  "mel_fmin_hz": 100.0,
+  "mel_fmax_hz": 8000.0,
+  "layout": "time_freq",
+  "output_kind": "probability",
+  "bird_output_first": 1,
+  "bird_output_count": 1,
+  "mel_bands": 16,
+  "score_threshold": 0.5,
+  "arena_bytes": 32768,
+  "license": "CC-BY-4.0 (architecture: DrongoNet; training data: warblrb10k)",
+  "source": "tools/train_detector.py --arch micro on train.csv (6383 clips)",
+  "params": 919,
+  "model_bytes": 6320
+}
