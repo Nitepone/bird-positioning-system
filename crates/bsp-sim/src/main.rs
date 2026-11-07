@@ -188,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
                 mode: None,
                 trigger: None,
                 validation: None,
+                validation_note: None,
+                chunks_rejected: 0,
             };
             http.post(format!("{base}{CLIENT_API_PREFIX}/{id}/heartbeat"))
                 .json(&hb)

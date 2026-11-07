@@ -174,6 +174,8 @@ pub async fn heartbeat_loop(
             mode: None,
             trigger: Some(trigger.clone()),
             validation: Some(bsp_proto::ValidationConfig::None),
+            validation_note: None,
+            chunks_rejected: 0,
         };
         if let Err(e) = session.heartbeat(&hb).await {
             stats

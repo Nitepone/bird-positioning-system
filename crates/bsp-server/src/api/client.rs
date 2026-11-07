@@ -16,7 +16,7 @@ use bsp_core::audio::AudioSample;
 use bsp_proto::{
     AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
     HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, TriggerConfig,
-    ValidationConfig, now_ns,
+    ValidationConfig, ValidationReport, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -28,6 +28,7 @@ pub fn router() -> Router<SharedState> {
         .route("/{id}/heartbeat", post(heartbeat))
         .route("/{id}/audio", post(upload_audio))
         .route("/{id}/position-request", post(position_request))
+        .route("/{id}/validation", post(validation_report))
 }
 
 async fn register(
@@ -62,6 +63,22 @@ async fn register(
 async fn capture_settings(state: &SharedState) -> (TriggerConfig, ValidationConfig) {
     let s = state.settings.lock().await;
     (s.trigger_or(&state.cfg.clients.gate), s.validation.clone())
+}
+
+/// What a client's validation model decided about one recording: kept as an
+/// event (shown in the log, and per client), for checking the model's results
+/// and cost.
+async fn validation_report(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+    Json(report): Json<ValidationReport>,
+) -> ApiResult<StatusCode> {
+    state
+        .db
+        .get_client(id)?
+        .ok_or_else(|| ApiError::not_found("client"))?;
+    state.event(Some(id), "validation", serde_json::to_value(&report)?);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `<bssid> <start> <end>` from [`HEADER_TSF`].
@@ -336,6 +353,8 @@ mod tests {
             mode: None,
             trigger: None,
             validation: None,
+            validation_note: None,
+            chunks_rejected: 0,
         }
     }
 

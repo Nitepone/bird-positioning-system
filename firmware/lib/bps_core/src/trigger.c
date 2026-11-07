@@ -17,6 +17,19 @@ void bps_validation_default(bps_validation_config *v)
     memset(v, 0, sizeof *v);
     v->type = BPS_VALIDATION_NONE;
     strcpy(v->name, "none");
+    v->threshold = -1.0f;
+}
+
+/* A folder name: letters, digits, '.', '-', '_', not starting with '.'. */
+static bool model_name_ok(const char *s)
+{
+    if (!s[0] || s[0] == '.')
+        return false;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') ||
+              *s == '.' || *s == '-' || *s == '_'))
+            return false;
+    return true;
 }
 
 /* The gate's four settings, all present; kept within what the gate handles. */
@@ -63,8 +76,19 @@ bool bps_validation_parse(const char *json, size_t len, bps_validation_config *o
     if (!bps_json_string(json, len, "validation_type", name, sizeof name))
         return false;
     strcpy(v.name, name);
-    if (strcmp(name, "none") != 0)
+    if (strcmp(name, "model") == 0) {
+        double thr;
+        if (!bps_json_string(json, len, "validation_model", v.model, sizeof v.model) ||
+            !model_name_ok(v.model)) {
+            v.type = BPS_VALIDATION_UNKNOWN; /* runs as none, saying why */
+        } else {
+            v.type = BPS_VALIDATION_MODEL;
+            if (bps_json_number(json, len, "validation_threshold", &thr) && thr >= 0 && thr <= 1)
+                v.threshold = (float)thr;
+        }
+    } else if (strcmp(name, "none") != 0) {
         v.type = BPS_VALIDATION_UNKNOWN;
+    }
     *out = v;
     return true;
 }
@@ -82,7 +106,8 @@ bool bps_trigger_equal(const bps_trigger_config *a, const bps_trigger_config *b)
 
 bool bps_validation_equal(const bps_validation_config *a, const bps_validation_config *b)
 {
-    return a->type == b->type && strcmp(a->name, b->name) == 0;
+    return a->type == b->type && strcmp(a->name, b->name) == 0 &&
+           strcmp(a->model, b->model) == 0 && a->threshold == b->threshold;
 }
 
 void bps_trigger_json(bps_json *j, const bps_trigger_config *t)
@@ -102,6 +127,11 @@ void bps_validation_json(bps_json *j, const bps_validation_config *v)
 {
     bps_json_obj(j, "validation");
     bps_json_str(j, "validation_type", v->name);
+    if (v->type == BPS_VALIDATION_MODEL) {
+        bps_json_str(j, "validation_model", v->model);
+        if (v->threshold >= 0)
+            bps_json_fixed(j, "validation_threshold", v->threshold, 3);
+    }
     bps_json_raw(j, "}");
 }
 

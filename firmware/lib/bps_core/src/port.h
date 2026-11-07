@@ -129,6 +129,36 @@ bool port_sd_list(const char *dir, const char *suffix);
  * bytes stay valid until the next read or listing. */
 int port_sd_result(const void **data, uint32_t *total);
 
+/* ---- On-device models (validate.h) ---- */
+
+/* Large buffers, in PSRAM where there is some; 16-byte aligned. */
+void *port_big_alloc(size_t n);
+void port_big_free(void *p);
+
+/* A model's input or output tensor. */
+typedef struct {
+    bool is_int8; /* else float32 */
+    void *data;
+    size_t bytes;
+    float scale; /* int8: real = (q - zero_point) * scale */
+    int32_t zero_point;
+} port_ml_tensor;
+
+/* Sets up TFLite Micro for the `model_bytes` model at `model` (which must stay
+ * put), with a tensor arena of `arena_bytes`. False (with the reason in `err`)
+ * where the board cannot run models, or the model does not load, or is not a
+ * well-formed model of that size (it is checked before use). */
+bool port_ml_load(const void *model, size_t model_bytes, size_t arena_bytes, port_ml_tensor *in,
+                  port_ml_tensor *out, size_t *arena_used, char *err, size_t err_cap);
+bool port_ml_invoke(void);
+void port_ml_unload(void);
+
+/* A low-priority task, off the capture core, that runs `fn` each time it is
+ * kicked (validation's front end and model, which take tens of ms to
+ * seconds). False where there is none. */
+bool port_worker_start(void (*fn)(void));
+void port_worker_kick(void);
+
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);
 

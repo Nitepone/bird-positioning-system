@@ -129,6 +129,15 @@ pub enum ValidationConfig {
     /// Every triggered recording is uploaded.
     #[default]
     None,
+    /// A model on the client's storage card, in `/models/<validation_model>/`
+    /// (model.tflite and model.json, see trigger-models/): a triggered
+    /// recording is uploaded only if the model's bird score reaches the
+    /// threshold, which defaults to the model's own.
+    Model {
+        validation_model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation_threshold: Option<f32>,
+    },
     /// A validation type this build does not know (from a newer peer); the
     /// client uploads everything, as with `None`.
     #[serde(other)]
@@ -219,8 +228,29 @@ mod tests {
         assert_eq!(t, TriggerConfig::Unknown);
         assert_eq!(t.gate(), GateConfig::default());
         let v: ValidationConfig =
-            serde_json::from_str(r#"{"validation_type":"model","threshold":0.5}"#).unwrap();
+            serde_json::from_str(r#"{"validation_type":"ensemble","threshold":0.5}"#).unwrap();
         assert_eq!(v, ValidationConfig::Unknown);
+        let v: ValidationConfig = serde_json::from_str(
+            r#"{"validation_type":"model","validation_model":"drongonet-micro"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            ValidationConfig::Model {
+                validation_model: "drongonet-micro".into(),
+                validation_threshold: None
+            }
+        );
+        let v = serde_json::to_value(ValidationConfig::Model {
+            validation_model: "m".into(),
+            validation_threshold: Some(0.4),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "validation_type": "model", "validation_model": "m",
+                                "validation_threshold": 0.4f32 })
+        );
     }
 
     #[test]
@@ -397,6 +427,41 @@ pub struct Heartbeat {
     /// The validation the client runs (clients that report it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationConfig>,
+    /// Why the client runs another validation than asked (e.g. no model on
+    /// its card), or how loading the model goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_note: Option<String>,
+    /// Triggered recordings validation kept from uploading, since the client
+    /// started.
+    #[serde(default)]
+    pub chunks_rejected: u64,
+}
+
+/// What a client's validation decided about one triggered recording: sent
+/// for every recording the model read, uploaded or not, so its results and
+/// cost can be checked (`POST /{id}/validation`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationReport {
+    pub model: String,
+    /// The model's bird score, 0..1.
+    pub score: f32,
+    pub threshold: f32,
+    /// Whether the recording is uploaded.
+    pub upload: bool,
+    /// Server-clock time of the first sample the model read, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<Timestamp>,
+    /// Audio the model read (ms).
+    pub window_ms: u32,
+    /// Time from the trigger to the decision (ms): waiting for the rest of
+    /// the window, then computing.
+    pub latency_ms: u32,
+    /// Resampling and spectrogram (ms).
+    pub frontend_ms: f32,
+    /// The model itself (ms).
+    pub invoke_ms: f32,
+    /// Tensor arena the model uses (bytes).
+    pub arena_bytes: u32,
 }
 
 /// The server's answer to a heartbeat. Older servers answer with no body.

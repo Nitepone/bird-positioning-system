@@ -416,11 +416,18 @@
     </fieldset>
     <fieldset>
       <legend>Recording validation</legend>
-      <select id="set-validation">
+      <select id="set-validation" onchange="showValidationFields()">
         <option value="none">None: upload every triggered recording</option>
+        <option value="model">Model: upload only if a model on the client's card hears a bird</option>
       </select><br>
-      <small>Checks a triggered recording on the client before it is uploaded, e.g. with a model that hears
-        whether a bird is calling. No checks are available yet.</small>
+      <span id="set-val-model-fields">
+        Model <input id="set-val-model" size="24" placeholder="e.g. drongonet-micro">
+        threshold <input id="set-val-thr" type="number" min="0" max="1" step="0.01" style="width: 5em" placeholder="model's"><br>
+      </span>
+      <small>Checks a triggered recording on the client before it is uploaded. A model is a folder in the card's
+        <span class="mono">/models/</span> (see <span class="mono">trigger-models/</span>); leave the threshold empty
+        for the model's own. A client without the model, or that cannot run it, uploads everything and says why
+        on its page. Each decision is logged as a <span class="mono">validation</span> event.</small>
     </fieldset>
     <button type="submit">Save settings</button>
     <span id="set-msg"></span>
@@ -1525,9 +1532,19 @@ function triggerText(t) {
   if (t.trigger_type === "energy") return `energy, ${t.threshold_db} dB`;
   return t.trigger_type;
 }
-function validationText(v) {
+function validationText(v, h) {
   const type = v?.validation_type ?? "none";
-  return type === "none" ? "no validation" : `validation: ${type}`;
+  let text = type === "none" ? "no validation"
+    : type === "model" ? `model ${v.validation_model}` + (v.validation_threshold != null ? ` at ${v.validation_threshold}` : "")
+    : `validation: ${type}`;
+  if (h?.chunks_rejected) text += `, ${h.chunks_rejected} rejected`;
+  if (h?.validation_note) text += ` (${h.validation_note})`;
+  return text;
+}
+
+function showValidationFields() {
+  document.getElementById("set-val-model-fields").style.display =
+    document.getElementById("set-validation").value === "model" ? "" : "none";
 }
 
 // ---- config page: server settings ----
@@ -1565,7 +1582,11 @@ function renderSettings(v) {
     document.getElementById("set-trig-hi").value = t.band_high_hz;
     document.getElementById("set-trig-frame").value = t.frame_ms;
   }
-  document.getElementById("set-validation").value = v.settings.validation.validation_type;
+  const val = v.settings.validation;
+  document.getElementById("set-validation").value = val.validation_type;
+  document.getElementById("set-val-model").value = val.validation_model ?? "";
+  document.getElementById("set-val-thr").value = val.validation_threshold ?? "";
+  showValidationFields();
   showSpeciesSummary(v.local_species);
   settingsDirty = false;
 }
@@ -1601,6 +1622,12 @@ async function saveSettings(ev) {
     msg.textContent = "Enter the trigger's settings as numbers.";
     return;
   }
+  const validation = { validation_type: document.getElementById("set-validation").value };
+  if (validation.validation_type === "model") {
+    validation.validation_model = document.getElementById("set-val-model").value.trim();
+    const thr = document.getElementById("set-val-thr").value.trim();
+    if (thr !== "") validation.validation_threshold = Number(thr);
+  }
   msg.textContent = "Saving...";
   try {
     renderSettings(await api("/settings", {
@@ -1611,7 +1638,7 @@ async function saveSettings(ev) {
         min_confidence_expected: checked("conf-expected"),
         min_confidence_unexpected: checked("conf-unexpected"),
         trigger,
-        validation: { validation_type: document.getElementById("set-validation").value },
+        validation,
       }),
     }));
     msg.textContent = "Saved.";
@@ -2100,7 +2127,7 @@ function renderClientDetail() {
     tile("Detections, 24 h", detTotal ?? "-", det ? `peak ${Math.max(...det.counts)} in an hour` : "loading"),
     h ? tile("Audio chunks" + asOf, `${h.chunks_sent} sent`,
       `${h.chunks_gated} gated ${info("Gated: quiet chunks the client did not send. Counted since it started.")}`) : "",
-    h?.trigger ? tile("Trigger" + asOf, esc(triggerText(h.trigger)), esc(validationText(h.validation))) : "",
+    h?.trigger ? tile("Trigger" + asOf, esc(triggerText(h.trigger)), esc(validationText(h.validation, h))) : "",
   ].join("");
 
   // Hardware Info: power, storage, radio, devices, firmware.

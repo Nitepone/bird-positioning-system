@@ -16,6 +16,7 @@
 #include "timesync.h"
 #include "trigger.h"
 #include "upload.h"
+#include "validate.h"
 
 #define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 
@@ -109,10 +110,10 @@ static struct {
     bps_validation_config want_v, run_v;
 } trig;
 
-static txn reg_txn, hb_txn, pos_txn;
+static txn reg_txn, hb_txn, pos_txn, val_txn;
 /* Heartbeats carry the clock, the devices' reports and the mode; the others
  * are small. */
-static char reg_tx[1024], hb_tx[2816], pos_tx[512];
+static char reg_tx[1024], hb_tx[2816], pos_tx[512], val_tx[768];
 static uint64_t reg_next_us, reg_delay_us, hb_next_us, status_next_us;
 static bool hb_failing;
 
@@ -125,7 +126,8 @@ static struct {
 } ts = {.h = -1};
 
 static struct {
-    uint64_t chunks_sent, chunks_gated;
+    uint64_t chunks_sent, chunks_gated, chunks_rejected;
+    uint32_t reports_skipped; /* validation reports not sent: one still on its way */
     uint32_t overruns;
     uint32_t dropouts_reported, dropouts_sending;
     uint32_t idle_mark;
@@ -326,7 +328,10 @@ static void log_trigger(const char *what)
 {
     char d[96];
     bps_trigger_describe(&trig.run, d, sizeof d);
-    port_log("%s: %s; validation: %s", what, d, trig.run_v.name);
+    if (trig.run_v.type == BPS_VALIDATION_MODEL)
+        port_log("%s: %s; validation: model %s", what, d, trig.run_v.model);
+    else
+        port_log("%s: %s; validation: %s", what, d, trig.run_v.name);
 }
 
 /* What runs for what the server asks: unknown types fall back. */
@@ -337,16 +342,16 @@ static void trigger_runnable(const bps_trigger_config *t, const bps_validation_c
         *run = *t;
     else
         bps_trigger_default(run);
-    if (v->type == BPS_VALIDATION_NONE)
-        *run_v = *v;
+    if (v->type != BPS_VALIDATION_UNKNOWN)
+        *run_v = *v; /* a model: validate.h loads it, and says if it cannot */
     else
         bps_validation_default(run_v);
     if (t->type != BPS_TRIGGER_ENERGY)
         port_log("trigger: '%s' is not supported by this firmware; the energy trigger runs",
                  t->name);
-    if (v->type != BPS_VALIDATION_NONE)
-        port_log("validation: '%s' is not supported by this firmware; every recording is "
-                 "uploaded",
+    if (v->type == BPS_VALIDATION_UNKNOWN)
+        port_log("validation: '%s' is not supported by this firmware, or names an unusable "
+                 "model; every recording is uploaded",
                  v->name);
 }
 
@@ -357,6 +362,7 @@ static void trigger_start(const bps_trigger_config *t, const bps_validation_conf
     trig.want_v = *v;
     trigger_runnable(t, v, &trig.run, &trig.run_v);
     gate_cfg = trig.run.gate;
+    bps_validate_configure(&trig.run_v);
     log_trigger("trigger");
 }
 
@@ -386,7 +392,61 @@ static void apply_trigger(const bps_trigger_config *t, const bps_validation_conf
     trig.want_v = *v;
     trig.run = run;
     trig.run_v = run_v;
+    bps_validate_configure(&trig.run_v);
     log_trigger("trigger changed");
+}
+
+/* ---- Validation reports ---- */
+
+static void on_validated(const bps_validate_result *r, uint64_t latency_us)
+{
+    const bps_model_config *m = bps_validate_model();
+    char sc[16], th[16];
+    port_log("validation: %s, score %s %s %s (%lu ms after the trigger; front end %lu ms of which "
+             "resampling %lu, model %lu ms)",
+             r->ok ? (r->upload ? "upload" : "rejected") : "check failed, upload",
+             centi(sc, sizeof sc, (int32_t)lroundf(r->score * 100)), r->upload ? ">=" : "<",
+             centi(th, sizeof th, (int32_t)lroundf(r->threshold * 100)),
+             (unsigned long)(latency_us / 1000), (unsigned long)(r->frontend_us / 1000),
+             (unsigned long)(r->resample_us / 1000), (unsigned long)(r->invoke_us / 1000));
+    if (!m || !r->ok)
+        return;
+    if (state != ST_RUN || val_txn.state != TXN_IDLE) {
+        stats.reports_skipped++;
+        return;
+    }
+    static char body[512];
+    char path[96];
+    bps_json j;
+    bps_json_init(&j, body, sizeof body);
+    bps_json_raw(&j, "{");
+    bps_json_str(&j, "model", m->name);
+    bps_json_fixed(&j, "score", r->score, 4);
+    bps_json_fixed(&j, "threshold", r->threshold, 4);
+    bps_json_bool(&j, "upload", r->upload);
+    int64_t mono_ts, next;
+    bool has_next;
+    uint32_t next_idx;
+    (void)next;
+    if (epoch_set && bps_ring_locate(&ring, r->window_start, &mono_ts, &has_next, &next_idx))
+        bps_json_i64(&j, "window_start", bps_clock_at(&clk, mono_ts + epoch_ns));
+    bps_json_i64(&j, "window_ms", r->window_ms);
+    bps_json_i64(&j, "latency_ms", (int64_t)(latency_us / 1000));
+    bps_json_fixed(&j, "frontend_ms", r->frontend_us / 1000.0, 2);
+    bps_json_fixed(&j, "invoke_ms", r->invoke_us / 1000.0, 2);
+    bps_json_i64(&j, "arena_bytes", (int64_t)bps_validate_arena_used());
+    bps_json_raw(&j, "}");
+    if (j.overflow)
+        return;
+    path_for(path, sizeof path, "validation");
+    txn_start(&val_txn, "a validation report", path, body, j.len);
+}
+
+static void report_poll(void)
+{
+    txn_poll(&val_txn);
+    if (val_txn.state == TXN_DONE || val_txn.state == TXN_FAILED)
+        txn_reset(&val_txn);
 }
 
 static void start_capture(void)
@@ -424,6 +484,7 @@ static void start_capture(void)
         .need_register = &need_register,
         .connect_server = connect_server, .path_for = path_for,
         .read_response = read_response, .centi = centi,
+        .on_validated = on_validated, .chunks_rejected = &stats.chunks_rejected,
     };
     bps_upload_init(&u);
     stats.idle_mark = bps_ring_written(&ring);
@@ -465,6 +526,7 @@ static void drop_connections(void)
     txn_reset(&reg_txn);
     txn_reset(&hb_txn);
     txn_reset(&pos_txn);
+    txn_reset(&val_txn);
     bps_upload_drop();
     bps_spool_drop();
     if (ts.h >= 0)
@@ -1065,8 +1127,15 @@ static void start_heartbeat(uint64_t now)
     bps_devices_heartbeat(&j);
     mode_json(&j, now);
     if (capturing) {
+        bps_validation_config running;
+        bps_validate_running(&running);
         bps_trigger_json(&j, &trig.run);
-        bps_validation_json(&j, &trig.run_v);
+        bps_validation_json(&j, &running);
+        const char *note = bps_validate_note();
+        if (note) {
+            bps_json_str(&j, "validation_note", note);
+        }
+        bps_json_i64(&j, "chunks_rejected", (int64_t)stats.chunks_rejected);
     }
     bps_json_raw(&j, "}");
     mode.final_hb = mode.run == MODE_BATCH && mode.phase == C_FINAL;
@@ -1151,10 +1220,16 @@ static void position_poll(uint64_t now)
  * fit (a minute of measurements) cannot be extrapolated back to. */
 static void count_gated(void)
 {
-    if (!bps_upload_idle() || chunk_len == 0) {
+    if (chunk_len == 0)
+        return;
+    if (bps_upload_sending()) {
         stats.idle_mark = bps_upload_end();
         return;
     }
+    /* A chunk waiting for validation or to connect may yet go: once it is
+     * rejected (or dropped), its stretch counts from where counting stopped. */
+    if (!bps_upload_idle())
+        return;
     uint32_t w = bps_ring_written(&ring);
     while (bps_idx_diff(w, stats.idle_mark) >= (int32_t)chunk_len) {
         int64_t mono_ts;
@@ -1165,6 +1240,31 @@ static void count_gated(void)
                               bps_samples_to_ns(chunk_len, cfg.sample_rate));
         stats.chunks_gated++;
         stats.idle_mark += chunk_len;
+    }
+}
+
+/* Chunks that leave the ring unpolled (the network is down: count_gated() and
+ * uploads wait for ST_RUN) count as gated as they go, as count_gated() would
+ * later; a mark left 2^31 samples behind (12.4 h at 48 kHz) would compare as
+ * the future and stop the count for as long again. Uploads' marks likewise. */
+static void keep_marks_recent(void)
+{
+    if (!capturing)
+        return;
+    /* Past what count_gated() leaves behind, in ST_RUN, by a chunk. */
+    if (!bps_upload_sending())
+        stats.chunks_gated +=
+            bps_ring_catch_up(&ring, &stats.idle_mark, chunk_len, ring.capacity + chunk_len);
+    bps_upload_keep_recent();
+}
+
+/* While connecting: chunks being saved on the card (batch mode) go on, or the
+ * audio is lost if joining or registering takes longer than the ring holds. */
+static void offline_poll(uint64_t now)
+{
+    if (capturing && bps_upload_offline()) {
+        bps_upload_poll(now);
+        count_gated();
     }
 }
 
@@ -1230,7 +1330,7 @@ static void log_status(uint64_t now)
     /* The error is half the best round trip plus the scatter around the fit. */
     port_log("status: %s, clock error %ld us (best round trip %ld us, scatter %ld us), drift %s "
              "ppm, sample rate %s ppm (timeline scatter %ld ns, last point %ld ns off), %lu sent, "
-             "%lu gated, %lu dropouts, %lu bytes free (lowest %lu)",
+             "%lu gated, %lu rejected, %lu dropouts, %lu bytes free (lowest %lu)",
              synced() ? "synced" : "not synced", f ? (long)(f->error_ns / 1000) : -1L,
              f ? (long)(f->rtt_ns / 1000) : -1L,
              f ? (long)((f->error_ns - f->rtt_ns / 2) / 1000) : -1L,
@@ -1238,7 +1338,8 @@ static void log_status(uint64_t now)
              centi(b, sizeof b, LOAD(&cap.rate_err_ppb) / 10000), (long)LOAD(&cap.scatter_ns),
              (long)LOAD(&cap.predict_ns),
              (unsigned long)stats.chunks_sent, (unsigned long)stats.chunks_gated,
-             (unsigned long)dropouts_total(), (unsigned long)port_free_heap(),
+             (unsigned long)stats.chunks_rejected, (unsigned long)dropouts_total(),
+             (unsigned long)port_free_heap(),
              (unsigned long)heap_low);
     char devices[256];
     bps_devices_describe(devices, sizeof devices);
@@ -1293,7 +1394,9 @@ void bps_client_setup(const bps_settings *s)
     };
     bps_spool_init(&sc);
     mode_started(boot_us);
-    reg_txn.h = hb_txn.h = pos_txn.h = -1;
+    bps_validate_init(&ring, cfg.sample_rate);
+    reg_txn.h = hb_txn.h = pos_txn.h = val_txn.h = -1;
+    val_txn.tx = val_tx, val_txn.tx_cap = sizeof val_tx;
     reg_txn.tx = reg_tx, reg_txn.tx_cap = sizeof reg_tx;
     hb_txn.tx = hb_tx, hb_txn.tx_cap = sizeof hb_tx;
     pos_txn.tx = pos_tx, pos_txn.tx_cap = sizeof pos_tx;
@@ -1310,6 +1413,7 @@ void bps_client_loop(void)
     port_beacon pb;
     for (int i = 0; i < 16 && port_beacon_take(&pb); i++)
         bps_beacon_push(&beacon, pb.bssid, pb.tsf_us, pb.mono_ns);
+    keep_marks_recent();
     if (state != ST_WIFI && state != ST_OFF && !port_wifi_up()) {
         port_log("wifi: disconnected");
         drop_connections();
@@ -1317,6 +1421,7 @@ void bps_client_loop(void)
     }
     switch (state) {
     case ST_WIFI:
+        offline_poll(now);
         if (port_wifi_up()) {
             char wifi[128];
             port_wifi_diag(wifi, sizeof wifi);
@@ -1333,6 +1438,7 @@ void bps_client_loop(void)
             contact_connect_poll(now);
         break;
     case ST_REGISTER:
+        offline_poll(now);
         register_poll(now);
         if (state == ST_REGISTER)
             contact_connect_poll(now);
@@ -1350,8 +1456,11 @@ void bps_client_loop(void)
         count_gated();
         sync_poll(now);
         anchor_poll(now);
+        /* The card's reads are one at a time: the spool's pass and a model
+         * loading take turns (card.h). */
         live_spool_poll(now);
         bps_spool_poll(now);
+        report_poll();
         diag_loop_part("stored uploads");
         if (state == ST_RUN)
             contact_poll(now);
@@ -1371,6 +1480,8 @@ void bps_client_loop(void)
             wake(now);
         break;
     }
+    if (capturing)
+        bps_validate_poll(now);
     bps_devices_poll(now);
     update_led(now);
     log_status(now);

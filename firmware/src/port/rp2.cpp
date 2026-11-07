@@ -316,3 +316,18 @@ extern "C" void port_board_init(void)
 }
 
 #endif
+
+// ---- On-device models: not on these boards ----
+
+extern "C" void *port_big_alloc(size_t n) { return malloc(n); }
+extern "C" void port_big_free(void *p) { free(p); }
+extern "C" bool port_ml_load(const void *, size_t, size_t, port_ml_tensor *, port_ml_tensor *,
+                             size_t *, char *err, size_t cap)
+{
+    snprintf(err, cap, "this board cannot run models");
+    return false;
+}
+extern "C" bool port_ml_invoke(void) { return false; }
+extern "C" void port_ml_unload(void) {}
+extern "C" bool port_worker_start(void (*)(void)) { return false; }
+extern "C" void port_worker_kick(void) {}

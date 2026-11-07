@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "card.h"
 #include "port.h"
 #include "record.h"
 
@@ -137,7 +138,8 @@ enum { F_IDLE, F_LISTING, F_ORPHANS, F_NEXT, F_META, F_HEAD, F_READING, F_DATA, 
 
 static struct {
     int state, h;
-    bool again; /* kicked during a pass: make another */
+    bool pending; /* kicked: a pass starts once the card is free (card.h) */
+    bool again;   /* kicked during a pass: make another */
     char list[PORT_SD_READ_MAX + 1];
     size_t pos;
     uint32_t total, listed;
@@ -180,6 +182,13 @@ static void close_conn(void)
     f.h = -1;
 }
 
+/* The pass is over: the card is free for others. */
+static void idle(void)
+{
+    f.state = F_IDLE;
+    bps_card_give(BPS_CARD_SPOOL);
+}
+
 static void note_waiting(int64_t start_local)
 {
     f.waiting++;
@@ -192,7 +201,7 @@ static void note_waiting(int64_t start_local)
 static void list(void)
 {
     if (!port_sd_list(BPS_SPOOL_DIR, ".json")) {
-        f.state = F_IDLE;
+        idle();
         return;
     }
     /* Everything saved from here on is not in the listing. */
@@ -229,11 +238,15 @@ static void remove_orphans(const char *names, size_t len)
         if (n <= 5 || n - 5 + 6 > sizeof json)
             continue;
         snprintf(json, sizeof json, "%.*s.json\n", (int)(n - 5), s);
-        /* Listed, being written, or too recent to tell: not an orphan. */
+        /* Listed, saved since the listing (batch mode saves during a pass: in
+         * order, so from the first saved since on), being written, or too
+         * recent to tell: not an orphan. Names are in whole ms. */
+        int64_t start = strtoll(s, NULL, 10) * BPS_NANOS_PER_MS;
         bool listed = strstr(f.list, json) != NULL &&
                       (strstr(f.list, json) == f.list || strstr(f.list, json)[-1] == '\n');
-        if (listed || (w.active && strncmp(w.name, s, n - 5) == 0 && !w.name[n - 5]) ||
-            strtoll(s, NULL, 10) * BPS_NANOS_PER_MS > now_local - ORPHAN_AGE_NS)
+        bool saved_since = st.has_new_oldest && start > st.new_oldest - BPS_NANOS_PER_MS;
+        if (listed || saved_since || (w.active && strncmp(w.name, s, n - 5) == 0 && !w.name[n - 5]) ||
+            start > now_local - ORPHAN_AGE_NS)
             continue;
         snprintf(path, sizeof path, "%s/%.*s", BPS_SPOOL_DIR, (int)n, s);
         port_sd_remove(path);
@@ -263,7 +276,7 @@ static void pass_done(void)
         list();
         return;
     }
-    f.state = F_IDLE;
+    idle();
 }
 
 static void fail(const char *why)
@@ -417,7 +430,7 @@ static void finish_chunk(int r)
         *c.need_register = true;
         note_waiting(f.start_local);
         f.failing = true;
-        f.state = F_IDLE;
+        idle();
         return;
     } else if (status >= 400 && status < 500) {
         port_log("spool: the server refused %s (%d); deleted", f.name, status);
@@ -474,7 +487,7 @@ static bool step(uint64_t now)
             char path[48];
             path_of(path, sizeof path, f.name, "json");
             if (!port_sd_read(path, 0, META_MAX)) {
-                f.state = F_IDLE;
+                idle();
                 return false;
             }
         }
@@ -555,12 +568,12 @@ static bool step(uint64_t now)
     return false;
 }
 
-void bps_spool_kick(void)
+/* Starts the pass asked for, unless a model is loading (it holds the card). */
+static void start_pass(void)
 {
-    if (f.state != F_IDLE) {
-        f.again = true;
+    if (!f.pending || !bps_card_take(BPS_CARD_SPOOL))
         return;
-    }
+    f.pending = false;
     f.again = false;
     f.failing = false;
     f.sent = f.refused = 0;
@@ -569,22 +582,35 @@ void bps_spool_kick(void)
     list();
 }
 
+void bps_spool_kick(void)
+{
+    if (f.state != F_IDLE) {
+        f.again = true;
+        return;
+    }
+    f.pending = true;
+    start_pass();
+}
+
 void bps_spool_poll(uint64_t now)
 {
+    if (f.state == F_IDLE)
+        start_pass();
     for (int i = 0; i < 8 && f.state != F_IDLE && step(now); i++)
         ;
 }
 
-bool bps_spool_busy(void) { return f.state != F_IDLE; }
+bool bps_spool_busy(void) { return f.state != F_IDLE || f.pending; }
 
 void bps_spool_drop(void)
 {
+    f.pending = false;
     if (f.state == F_IDLE)
         return;
     close_conn();
     if (f.state >= F_META)
         note_waiting(f.start_local);
-    f.state = F_IDLE;
+    idle();
     f.again = false;
 }
 

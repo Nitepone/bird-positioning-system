@@ -19,8 +19,11 @@ typedef enum {
 
 typedef enum {
     BPS_VALIDATION_NONE,
+    BPS_VALIDATION_MODEL, /* a model on the card: /models/<model>/ */
     BPS_VALIDATION_UNKNOWN,
 } bps_validation_type;
+
+#define BPS_MODEL_NAME_MAX 32
 
 typedef struct {
     bps_trigger_type type;
@@ -31,6 +34,8 @@ typedef struct {
 typedef struct {
     bps_validation_type type;
     char name[16];
+    char model[BPS_MODEL_NAME_MAX]; /* BPS_VALIDATION_MODEL */
+    float threshold;                /* below 0: the model's own */
 } bps_validation_config;
 
 void bps_trigger_default(bps_trigger_config *t);

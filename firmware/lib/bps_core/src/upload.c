@@ -14,7 +14,9 @@
 /* For the server's answer, as for the client's other requests. */
 #define ANSWER_TIMEOUT_US 10000000
 
-enum { UP_IDLE, UP_SEND, UP_RESP };
+/* UP_CHECK: a triggered chunk waits for validation (validate.h); UP_RETRY:
+ * validation let it through, but the server could not be reached (yet). */
+enum { UP_IDLE, UP_CHECK, UP_RETRY, UP_SEND, UP_RESP };
 
 /* The client's state and helpers, from bps_upload_init(). */
 static bps_upload_ctx c;
@@ -22,12 +24,21 @@ static bps_upload_ctx c;
 /* Chunks from the next one on are saved on the card (batch mode). */
 static bool to_spool;
 
+static void check_poll(uint64_t now);
+
 static struct {
     int state, h;
     bool spool; /* this chunk goes to the card, not the server */
     uint32_t start, end, next, segs;
-    bool has_prev;
+    /* Passes up to here were handled (a chunk covered them, or was given up).
+     * prev_old: that end has left the ring, so ring indices no longer compare
+     * with it (they would wrap), and every pass since is new. */
+    bool has_prev, prev_old;
     uint32_t prev_end;
+    /* The gate's latest pass has left the ring: the next is new once the
+     * pass counter has moved on from pass_seen. */
+    bool pass_old;
+    uint32_t pass_seen;
     uint32_t frame; /* FLAC frames sent */
     int16_t pcm[BPS_FLAC_BLOCK];
     /* The request head, or a FLAC frame as one HTTP chunk: size line, frame,
@@ -39,6 +50,13 @@ static struct {
     bps_http_response resp;
     uint64_t progress_us, deadline_us, retry_us;
     uint32_t lost; /* samples of this chunk sent as silence */
+    /* UP_CHECK: the chunk's start, the model's window, whether its check runs. */
+    uint32_t chk_start, chk_win, chk_trigger;
+    bool chk_running;
+    /* Gate passes up to here were in a window validation rejected. */
+    bool has_skip, skip_old;
+    uint32_t skip_until, skip_count;
+    uint64_t chk_since_us;
     /* Logged when the upload ends. */
     struct {
         uint64_t begun_us, sent_us; /* sent_us: when the last byte was handed over */
@@ -163,12 +181,20 @@ static void upload_report(uint64_t now, const char *outcome)
     diag_upload_report();
 }
 
-static void upload_finish(void)
+/* The next chunk continues from `end` (passes before it are handled). */
+static void set_prev(uint32_t end)
+{
+    up.has_prev = true;
+    up.prev_old = false;
+    up.prev_end = end;
+}
+
+static void upload_finish(uint32_t end)
 {
     port_tcp_close(up.h);
     up.h = -1;
     up.state = UP_IDLE;
-    up.has_prev = true;
+    set_prev(end);
 }
 
 static void upload_abort(const char *why)
@@ -178,8 +204,7 @@ static void upload_abort(const char *why)
     snprintf(outcome, sizeof outcome, "aborted (%s, nothing written for %lu ms)", why,
              (unsigned long)((now - up.progress_us) / 1000));
     upload_report(now, outcome);
-    up.prev_end = up.next;
-    upload_finish();
+    upload_finish(up.next);
 }
 
 /* An HTTP chunk's size line, always 6 bytes ("%04X\r\n"; leading zeros are
@@ -202,8 +227,7 @@ static void spool_begin(uint32_t start, int64_t mono_ts, int64_t mono_end, int64
     if (!bps_spool_begin(mono_ts + *c.epoch_ns, mono_end + *c.epoch_ns, start_ns, end_ns,
                          c.cfg->sample_rate, c.chunk_len, head, sizeof head)) {
         /* No card with room: the chunk is lost. */
-        up.has_prev = true;
-        up.prev_end = start + c.chunk_len;
+        set_prev(start + c.chunk_len);
         up.retry_us = now + 1000000;
         return;
     }
@@ -218,8 +242,9 @@ static void spool_begin(uint32_t start, int64_t mono_ts, int64_t mono_end, int64
     up.state = UP_SEND;
 }
 
-/* Starts uploading `chunk_len` samples from ring index `start`. */
-static void upload_begin(uint32_t start, uint64_t now)
+/* Starts uploading `chunk_len` samples from ring index `start` (or saving
+ * them). False if the server could not be reached: the chunk is still to go. */
+static bool upload_begin(uint32_t start, uint64_t now)
 {
     uint32_t w = bps_ring_written(c.ring);
     uint32_t keep = c.ring->capacity - 4096 - c.cfg->sample_rate * BPS_UPLOAD_SLACK_MS / 1000;
@@ -231,9 +256,8 @@ static void upload_begin(uint32_t start, uint64_t now)
     uint32_t next_idx;
     for (;;) {
         if (!bps_ring_locate(c.ring, start, &mono_ts, &has_next, &next_idx)) {
-            up.has_prev = true; /* older than any remembered timeline: skip it */
-            up.prev_end = w;
-            return;
+            set_prev(w); /* older than any remembered timeline: skip it */
+            return true;
         }
         if (!has_next || bps_idx_diff(next_idx, start) >= (int32_t)c.chunk_len)
             break;
@@ -249,7 +273,7 @@ static void upload_begin(uint32_t start, uint64_t now)
     int64_t end_ns = bps_clock_at(c.clk, mono_end + *c.epoch_ns);
     if (to_spool) {
         spool_begin(start, mono_ts, mono_end, start_ns, end_ns, now);
-        return;
+        return true;
     }
 
     char extra[192], path[96];
@@ -277,7 +301,7 @@ static void upload_begin(uint32_t start, uint64_t now)
                                 "POST", c.cfg->server_host, c.cfg->server_port, path, "audio/flac",
                                 BPS_HTTP_CHUNKED, extra);
     if (!head)
-        return;
+        return true;
     put_chunk_size(up.buf + head, BPS_FLAC_HEADER_LEN);
     bps_flac_header(up.buf + head + 6, c.cfg->sample_rate, c.chunk_len);
     memcpy(up.buf + head + 6 + BPS_FLAC_HEADER_LEN, "\r\n", 2);
@@ -290,7 +314,7 @@ static void upload_begin(uint32_t start, uint64_t now)
         port_log("upload: cannot connect to %s:%u", c.cfg->server_host,
                  (unsigned)c.cfg->server_port);
         up.retry_us = now + 1000000;
-        return;
+        return false;
     }
     memset(&up.d, 0, sizeof up.d);
     up.d.begun_us = now;
@@ -307,6 +331,19 @@ static void upload_begin(uint32_t start, uint64_t now)
     bps_record_begin(start_ns, end_ns, tsf[0] ? tsf : NULL, c.cfg->sample_rate, c.chunk_len,
                      up.buf + head + 6, BPS_FLAC_HEADER_LEN);
     diag_upload_begin();
+    return true;
+}
+
+/* Uploads the chunk from `start`, which validation let through (or could not
+ * judge): if the server cannot be reached, that stands, and only connecting
+ * is tried again (UP_RETRY), not the check. */
+static void upload_checked(uint32_t start, uint64_t now)
+{
+    up.state = UP_IDLE;
+    if (!upload_begin(start, now)) {
+        up.state = UP_RETRY;
+        up.chk_start = start;
+    }
 }
 
 /* Reads `n` samples from `up.next`. Any already overwritten (the network
@@ -344,9 +381,8 @@ static int upload_refill(void)
             (has_next && bps_idx_diff(nx, up.end) < 0)) {
             if (up.spool) {
                 bps_spool_abort();
-                up.prev_end = up.next;
                 up.state = UP_IDLE;
-                up.has_prev = true;
+                set_prev(up.next);
             } else {
                 upload_abort("capture timeline jumped");
             }
@@ -425,9 +461,19 @@ static void spool_pump(void)
     if (up.lost)
         (*c.overruns)++;
     bps_spool_end(up.end - up.start, up.lost);
-    up.prev_end = up.end;
     up.state = UP_IDLE;
-    up.has_prev = true;
+    set_prev(up.end);
+}
+
+/* A pass this close to the end of a chunk, or later, may still be going: the
+ * next chunk follows on. The look-back (as much after the sound as before),
+ * but at most what a chunk holds after the pass that started it: a longer
+ * look-back would have every sound continue into a second chunk. */
+static uint32_t near_end(void)
+{
+    uint32_t before = c.cap->gate.frame_len + c.lookback;
+    uint32_t after = c.chunk_len > before ? c.chunk_len - before : 0;
+    return after < c.lookback ? after : c.lookback;
 }
 
 void bps_upload_poll(uint64_t now)
@@ -440,12 +486,20 @@ void bps_upload_poll(uint64_t now)
         upload_pump(now);
         return;
     }
+    if (up.state == UP_CHECK) {
+        check_poll(now);
+        return;
+    }
+    if (up.state == UP_RETRY) {
+        if (now >= up.retry_us)
+            upload_checked(up.chk_start, now);
+        return;
+    }
     if (up.state == UP_RESP) {
         int r = c.read_response(up.h, up.rx, sizeof up.rx, &up.rx_len, &up.resp);
         if (r == 0 && now < up.deadline_us)
             return;
-        up.prev_end = up.end;
-        upload_finish();
+        upload_finish(up.end);
         char outcome[40];
         if (r > 0 && up.resp.status >= 200 && up.resp.status < 300) {
             (*c.chunks_sent)++;
@@ -464,31 +518,155 @@ void bps_upload_poll(uint64_t now)
     }
 
     /* Idle: has the gate opened? Uploads wait for the first clock fit. */
-    if (!*c.epoch_set || !bps_est_fit(&c.clk->est) || now < up.retry_us ||
-        !LOAD(&c.cap->pass_count))
+    if (!*c.epoch_set || !bps_est_fit(&c.clk->est) || now < up.retry_us)
         return;
+    /* The count first: a pass counted after it ends later than the end read
+     * next (capture.c stores them the other way round). */
+    uint32_t count = LOAD(&c.cap->pass_count);
+    if (!count)
+        return;
+    if (up.pass_old) {
+        /* The latest pass left the ring unhandled (bps_upload_keep_recent):
+         * its end no longer compares, and its audio is gone. */
+        if (count == up.pass_seen)
+            return;
+        up.pass_old = false;
+    }
     uint32_t p = LOAD(&c.cap->last_pass_end);
     uint32_t w = bps_ring_written(c.ring);
     if (bps_idx_diff(w, p) > (int32_t)(c.ring->capacity / 2) && !up.has_prev) {
         /* Gated long ago (before the clock was ready): too old to send. */
-        up.has_prev = true;
-        up.prev_end = w;
+        set_prev(w);
         return;
     }
+    /* Already judged: a pass inside a window the model rejected. Once that
+     * window is out of the ring, ring indices no longer compare (and wrap), so
+     * the pass counter tells whether the gate has passed since. */
+    if (up.has_skip && !up.skip_old && bps_idx_diff(w, up.skip_until) > (int32_t)c.ring->capacity)
+        up.skip_old = true;
+    if (up.has_skip && up.skip_old && count != up.skip_count)
+        up.has_skip = false;
+    if (up.has_skip && (up.skip_old || bps_idx_diff(p, up.skip_until) <= 0))
+        return;
     uint32_t start = p - c.cap->gate.frame_len - c.lookback;
-    if (up.has_prev) {
+    if (up.has_prev && !up.prev_old) {
         /* Nothing new unless it passed near the end of the last chunk or after. */
-        if (bps_idx_diff(p, up.prev_end - c.lookback) <= 0)
+        if (bps_idx_diff(p, up.prev_end - near_end()) <= 0)
             return;
         if (bps_idx_diff(start, up.prev_end) < 0)
             start = up.prev_end; /* still open: continue without a gap */
     }
+    if (bps_validate_active()) {
+        /* The model's window: a third of it before the triggering frame. */
+        uint32_t frame_start = p - c.cap->gate.frame_len;
+        up.chk_win = frame_start - bps_validate_window() / 3;
+        up.chk_start = start;
+        up.chk_trigger = p;
+        up.chk_running = false;
+        up.chk_since_us = now;
+        up.state = UP_CHECK;
+        return;
+    }
     upload_begin(start, now);
 }
 
-void bps_upload_init(const bps_upload_ctx *ctx) { c = *ctx; }
+/* A triggered chunk waits for validation: for the rest of the model's window
+ * to be captured, then for the model. Fails open: anything that keeps the
+ * check from finishing uploads the chunk. */
+static void check_poll(uint64_t now)
+{
+    if (!bps_validate_active()) {
+        upload_checked(up.chk_start, now);
+        return;
+    }
+    uint32_t w = bps_ring_written(c.ring);
+    /* Waiting longer would let the chunk's start go out of the ring: as far
+     * as upload_begin() reaches back, less a second for the upload to start. */
+    uint32_t keep = c.ring->capacity - 4096 -
+                    c.cfg->sample_rate * (BPS_UPLOAD_SLACK_MS + 1000) / 1000;
+    if (bps_idx_diff(w, up.chk_start) > (int32_t)keep) {
+        uint32_t end = up.chk_win + bps_validate_window() + bps_validate_margin();
+        port_log("validation: no decision in time; uploading (waited %lu ms, %s, window end %ld ms ago, "
+                 "trigger %ld ms ago, start %ld ms ago)",
+                 (unsigned long)((now - up.chk_since_us) / 1000),
+                 up.chk_running ? "check running" : "check not started",
+                 (long)((int64_t)bps_idx_diff(w, end) * 1000 / c.cfg->sample_rate),
+                 (long)((int64_t)bps_idx_diff(w, up.chk_trigger) * 1000 / c.cfg->sample_rate),
+                 (long)((int64_t)bps_idx_diff(w, up.chk_start) * 1000 / c.cfg->sample_rate));
+        upload_checked(up.chk_start, now);
+        return;
+    }
+    if (!up.chk_running) {
+        uint32_t end = up.chk_win + bps_validate_window() + bps_validate_margin();
+        if (bps_idx_diff(w, end) < 0 || !bps_validate_start(up.chk_win))
+            return;
+        up.chk_running = true;
+        return;
+    }
+    bps_validate_result r;
+    if (!bps_validate_take(&r))
+        return;
+    up.state = UP_IDLE;
+    if (c.on_validated)
+        c.on_validated(&r, now - up.chk_since_us);
+    if (r.upload) {
+        upload_checked(up.chk_start, now);
+        return;
+    }
+    /* Rejected: passes inside the window are passed over. Nothing was sent,
+     * so the next chunk still starts its full look-back before its pass. */
+    (*c.chunks_rejected)++;
+    up.has_skip = true;
+    up.skip_old = false;
+    up.skip_until = up.chk_win + bps_validate_window();
+    up.skip_count = LOAD(&c.cap->pass_count);
+}
+
+void bps_upload_keep_recent(void)
+{
+    if (!c.ring)
+        return;
+    uint32_t w = bps_ring_written(c.ring);
+    int32_t cap = (int32_t)c.ring->capacity;
+    /* The count first, as in bps_upload_poll(). */
+    uint32_t count = LOAD(&c.cap->pass_count);
+    uint32_t p = LOAD(&c.cap->last_pass_end);
+    if (count && bps_idx_diff(w, p) > cap) {
+        up.pass_old = true;
+        up.pass_seen = count;
+    }
+    if (up.has_prev && !up.prev_old && bps_idx_diff(w, up.prev_end) > cap)
+        up.prev_old = true;
+    if (up.has_skip && !up.skip_old && bps_idx_diff(w, up.skip_until) > cap)
+        up.skip_old = true;
+    if ((up.state == UP_CHECK || up.state == UP_RETRY) && bps_idx_diff(w, up.chk_start) > cap) {
+        /* Its audio is gone: as if it had been sent, the passes it held are
+         * handled. A check still running ends on its own, and the next one
+         * waits for it (bps_validate_start). */
+        port_log("%s: the chunk left the ring before it could go; dropped",
+                 up.state == UP_CHECK ? "validation" : "upload");
+        up.state = UP_IDLE;
+        set_prev(up.chk_start + c.chunk_len);
+    }
+}
+
+void bps_upload_init(const bps_upload_ctx *ctx)
+{
+    c = *ctx;
+    memset(&up, 0, sizeof up); /* as at boot (once, but tests start each afresh) */
+    up.h = -1;
+}
 
 bool bps_upload_idle(void) { return up.state == UP_IDLE; }
+
+bool bps_upload_sending(void) { return up.state == UP_SEND || up.state == UP_RESP; }
+
+bool bps_upload_offline(void)
+{
+    if (up.state == UP_SEND || up.state == UP_RESP)
+        return up.spool;
+    return to_spool;
+}
 
 uint32_t bps_upload_end(void) { return up.end; }
 
@@ -496,13 +674,13 @@ void bps_upload_set_spool(bool on) { to_spool = on; }
 
 void bps_upload_drop(void)
 {
-    /* Saving on the card goes on without the network. */
-    if (up.state != UP_IDLE && !up.spool) {
+    /* Saving on the card goes on without the network, and so does a check,
+     * or a chunk waiting to connect. */
+    if (bps_upload_sending() && !up.spool) {
         bps_record_end(up.next - up.start, up.lost, "dropped (reconnecting)");
         port_tcp_close(up.h);
         up.h = -1;
         up.state = UP_IDLE;
-        up.has_prev = true;
-        up.prev_end = up.next;
+        set_prev(up.next);
     }
 }

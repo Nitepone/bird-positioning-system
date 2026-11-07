@@ -48,11 +48,13 @@ void bps_spool_abort(void);
 
 /* ---- Uploading ---- */
 
-/* Starts a pass over the spool, uploading what can be (unless one is going). */
+/* Asks for a pass over the spool, uploading what can be: it starts now, or
+ * (polled) once a model has loaded, as the card's reads are one at a time
+ * (card.h). One asked for while a pass goes follows it. */
 void bps_spool_kick(void);
 /* Carries on with the pass; call from the client's loop while connected. */
 void bps_spool_poll(uint64_t now);
-/* Whether a pass is going. */
+/* Whether a pass is going, or asked for. */
 bool bps_spool_busy(void);
 /* Gives up the pass (the client is disconnecting); the next starts over. */
 void bps_spool_drop(void);

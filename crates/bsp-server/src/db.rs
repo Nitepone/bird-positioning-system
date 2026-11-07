@@ -63,6 +63,10 @@ pub struct ClientHealth {
     pub trigger: Option<TriggerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_note: Option<String>,
+    #[serde(default)]
+    pub chunks_rejected: u64,
 }
 
 impl ClientHealth {
@@ -78,6 +82,8 @@ impl ClientHealth {
             mode: hb.mode.clone(),
             trigger: hb.trigger.clone(),
             validation: hb.validation.clone(),
+            validation_note: hb.validation_note.clone(),
+            chunks_rejected: hb.chunks_rejected,
         }
     }
 }
@@ -915,6 +921,8 @@ mod tests {
             }),
             trigger: Some(TriggerConfig::default()),
             validation: Some(ValidationConfig::None),
+            validation_note: None,
+            chunks_rejected: 0,
         };
         assert!(
             db.record_heartbeat(id, "addr2", Some(&clock), &health)
@@ -1274,6 +1282,8 @@ mod tests {
                 mode: None,
                 trigger: None,
                 validation: None,
+                validation_note: None,
+                chunks_rejected: 0,
             };
             db.record_heartbeat(id, "addr", None, &health).unwrap();
         };
@@ -1293,6 +1303,8 @@ mod tests {
             mode: None,
             trigger: None,
             validation: None,
+            validation_note: None,
+            chunks_rejected: 0,
         };
         db.record_heartbeat(a, "addr", None, &no_battery).unwrap();
 

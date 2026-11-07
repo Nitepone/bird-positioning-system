@@ -93,8 +93,23 @@ impl Settings {
             Some(TriggerConfig::Energy(g)) => validate_gate(g)?,
             Some(TriggerConfig::Unknown) => return Err("unsupported trigger type".into()),
         }
-        if self.validation == ValidationConfig::Unknown {
-            return Err("unsupported validation type".into());
+        match &self.validation {
+            ValidationConfig::None => {}
+            ValidationConfig::Model {
+                validation_model,
+                validation_threshold,
+            } => {
+                if !valid_model_name(validation_model) {
+                    return Err(format!(
+                        "the model name must be 1 to {MODEL_NAME_MAX} letters, digits, '.', '-' or '_' \
+                         (a folder in the card's /models/)"
+                    ));
+                }
+                if validation_threshold.is_some_and(|t| !(0.0..=1.0).contains(&t)) {
+                    return Err("the validation threshold must be within 0..1".into());
+                }
+            }
+            ValidationConfig::Unknown => return Err("unsupported validation type".into()),
         }
         Ok(())
     }
@@ -113,6 +128,17 @@ impl Settings {
             unexpected: self.min_confidence_unexpected.value(),
         }
     }
+}
+
+/// Longest model name the client takes (its folder on the card).
+pub const MODEL_NAME_MAX: usize = 31;
+
+fn valid_model_name(name: &str) -> bool {
+    (1..=MODEL_NAME_MAX).contains(&name.len())
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 fn validate_gate(g: &GateConfig) -> Result<(), String> {
@@ -291,5 +317,22 @@ mod tests {
             ..Settings::default()
         };
         assert!(unknown.validate().is_err());
+        let model = |name: &str, t: Option<f32>| Settings {
+            validation: ValidationConfig::Model {
+                validation_model: name.into(),
+                validation_threshold: t,
+            },
+            ..Settings::default()
+        };
+        assert!(model("drongonet-micro", None).validate().is_ok());
+        assert!(
+            model("birdnet-tiny-2.0-hybrid", Some(0.3))
+                .validate()
+                .is_ok()
+        );
+        for bad in ["", "../etc", "a/b", ".hidden", "x y", &"m".repeat(32)] {
+            assert!(model(bad, None).validate().is_err(), "{bad:?}");
+        }
+        assert!(model("m", Some(1.5)).validate().is_err());
     }
 }
