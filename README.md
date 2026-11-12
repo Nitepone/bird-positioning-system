@@ -269,6 +269,27 @@ without the access point's clock. In batch mode chunks are not also copied to `r
 Batch mode needs an ESP32 board (a Pico board has no card slot yet). A board starts in live mode
 and switches at its first heartbeat.
 
+**Maintenance: reboot and trace logging.** On the **Clients** page (select a client; *Maintenance*):
+
+- **Reboot** restarts the board cleanly: it lets the upload in progress finish (or gives it up after
+  15 s), closes its SD card, restarts, and is back within seconds. The request reaches it in the
+  reply to its next heartbeat (a batch client's: at its next contact), and the board acknowledges it
+  in its first heartbeat after the restart. It runs each request once, even if a reply comes again.
+- **Trace logging** sends every line the board logs (what `./build.sh -m` shows) to the server with
+  its heartbeats, for 10 minutes to 24 hours. The lines are on the **Logs** page (kind
+  `client_log`, filtered by client), at the time the board logged them. The board turns it off by
+  itself when the time is up, even if it cannot reach the server. It keeps the lines in RAM (8 KB,
+  4 KB on a Pico) until a heartbeat delivers them; in batch mode they wait for the next contact, and
+  any it had to drop meanwhile are counted (`client_log_dropped`). The lines count toward the
+  event log's retention (`event_retention`, the latest 10,000 events), so a long trace pushes older
+  events out sooner.
+
+Every board reports why it last started (power on, reboot from here, watchdog, brownout, crash or
+other), shown on the **Clients** page and logged as a `client_rebooted` event. Both commands need
+firmware with API 1.1.0 or later; for older firmware they show as not supported. `bsp-client` and the
+browser client answer them as not supported. The same through the API:
+`POST /api/v1/control/clients/{id}/reboot` and `PUT /api/v1/control/clients/{id}/logging`.
+
 **Configure, build and flash.** Two scripts in `firmware/` do it:
 
 ```sh
@@ -375,6 +396,7 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
+| Reboot and trace logging are greyed out ("not supported by this client's firmware") | The board's firmware predates them (API older than 1.1.0): build and flash it again |
 | Client is refused with "incompatible API version" | It and the server speak different major versions of the [client-server API](#api-version): update the client's firmware or the server so they match. The refused client is listed on the **Clients** page, flagged |
 | Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 boards only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
 | Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
@@ -465,7 +487,9 @@ With `-b` it also hears beacons of a pretend access point whose clock is the com
 clock, so several host clients on one computer (each with its own `-i UUID`) share an AP, as ESP32
 boards on one access point do. With `-d DIR` a directory stands in for an SD card: recordings are
 saved there as on a board, and taking the directory away and back acts as pulling the card. Host
-clients can run in batch mode too (turning the "radio" off cuts them off from the server).
+clients can run in batch mode too (turning the "radio" off cuts them off from the server). They
+take both maintenance commands: a reboot executes the program again with the same arguments (and
+reports `requested`; a fresh start reports `power_on`), and trace logging sends what it prints.
 
 ## Developer notes
 
@@ -477,7 +501,8 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 - `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement
   and noise gate, plus the audio timestamper, the access point clock (`beacon.c`), the ring
   buffer, the client's state machines, the I2C/SPI devices (`devices.c`, with a driver per kind:
-  `dev_max17048.c`, `dev_sd.c`) and the copy of recordings on the card (`record.c`). A new kind of
+  `dev_max17048.c`, `dev_sd.c`), the copy of recordings on the card (`record.c`) and the trace
+  log's ring (`logbuf.c`, fed by every port's `port_log`). A new kind of
   device is a driver, a line in the table in `devices.c` and its entry in `DRIVERS` in
   `scripts/bps_config.py`.
   `src/port/` adapts it to each board: `rp2.cpp` (arduino-pico; capture on core 1) and
@@ -512,8 +537,19 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
     `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`), `devices` (`kind`, `bus`,
     `address`, `present`) and `mode` (`mode`: `live` or `batch`, `interval_s`, `backlog`,
-    `backlog_bytes`, `delivered_through`, `next_contact_s`, `radio_on_pct`, `gap`, `note`). The
-    reply is `{"mode": {"mode": ..., "interval_s": ...}}`, the mode set for the client
+    `backlog_bytes`, `delivered_through`, `next_contact_s`, `radio_on_pct`, `gap`, `note`). From
+    API 1.1.0, optionally: `acks` (`[{"command_id": ..., "result": "done" | "unsupported" |
+    "failed"}]`, the commands handled since the last delivered heartbeat), `reboot_reason`
+    (`requested`, `power_on`, `watchdog`, `brownout`, `panic`, `other` or `unknown`; in every
+    heartbeat after a start until one is delivered) and `log` (`level`: `on` or `off`,
+    `remaining_s` while on, `now_ms`: the client's clock in ms since it started, `lines`:
+    `[[ms, "text"], ...]` since the last delivered heartbeat, as many as fit, `dropped`: lines lost
+    since then). The reply is `{"mode": {"mode": ..., "interval_s": ...}}`, the mode set for the
+    client, with the `trigger` and `validation` to run, and to clients on API 1.1.0 or later
+    `commands`: those not yet acknowledged, `[{"command_id": ..., "command": "reboot"}, {"command_id":
+    ..., "command": "logging", "log_level": "on" | "off", "log_duration_s": ...}]`. Command ids
+    increase (they are at least the time they were made, in ms since 1970); a client runs only ids
+    above the highest it has run, and remembers that across restarts
   - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
     client always sends FLAC, about a quarter the size, with chunked encoding). Optional:
     `x-bps-end-ns`, when the sample after the last was captured (the chunk's real duration), and
@@ -529,9 +565,19 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET|PUT /settings`: site location and confidence levels
   - `GET /local-species`: species expected at the site
   - `GET /clients`: each client's `version` and `api_version` (null for old firmware), and
-    `api_compat`: `compatible`, `client_newer`, `legacy` or `incompatible`
+    `api_compat`: `compatible`, `client_newer`, `legacy` or `incompatible`; `last_reboot`
+    (`reason`, `at`) and `maintenance`: `supported` (whether its firmware takes commands),
+    `reboot` and `logging` (the latest command of each: `id`, `params`, `created_at`,
+    `delivered_at`, `acked_at`, `result`: null while pending, then the client's answer or
+    `superseded`) and `logging_until` (while it captures its log, when it stops, as it reported)
   - `GET|PUT|DELETE /clients/{id}`
   - `PUT /clients/{id}/mode`: `{"mode": "live" | "batch", "interval_s": 30-3600}`
+  - `POST /clients/{id}/reboot`: queues a reboot (`202` with the command; `200` with the pending
+    one if there is one). `409` with `{"error": ...}` if the client's firmware does not take
+    commands (API older than 1.1.0)
+  - `PUT /clients/{id}/logging`: `{"level": "on", "duration_s": 1-86400}` or `{"level": "off"}`
+    (`202` with the command; it replaces a pending one; `409` as above). The firmware has one log
+    level, so `on` captures every line; `level` is where finer levels would go
   - `GET /clients/{id}/clock?minutes=`: the client's clock reports (one per heartbeat) over the
     last `minutes` (default 30, at most 60)
   - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
@@ -546,7 +592,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /samples/{client_id}/audio?from=&to=[&format=wav]`: what that client recorded over
     `from..to` (ns, at most 120 s), pieced together from its stored clips; FLAC, or WAV as above
   - `GET /samples/{client_id}/waveform?from=&to=`: the same as an SVG waveform
-  - `GET /events`
+  - `GET /events?client_id=&kind=&exclude_kind=&after_id=&limit=`: among others `client_log`
+    (`text`, `ms`: a line of a client's trace log, at the time it was logged),
+    `client_log_dropped`, `client_rebooted` (`reason`, `at`), `reboot_requested`,
+    `logging_requested` and `command_acked` (`command_id`, `command`, `result`)
   - `GET|DELETE /positioning-request`
 
 <a id="api-version"></a>
@@ -569,6 +618,10 @@ sends no `api_version` is old firmware: it is accepted as compatible, and flagge
 other major version is refused with an error that names both versions, and the **Clients** page
 lists the client as incompatible. Servers and clients must keep to the rules above for this to
 work: new fields stay optional, and a reader ignores fields it does not know.
+
+History: **1.1.0** added maintenance commands (`commands` in heartbeat replies; `acks`,
+`reboot_reason` and `log` in heartbeats). The server sends commands only to clients that registered
+with 1.1.0 or later.
 
 **Known limitations:**
 

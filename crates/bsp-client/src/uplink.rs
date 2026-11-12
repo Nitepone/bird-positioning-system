@@ -2,8 +2,8 @@
 
 use anyhow::{Context, bail};
 use bsp_proto::{
-    API_VERSION, CLIENT_API_PREFIX, Capabilities, ClientId, HEADER_START_NS, Heartbeat,
-    RegisterRequest, RegisterResponse, Timestamp,
+    API_VERSION, CLIENT_API_PREFIX, Capabilities, ClientId, CommandAck, CommandResult,
+    HEADER_START_NS, Heartbeat, HeartbeatResponse, RegisterRequest, RegisterResponse, Timestamp,
 };
 use reqwest::StatusCode;
 use std::collections::VecDeque;
@@ -116,15 +116,17 @@ impl Session {
         }
     }
 
-    pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<(), SendError> {
-        check(
+    /// Sends a heartbeat; the reply, unless it has none (older servers) or it
+    /// cannot be read.
+    pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<Option<HeartbeatResponse>, SendError> {
+        let resp = check(
             self.http
                 .post(self.url(&format!("/{}/heartbeat", self.id)))
                 .json(hb)
                 .send()
                 .await?,
         )?;
-        Ok(())
+        Ok(resp.json().await.ok())
     }
 
     pub async fn upload(&self, start: Timestamp, wav: Vec<u8>) -> Result<(), SendError> {
@@ -171,6 +173,10 @@ pub async fn heartbeat_loop(
 ) {
     let started = Instant::now();
     let mut tick = tokio::time::interval(interval);
+    // Maintenance commands (reboot, trace logging) are for the
+    // microcontroller client: this one answers each as unsupported, once.
+    let mut acks: Vec<CommandAck> = Vec::new();
+    let mut answered: VecDeque<i64> = VecDeque::new();
     loop {
         tick.tick().await;
         let hb = Heartbeat {
@@ -188,12 +194,38 @@ pub async fn heartbeat_loop(
             validation: Some(bsp_proto::ValidationConfig::None),
             validation_note: None,
             chunks_rejected: 0,
+            acks: acks.clone(),
+            reboot_reason: None,
+            log: None,
         };
-        if let Err(e) = session.heartbeat(&hb).await {
-            stats
-                .dropouts
-                .fetch_add(hb.capture_dropouts, Ordering::Relaxed);
-            session.recover(e).await;
+        match session.heartbeat(&hb).await {
+            Ok(reply) => {
+                acks.clear();
+                for c in reply.map(|r| r.commands).unwrap_or_default() {
+                    if answered.contains(&c.command_id) {
+                        continue;
+                    }
+                    tracing::info!(
+                        "the server asked for {} (command {}); this client does not support it",
+                        c.kind.name(),
+                        c.command_id
+                    );
+                    acks.push(CommandAck {
+                        command_id: c.command_id,
+                        result: CommandResult::Unsupported,
+                    });
+                    answered.push_back(c.command_id);
+                    if answered.len() > 32 {
+                        answered.pop_front();
+                    }
+                }
+            }
+            Err(e) => {
+                stats
+                    .dropouts
+                    .fetch_add(hb.capture_dropouts, Ordering::Relaxed);
+                session.recover(e).await;
+            }
         }
     }
 }

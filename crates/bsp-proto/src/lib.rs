@@ -28,7 +28,7 @@ pub const CLIENT_API_PREFIX: &str = "/api/v1/client";
 /// patch for a fix that changes nothing on the wire. The firmware's copy is
 /// `BPS_API_VERSION` in firmware/lib/bps_core/src/proto.h; a test keeps them
 /// equal.
-pub const API_VERSION: &str = "1.0.0";
+pub const API_VERSION: &str = "1.1.0";
 
 /// Header carrying the timestamp of the first sample of an uploaded WAV chunk.
 pub const HEADER_START_NS: &str = "x-bsp-start-ns";
@@ -330,6 +330,75 @@ mod tests {
     }
 
     #[test]
+    fn commands_wire_format() {
+        let c = Command {
+            command_id: 1_762_950_000_000,
+            kind: CommandKind::Reboot,
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "command_id": 1_762_950_000_000i64, "command": "reboot" })
+        );
+        let c = Command {
+            command_id: 7,
+            kind: CommandKind::Logging {
+                log_level: LogLevel::On,
+                log_duration_s: 600,
+            },
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "command_id": 7, "command": "logging", "log_level": "on",
+                                "log_duration_s": 600 })
+        );
+        assert_eq!(serde_json::from_value::<Command>(v).unwrap(), c);
+        // From a newer peer: kept apart, not an error.
+        let c: Command =
+            serde_json::from_str(r#"{"command_id":9,"command":"format_card"}"#).unwrap();
+        assert_eq!(c.kind, CommandKind::Unknown);
+        let l: LogLevel = serde_json::from_str(r#""trace""#).unwrap();
+        assert_eq!(l, LogLevel::Unknown);
+        let r: HeartbeatResponse =
+            serde_json::from_str(r#"{"mode":{"mode":"live","interval_s":300}}"#).unwrap();
+        assert!(r.commands.is_empty());
+        assert!(!serde_json::to_string(&r).unwrap().contains("commands"));
+    }
+
+    #[test]
+    fn heartbeats_carry_acks_reboot_reasons_and_logs() {
+        let hb: Heartbeat = serde_json::from_str(
+            r#"{"clock":null,"uptime_s":3,"chunks_sent":0,"chunks_gated":0,"queue_len":0,
+                "capture_dropouts":0,"acks":[{"command_id":5,"result":"done"}],
+                "reboot_reason":"requested",
+                "log":{"level":"on","remaining_s":42,"now_ms":3000,"dropped":2,
+                       "lines":[[2900,"wifi: connected"],[2950,"a \"quoted\" line"]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hb.acks,
+            [CommandAck {
+                command_id: 5,
+                result: CommandResult::Done
+            }]
+        );
+        assert_eq!(hb.reboot_reason, Some(RebootReason::Requested));
+        let log = hb.log.unwrap();
+        assert_eq!(log.lines[1], LogLine(2950, "a \"quoted\" line".into()));
+        assert_eq!((log.dropped, log.remaining_s), (2, Some(42)));
+        // A heartbeat from before API 1.1.0.
+        let old: Heartbeat = serde_json::from_str(
+            r#"{"clock":null,"uptime_s":3,"chunks_sent":0,"chunks_gated":0,"queue_len":0,
+                "capture_dropouts":0}"#,
+        )
+        .unwrap();
+        assert!(old.acks.is_empty() && old.reboot_reason.is_none() && old.log.is_none());
+        let r: RebootReason = serde_json::from_str(r#""cosmic_ray""#).unwrap();
+        assert_eq!(r, RebootReason::Unknown);
+    }
+
+    #[test]
     fn battery_charging_is_optional() {
         // As the MAX17048 driver reports it today: no charger status.
         let b: BatteryStatus =
@@ -477,7 +546,142 @@ pub struct Heartbeat {
     /// started.
     #[serde(default)]
     pub chunks_rejected: u64,
+    /// The commands the client has handled since its last delivered heartbeat
+    /// (API 1.1.0): the server stops sending each once it is acknowledged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acks: Vec<CommandAck>,
+    /// Why the client last started, in its first heartbeats after every
+    /// start until one is delivered (API 1.1.0, clients that can tell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot_reason: Option<RebootReason>,
+    /// The client's trace log: whether it is capturing, and the lines captured
+    /// since the last delivered heartbeat (API 1.1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<LogBatch>,
 }
+
+/// A maintenance command for one client, passed on in heartbeat replies until
+/// the client acknowledges it (API 1.1.0). A client runs each command once:
+/// ids increase over time, and it runs only ids above the highest it has run,
+/// remembering that across its restarts. The field names are unique across
+/// the reply, as the microcontroller client finds values by key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Command {
+    /// Assigned by the server: at least the time it was made in ms since
+    /// 1970, and above every earlier id.
+    pub command_id: i64,
+    #[serde(flatten)]
+    pub kind: CommandKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum CommandKind {
+    /// Restart cleanly: finish or give up the upload in progress, close the
+    /// storage card, restart, and report `reboot_reason: requested`.
+    Reboot,
+    /// Capture the client's log for `log_duration_s` from when the client
+    /// gets this (it turns capture off by itself then), or stop (`off`).
+    Logging {
+        log_level: LogLevel,
+        #[serde(default)]
+        log_duration_s: u32,
+    },
+    /// A command this build does not know (from a newer peer): acknowledged
+    /// as `unsupported`.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CommandKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Reboot => "reboot",
+            Self::Logging { .. } => "logging",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// How much of its log a client captures. The firmware has one level today:
+/// `on` captures every line it logs. Finer levels may be added under the same
+/// field; a client treats a level it does not know as `on`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    #[default]
+    Off,
+    On,
+    /// A level this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Longest trace logging the server asks for at once (s).
+pub const MAX_LOG_DURATION_S: u32 = 86_400;
+
+/// A client's answer to a command, in its next heartbeat.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandAck {
+    pub command_id: i64,
+    pub result: CommandResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResult {
+    /// Done (a reboot: acknowledged after the restart).
+    Done,
+    /// The client does not implement this command.
+    Unsupported,
+    /// The client tried, and could not.
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a client last started.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebootReason {
+    /// The server asked it to (a `reboot` command).
+    Requested,
+    PowerOn,
+    Watchdog,
+    Brownout,
+    /// A crash.
+    Panic,
+    /// A reset the client can name but is none of the above (e.g. its reset
+    /// pin, or a restart it was not asked for).
+    Other,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A client's trace log in one heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogBatch {
+    /// Whether the client captures its log now.
+    pub level: LogLevel,
+    /// Seconds until capture turns itself off, while it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_s: Option<u32>,
+    /// The client's clock (ms since it started) when it made the heartbeat:
+    /// with it, the lines' times map onto the server's clock.
+    pub now_ms: u64,
+    /// The lines captured since the last delivered heartbeat, oldest first
+    /// (as many as fit; the rest follow).
+    #[serde(default)]
+    pub lines: Vec<LogLine>,
+    /// Lines lost since the last delivered heartbeat: overwritten before they
+    /// could be sent, or logged while the capture buffer was busy.
+    #[serde(default)]
+    pub dropped: u32,
+}
+
+/// One line of a client's log: `[ms since the client started, text]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogLine(pub u64, pub String);
 
 /// What a client's validation decided about one triggered recording: sent
 /// for every recording the model read, uploaded or not, so its results and
@@ -518,6 +722,10 @@ pub struct HeartbeatResponse {
     pub trigger: Option<TriggerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationConfig>,
+    /// Maintenance commands still to be acknowledged (API 1.1.0; only to
+    /// clients that speak it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<Command>,
 }
 
 /// How a client uses its radio.

@@ -5,7 +5,7 @@ use crate::audio_buffer::TsfStamp;
 use crate::clip_audio;
 use crate::clock_history::ClockReport;
 use crate::compat::{self, ApiCompat};
-use crate::db::ClientHealth;
+use crate::db::{ClientHealth, ClientRecord, RebootInfo};
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
 use axum::Router;
@@ -16,8 +16,8 @@ use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
     API_VERSION, AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
-    HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, TriggerConfig,
-    ValidationConfig, ValidationReport, now_ns,
+    HeartbeatResponse, LogBatch, NANOS_PER_MS, NANOS_PER_SEC, RebootReason, RegisterRequest,
+    RegisterResponse, Timestamp, TriggerConfig, ValidationConfig, ValidationReport, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -186,6 +186,60 @@ fn clean_name(name: &str) -> String {
         .collect()
 }
 
+/// Two reports of a start this close together are of the same one (a
+/// heartbeat repeated because its reply was lost).
+const SAME_BOOT_NS: i64 = 10 * NANOS_PER_SEC;
+
+/// A heartbeat's report of why the client started: kept, and logged once.
+fn note_reboot(
+    state: &SharedState,
+    client: &ClientRecord,
+    reason: RebootReason,
+    uptime_s: u64,
+    now: Timestamp,
+) -> ApiResult<()> {
+    let at = now - uptime_s as i64 * NANOS_PER_SEC;
+    if client
+        .last_reboot
+        .is_some_and(|b| b.reason == reason && (b.at - at).abs() < SAME_BOOT_NS)
+    {
+        return Ok(());
+    }
+    state
+        .db
+        .set_last_reboot(client.id, &RebootInfo { reason, at })?;
+    tracing::info!(client = %client.id, ?reason, "client restarted");
+    state.event(
+        Some(client.id),
+        "client_rebooted",
+        json!({ "reason": reason, "at": at, "uptime_s": uptime_s }),
+    );
+    Ok(())
+}
+
+/// A heartbeat's log lines, each kept as a `client_log` event at the time
+/// the client logged it (its clock mapped onto the server's by the
+/// heartbeat's own time; the network delay is left in).
+fn store_log(state: &SharedState, id: ClientId, log: &LogBatch, now: Timestamp) {
+    if log.dropped > 0 {
+        state.event(
+            Some(id),
+            "client_log_dropped",
+            json!({ "count": log.dropped }),
+        );
+    }
+    for line in &log.lines {
+        let ago_ms = log.now_ms.saturating_sub(line.0).min(i64::MAX as u64 / 2) as i64;
+        let ts = now.saturating_sub(ago_ms.saturating_mul(NANOS_PER_MS));
+        state.event_at(
+            ts,
+            Some(id),
+            "client_log",
+            json!({ "text": line.1, "ms": line.0 }),
+        );
+    }
+}
+
 async fn heartbeat(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -201,7 +255,28 @@ async fn heartbeat(
     state
         .db
         .record_heartbeat(id, &addr.to_string(), hb.clock.as_ref(), &health)?;
-    state.event(Some(id), "heartbeat", serde_json::to_value(&hb)?);
+    // The log's lines are kept as events of their own.
+    let mut detail = serde_json::to_value(&hb)?;
+    if let Some(log) = detail.get_mut("log").and_then(|l| l.as_object_mut()) {
+        let n = log.remove("lines").and_then(|l| l.as_array().map(Vec::len));
+        log.insert("line_count".into(), n.unwrap_or(0).into());
+    }
+    state.event(Some(id), "heartbeat", detail);
+    if let Some(reason) = hb.reboot_reason {
+        note_reboot(&state, &before, reason, hb.uptime_s, now)?;
+    }
+    for ack in &hb.acks {
+        if let Some(c) = state.db.ack_command(id, ack.command_id, ack.result, now)? {
+            state.event(
+                Some(id),
+                "command_acked",
+                json!({ "command_id": c.id, "command": c.command, "result": c.result }),
+            );
+        }
+    }
+    if let Some(log) = &hb.log {
+        store_log(&state, id, log, now);
+    }
     for (kind, detail) in health_events(before.health.as_ref(), &health) {
         state.event(Some(id), kind, detail);
     }
@@ -236,10 +311,19 @@ async fn heartbeat(
         );
     }
     let (trigger, validation) = capture_settings(&state).await;
+    // Commands go only to clients that speak an API version with them.
+    let mut commands = Vec::new();
+    if compat::takes_commands(after.api_version.as_deref()) {
+        let pending = state.db.pending_commands(id)?;
+        commands = pending.iter().filter_map(|c| c.to_command()).collect();
+        let ids: Vec<i64> = pending.iter().map(|c| c.id).collect();
+        state.db.mark_delivered(&ids, now)?;
+    }
     Ok(Json(HeartbeatResponse {
         mode: after.mode,
         trigger: Some(trigger),
         validation: Some(validation),
+        commands,
     }))
 }
 
@@ -378,6 +462,7 @@ mod tests {
             validation: None,
             validation_note: None,
             chunks_rejected: 0,
+            logging: None,
         }
     }
 

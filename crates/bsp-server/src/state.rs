@@ -59,10 +59,21 @@ pub struct PositioningRequest {
 impl AppState {
     /// Records a raw event; failures are logged, never propagated.
     pub fn event(&self, client_id: Option<ClientId>, kind: &str, detail: serde_json::Value) {
+        self.event_at(now_ns(), client_id, kind, detail);
+    }
+
+    /// [`Self::event`] for something that happened at `ts` (server clock).
+    pub fn event_at(
+        &self,
+        ts: Timestamp,
+        client_id: Option<ClientId>,
+        kind: &str,
+        detail: serde_json::Value,
+    ) {
         tracing::debug!(?client_id, kind, %detail, "event");
-        if let Err(e) =
-            self.db
-                .insert_event(now_ns(), client_id, kind, &detail, self.cfg.event_retention)
+        if let Err(e) = self
+            .db
+            .insert_event(ts, client_id, kind, &detail, self.cfg.event_retention)
         {
             tracing::error!("failed to store event: {e}");
         }

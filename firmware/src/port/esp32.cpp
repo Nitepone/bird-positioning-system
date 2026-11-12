@@ -4,6 +4,7 @@
 #if defined(ARDUINO_ARCH_ESP32)
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -14,9 +15,11 @@
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
 #include <esp_private/wifi.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/ringbuf.h>
+#include <freertos/semphr.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -24,6 +27,7 @@
 
 extern "C" {
 #include "capture.h"
+#include "logbuf.h"
 #include "port.h"
 }
 
@@ -39,6 +43,19 @@ extern "C" void port_unique_id(uint8_t out[8])
 
 extern "C" size_t port_free_heap(void) { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
 
+// The trace log's lock: a FreeRTOS mutex, only ever tried (never waited for),
+// so it neither blocks a task nor, unlike a critical section, holds off the
+// I2S interrupt. Made in port_board_init(), before anything logs.
+static SemaphoreHandle_t log_mutex;
+static StaticSemaphore_t log_mutex_buf;
+
+extern "C" bool port_log_trylock(void)
+{
+    return log_mutex && xSemaphoreTake(log_mutex, 0) == pdTRUE;
+}
+
+extern "C" void port_log_unlock(void) { xSemaphoreGive(log_mutex); }
+
 extern "C" void port_log(const char *fmt, ...)
 {
     char buf[256];
@@ -47,6 +64,101 @@ extern "C" void port_log(const char *fmt, ...)
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     Serial.printf("[%10lu] %s\r\n", (unsigned long)millis(), buf);
+    bps_log_capture(port_mono_us(), buf);
+}
+
+// ---- Restarts ----
+//
+// The last command run, and a mark on a restart the server asked for, are
+// kept in RTC memory that a software restart (or a panic, or a watchdog)
+// leaves alone, checked by a magic number since it holds garbage after power
+// on. A reboot command's id also goes to NVS, which keeps it across power
+// cycles: it is written as the board is about to restart anyway (a flash
+// write stalls code running from flash, the capture task's included), so
+// trace logging commands, run while capturing, are kept in RTC memory only.
+
+#define KEEP_MAGIC 0x62707372u // "bpsr"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t restart; // the next software restart was asked for
+    int64_t command;
+    uint32_t check;
+} kept_t;
+
+static RTC_NOINIT_ATTR kept_t kept;
+
+static uint32_t kept_check(const kept_t *k)
+{
+    return k->magic ^ k->restart ^ (uint32_t)k->command ^ (uint32_t)((uint64_t)k->command >> 32) ^
+           0x5a5a5a5au;
+}
+
+static void kept_write(int64_t command, bool restart)
+{
+    kept.magic = KEEP_MAGIC;
+    kept.restart = restart;
+    kept.command = command;
+    kept.check = kept_check(&kept);
+}
+
+extern "C" void port_boot_info(port_boot *out)
+{
+    bool valid = kept.magic == KEEP_MAGIC && kept.check == kept_check(&kept);
+    int64_t command = valid ? kept.command : 0;
+    bool marked = valid && kept.restart;
+    Preferences nvs;
+    if (nvs.begin("bps", true)) {
+        int64_t stored = nvs.getLong64("command", 0);
+        if (stored > command)
+            command = stored;
+        nvs.end();
+    }
+    kept_write(command, false); // the mark is reported once
+    out->last_command = command;
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        out->reason = BPS_BOOT_POWER_ON;
+        break;
+    case ESP_RST_SW:
+        out->reason = marked ? BPS_BOOT_REQUESTED : BPS_BOOT_OTHER;
+        break;
+    case ESP_RST_PANIC:
+        out->reason = BPS_BOOT_PANIC;
+        break;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+        out->reason = BPS_BOOT_WATCHDOG;
+        break;
+    case ESP_RST_BROWNOUT:
+        out->reason = BPS_BOOT_BROWNOUT;
+        break;
+    case ESP_RST_UNKNOWN:
+        out->reason = BPS_BOOT_UNKNOWN;
+        break;
+    default: // the reset pin, deep sleep, USB, ...
+        out->reason = BPS_BOOT_OTHER;
+        break;
+    }
+}
+
+extern "C" void port_keep_command(int64_t id, bool restarting)
+{
+    kept_write(id, restarting);
+    if (!restarting)
+        return;
+    Preferences nvs;
+    if (nvs.begin("bps", false)) {
+        nvs.putLong64("command", id);
+        nvs.end();
+    }
+}
+
+extern "C" void port_restart(void)
+{
+    Serial.flush();
+    esp_restart();
 }
 
 // ---- Beacons ----
@@ -558,6 +670,7 @@ static StaticRingbuffer_t sd_q_struct;
 static int sd_cs = -1;
 static portMUX_TYPE sd_mux = portMUX_INITIALIZER_UNLOCKED;
 static port_sd_info sd_info; // under sd_mux
+static uint32_t sd_pending;  // items queued and not yet done, under sd_mux
 
 // The outcome of the latest read or listing: set by the card's task, with
 // the bytes in place first.
@@ -769,6 +882,9 @@ static void sd_task(void *)
                 }
             }
             vRingbufferReturnItem(sd_q, it);
+            portENTER_CRITICAL(&sd_mux);
+            sd_pending--;
+            portEXIT_CRITICAL(&sd_mux);
         }
         // Between files, check the card is still there, and its free space.
         if (mounted && !f && now >= next_check) {
@@ -824,6 +940,9 @@ static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, b
         sd_count(len, 0);
         return false;
     }
+    portENTER_CRITICAL(&sd_mux);
+    sd_pending++;
+    portEXIT_CRITICAL(&sd_mux);
     sd_item *it = (sd_item *)mem;
     it->op = op;
     it->append = append;
@@ -842,6 +961,14 @@ extern "C" bool port_sd_write(const char *path, const void *buf, size_t len, boo
 }
 
 extern "C" void port_sd_close(void) { sd_send(SD_CLOSE, "", nullptr, 0, false); }
+
+extern "C" bool port_sd_idle(void)
+{
+    portENTER_CRITICAL(&sd_mux);
+    bool idle = sd_pending == 0;
+    portEXIT_CRITICAL(&sd_mux);
+    return idle;
+}
 
 extern "C" bool port_sd_remove(const char *path) { return sd_send(SD_REMOVE, path, nullptr, 0, false); }
 
@@ -907,6 +1034,7 @@ extern "C" bool port_button(void)
 
 extern "C" void port_board_init(void)
 {
+    log_mutex = xSemaphoreCreateMutexStatic(&log_mutex_buf);
     // Down from 240 MHz, for power. The I2S clock comes from its own 160 MHz
     // PLL output and the timer from the crystal, so neither changes.
     setCpuFrequencyMhz(160);

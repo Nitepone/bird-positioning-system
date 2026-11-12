@@ -12,9 +12,13 @@
  * computer's real-time clock, so host clients on one computer share it.
  * -d DIR stands in a directory for a storage card: recordings are saved there.
  * The radio can be turned off (batch mode); joining again takes a second.
+ * A reboot the server asks for re-executes the program with the same
+ * arguments; the environment carries the last command run across it.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,6 +31,7 @@
 
 #include "capture.h"
 #include "client.h"
+#include "logbuf.h"
 #include "port.h"
 #include "proto.h"
 
@@ -43,14 +48,22 @@ void port_unique_id(uint8_t out[8]) { memcpy(out, chip_id, 8); }
 
 size_t port_free_heap(void) { return 64 << 20; } /* plenty */
 
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+bool port_log_trylock(void) { return pthread_mutex_trylock(&log_lock) == 0; }
+
+void port_log_unlock(void) { pthread_mutex_unlock(&log_lock); }
+
 void port_log(const char *fmt, ...)
 {
+    char buf[256];
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[%10lu] ", (unsigned long)(port_mono_us() / 1000));
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    uint64_t now = port_mono_us();
+    fprintf(stderr, "[%10lu] %s\n", (unsigned long)(now / 1000), buf);
+    bps_log_capture(now, buf);
 }
 
 /* While the radio is "off" there is no network; joining takes a second. */
@@ -221,6 +234,9 @@ static FILE *sd_file;
 static char sd_path[512];
 static port_sd_info sd_info;
 
+/* Written at once: nothing is ever waiting. */
+bool port_sd_idle(void) { return true; }
+
 bool port_sd_begin(int sck, int miso, int mosi, int cs)
 {
     (void)sck, (void)miso, (void)mosi, (void)cs;
@@ -378,6 +394,50 @@ static void *stdin_thread(void *arg)
 
 bool port_button(void) { return port_mono_us() < enter_until; }
 
+/* ---- Restarts: the program executes itself again ---- */
+
+#define ENV_LAST_COMMAND "BPS_HOST_LAST_COMMAND"
+#define ENV_RESTARTED "BPS_HOST_RESTARTED"
+
+static char **host_argv;
+
+void port_boot_info(port_boot *out)
+{
+    const char *last = getenv(ENV_LAST_COMMAND), *restarted = getenv(ENV_RESTARTED);
+    out->last_command = last ? strtoll(last, NULL, 10) : 0;
+    out->reason = restarted && strcmp(restarted, "1") == 0 ? BPS_BOOT_REQUESTED : BPS_BOOT_POWER_ON;
+    unsetenv(ENV_RESTARTED);
+}
+
+void port_keep_command(int64_t id, bool restarting)
+{
+    char v[24];
+    snprintf(v, sizeof v, "%lld", (long long)id);
+    setenv(ENV_LAST_COMMAND, v, 1);
+    if (restarting)
+        setenv(ENV_RESTARTED, "1", 1);
+}
+
+void port_restart(void)
+{
+    port_sd_close();
+    fflush(stdout);
+    fflush(stderr);
+    /* Nothing open is handed on: the client starts afresh. */
+    for (int fd = 3; fd < 1024; fd++)
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    /* By its real path, so the process keeps its name. */
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) {
+        self[n] = 0;
+        execv(self, host_argv);
+    }
+    execv("/proc/self/exe", host_argv);
+    port_log("reboot: cannot execute this program again (%s); exiting", strerror(errno));
+    exit(1);
+}
+
 /* From `git describe --tags --always --dirty`, set by the Makefile. */
 #ifndef BPS_GIT_DESCRIBE
 #define BPS_GIT_DESCRIBE "unknown"
@@ -403,6 +463,7 @@ int main(int argc, char **argv)
     };
     const char *wav_path = NULL;
     int opt;
+    host_argv = argv;
     while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:bd:V")) != -1) {
         switch (opt) {
         case 's': s.server_host = optarg; break;

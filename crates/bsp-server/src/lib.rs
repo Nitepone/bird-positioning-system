@@ -457,6 +457,286 @@ mod tests {
         assert_eq!(s["build"], BUILD);
     }
 
+    /// A heartbeat from client `id`, with `extra` fields; the reply.
+    async fn beat(state: &SharedState, id: u128, extra: Value) -> Value {
+        let mut hb = json!({ "clock": null, "uptime_s": 30, "chunks_sent": 0, "chunks_gated": 0,
+                             "queue_len": 0, "capture_dropouts": 0 });
+        for (k, v) in extra.as_object().unwrap() {
+            hb[k] = v.clone();
+        }
+        let path = format!("/api/v1/client/{}/heartbeat", Uuid::from_u128(id));
+        let (status, reply) = call(state, "POST", &path, Some(hb)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        reply
+    }
+
+    async fn control(
+        state: &SharedState,
+        method: &str,
+        id: u128,
+        what: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let path = format!("/api/v1/control/clients/{}/{what}", Uuid::from_u128(id));
+        call(state, method, &path, body).await
+    }
+
+    async fn events_of(state: &SharedState, kind: &str) -> Vec<Value> {
+        let (_, evs) = call(
+            state,
+            "GET",
+            &format!("/api/v1/control/events?kind={kind}&limit=500"),
+            None,
+        )
+        .await;
+        evs.as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_reboot_is_delivered_until_acknowledged() {
+        let state = test_state();
+        register(&state, 1, Some(API_VERSION)).await;
+        let (status, cmd) = control(&state, "POST", 1, "reboot", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = cmd["id"].as_i64().unwrap();
+        // Ids follow the clock (ms), so they keep increasing across database resets.
+        assert!((id - now_ns() / 1_000_000).abs() < 60_000, "{id}");
+        // Asking again while it is pending gives the same command.
+        let (status, again) = control(&state, "POST", 1, "reboot", None).await;
+        assert_eq!((status, again["id"].as_i64()), (StatusCode::OK, Some(id)));
+        assert_eq!(
+            listed(&state, 1).await["maintenance"]["reboot"]["result"],
+            Value::Null
+        );
+
+        // Every heartbeat reply carries it until the client answers.
+        for _ in 0..2 {
+            let reply = beat(&state, 1, json!({})).await;
+            assert_eq!(
+                reply["commands"],
+                json!([{ "command_id": id, "command": "reboot" }])
+            );
+        }
+        let m = &listed(&state, 1).await["maintenance"];
+        assert_eq!(m["supported"], true);
+        assert!(m["reboot"]["delivered_at"].is_i64());
+        assert_eq!(m["reboot"]["result"], Value::Null);
+
+        // The client restarts, and says so in its first heartbeat after.
+        let ack = json!({ "acks": [{ "command_id": id, "result": "done" }],
+                          "reboot_reason": "requested", "uptime_s": 4 });
+        let reply = beat(&state, 1, ack.clone()).await;
+        assert!(reply.get("commands").is_none(), "{reply}");
+        let c = listed(&state, 1).await;
+        assert_eq!(c["maintenance"]["reboot"]["result"], "done");
+        assert!(c["maintenance"]["reboot"]["acked_at"].is_i64());
+        assert_eq!(c["last_reboot"]["reason"], "requested");
+        // An answer repeated (its reply was lost) changes nothing, nor is logged twice.
+        beat(&state, 1, ack).await;
+        assert_eq!(events_of(&state, "command_acked").await.len(), 1);
+        assert_eq!(events_of(&state, "client_rebooted").await.len(), 1);
+        assert_eq!(events_of(&state, "reboot_requested").await.len(), 1);
+        // A new reboot gets a higher id.
+        let (status, next) = control(&state, "POST", 1, "reboot", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(next["id"].as_i64().unwrap() > id);
+        // Answers from another client do not count.
+        register(&state, 2, Some(API_VERSION)).await;
+        beat(
+            &state,
+            2,
+            json!({ "acks": [{ "command_id": next["id"], "result": "done" }] }),
+        )
+        .await;
+        assert_eq!(
+            listed(&state, 1).await["maintenance"]["reboot"]["result"],
+            Value::Null
+        );
+        // Unknown clients.
+        let (status, _) = control(&state, "POST", 9, "reboot", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn clients_without_commands_are_never_sent_any() {
+        let state = test_state();
+        register(&state, 1, None).await; // old firmware
+        register(&state, 2, Some("1.0.0")).await;
+        for id in [1, 2] {
+            let (status, body) = control(&state, "POST", id, "reboot", None).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not supported by this client's firmware")
+            );
+            let on = json!({ "level": "on", "duration_s": 60 });
+            let (status, _) = control(&state, "PUT", id, "logging", Some(on)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(listed(&state, id).await["maintenance"]["supported"], false);
+            // Even one queued somehow stays with the server.
+            state
+                .db
+                .queue_command(Uuid::from_u128(id), "reboot", &json!({}), now_ns())
+                .unwrap();
+            let reply = beat(&state, id, json!({})).await;
+            assert!(reply.get("commands").is_none(), "{reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_logging_shows_as_active_until_it_expires() {
+        let state = test_state();
+        register(&state, 1, Some(API_VERSION)).await;
+        for bad in [
+            json!({ "level": "on" }),
+            json!({ "level": "on", "duration_s": 0 }),
+            json!({ "level": "on", "duration_s": 86_401 }),
+            json!({ "level": "trace", "duration_s": 60 }),
+        ] {
+            let (status, _) = control(&state, "PUT", 1, "logging", Some(bad.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (status, first) = control(
+            &state,
+            "PUT",
+            1,
+            "logging",
+            Some(json!({ "level": "on", "duration_s": 60 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // A second setting takes the place of the first, still pending.
+        let (_, second) = control(
+            &state,
+            "PUT",
+            1,
+            "logging",
+            Some(json!({ "level": "on", "duration_s": 600 })),
+        )
+        .await;
+        let reply = beat(&state, 1, json!({})).await;
+        assert_eq!(
+            reply["commands"],
+            json!([{ "command_id": second["id"], "command": "logging",
+                                               "log_level": "on", "log_duration_s": 600 }])
+        );
+        assert!(second["id"].as_i64() > first["id"].as_i64());
+        let m = listed(&state, 1).await["maintenance"].clone();
+        assert_eq!(m["logging"]["id"], second["id"]);
+        assert_eq!(m["logging_until"], Value::Null); // not on yet
+
+        // On, as the client reports it: active until it turns itself off.
+        let on = json!({ "acks": [{ "command_id": second["id"], "result": "done" }],
+                         "log": { "level": "on", "remaining_s": 598, "now_ms": 1000 } });
+        let t = now_ns();
+        beat(&state, 1, on).await;
+        let until = listed(&state, 1).await["maintenance"]["logging_until"]
+            .as_i64()
+            .unwrap();
+        assert!((until - (t + 598 * NANOS)).abs() < 5 * NANOS, "{until}");
+        // A report from long ago has expired by now.
+        let c = state.db.get_client(Uuid::from_u128(1)).unwrap().unwrap();
+        let mut old = c.health.clone().unwrap();
+        old.at -= 600 * NANOS;
+        state.db.record_heartbeat(c.id, "a", None, &old).unwrap();
+        assert_eq!(
+            listed(&state, 1).await["maintenance"]["logging_until"],
+            Value::Null
+        );
+        // And off as soon as the client says so.
+        beat(
+            &state,
+            1,
+            json!({ "log": { "level": "on", "remaining_s": 30, "now_ms": 1 } }),
+        )
+        .await;
+        assert!(listed(&state, 1).await["maintenance"]["logging_until"].is_i64());
+        beat(&state, 1, json!({ "log": { "level": "off", "now_ms": 2 } })).await;
+        assert_eq!(
+            listed(&state, 1).await["maintenance"]["logging_until"],
+            Value::Null
+        );
+        // Turning it off needs no duration.
+        let (status, _) =
+            control(&state, "PUT", 1, "logging", Some(json!({ "level": "off" }))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    const NANOS: i64 = bsp_proto::NANOS_PER_SEC;
+
+    #[tokio::test]
+    async fn log_lines_are_kept_as_events_at_the_time_they_were_logged() {
+        let state = test_state();
+        register(&state, 1, Some(API_VERSION)).await;
+        let t = now_ns();
+        beat(&state, 1, json!({ "log": { "level": "on", "remaining_s": 60, "now_ms": 100_000,
+                                         "dropped": 3,
+                                         "lines": [[40_000, "wifi: connected"], [99_000, "a \"line\""]] } })).await;
+        let logs = events_of(&state, "client_log").await;
+        assert_eq!(logs.len(), 2);
+        // Newest first; each at the client's time on the server's clock.
+        assert_eq!(logs[0]["detail"]["text"], "a \"line\"");
+        assert_eq!(logs[1]["detail"]["text"], "wifi: connected");
+        assert_eq!(logs[1]["client_id"], Uuid::from_u128(1).to_string());
+        let ts = logs[1]["ts"].as_i64().unwrap();
+        assert!((ts - (t - 60 * NANOS)).abs() < 2 * NANOS, "{}", ts - t);
+        assert_eq!(
+            events_of(&state, "client_log_dropped").await[0]["detail"]["count"],
+            3
+        );
+        // Filtered by client, as the Logs page does.
+        let (_, evs) = call(
+            &state,
+            "GET",
+            &format!(
+                "/api/v1/control/events?client_id={}&kind=client_log",
+                Uuid::from_u128(1)
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(evs.as_array().unwrap().len(), 2);
+        // The heartbeat event keeps a count, not the lines again.
+        let hb = &events_of(&state, "heartbeat").await[0]["detail"]["log"];
+        assert_eq!((hb.get("lines"), &hb["line_count"]), (None, &json!(2)));
+    }
+
+    #[tokio::test]
+    async fn restarts_are_kept_and_logged_once_each() {
+        let state = test_state();
+        register(&state, 1, Some(API_VERSION)).await;
+        let t = now_ns();
+        beat(
+            &state,
+            1,
+            json!({ "reboot_reason": "power_on", "uptime_s": 20 }),
+        )
+        .await;
+        // The same report again (the reply to the first was lost).
+        beat(
+            &state,
+            1,
+            json!({ "reboot_reason": "power_on", "uptime_s": 25 }),
+        )
+        .await;
+        let c = listed(&state, 1).await;
+        assert_eq!(c["last_reboot"]["reason"], "power_on");
+        let at = c["last_reboot"]["at"].as_i64().unwrap();
+        assert!((at - (t - 20 * NANOS)).abs() < 2 * NANOS);
+        beat(
+            &state,
+            1,
+            json!({ "reboot_reason": "watchdog", "uptime_s": 2 }),
+        )
+        .await;
+        let evs = events_of(&state, "client_rebooted").await;
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0]["detail"]["reason"], "watchdog");
+        assert_eq!(listed(&state, 1).await["last_reboot"]["reason"], "watchdog");
+    }
+
     /// The browser client's copy of the API version is the same.
     #[test]
     fn browser_client_speaks_the_same_api_version() {

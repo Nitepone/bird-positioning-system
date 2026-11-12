@@ -8,6 +8,7 @@
 #include "beacon.h"
 #include "capture.h"
 #include "devices.h"
+#include "logbuf.h"
 #include "port.h"
 #include "proto.h"
 #include "record.h"
@@ -70,8 +71,8 @@ typedef struct {
     int h, state;
     char *tx; /* the request: head and body */
     size_t tx_cap, tx_len, tx_off;
-    char rx[768];
-    size_t rx_len;
+    char *rx; /* the response */
+    size_t rx_cap, rx_len;
     uint64_t deadline_us;
     bps_http_response resp;
 } txn;
@@ -111,9 +112,13 @@ static struct {
 } trig;
 
 static txn reg_txn, hb_txn, pos_txn, val_txn;
-/* Heartbeats carry the clock, the devices' reports and the mode; the others
- * are small. */
-static char reg_tx[1024], hb_tx[2816], pos_tx[512], val_tx[768];
+/* Heartbeats carry the clock, the devices' reports, the mode, and the trace
+ * log's lines (as many as fit), and their replies maintenance commands; the
+ * others are small. A heartbeat's body is written in place, after room for
+ * the request head (txn_start_at). */
+#define HB_HEAD_ROOM 320
+static char reg_tx[1024], hb_tx[4096], pos_tx[512], val_tx[768];
+static char reg_rx[768], hb_rx[1024], pos_rx[768], val_rx[768];
 static uint64_t reg_next_us, reg_delay_us, hb_next_us, status_next_us;
 static bool hb_failing;
 
@@ -241,6 +246,19 @@ static void txn_reset(txn *t)
     t->state = TXN_IDLE;
 }
 
+/* Sends the `len` bytes of request in the transaction's buffer. */
+static void txn_send(txn *t, const char *what, size_t len)
+{
+    t->tx_len = len;
+    t->tx_off = 0;
+    t->rx_len = 0;
+    t->h = connect_server(what);
+    if (t->h < 0)
+        return;
+    t->state = TXN_SENDING;
+    t->deadline_us = port_mono_us() + TXN_TIMEOUT_US;
+}
+
 static void txn_start(txn *t, const char *what, const char *path, const char *body,
                       size_t body_len)
 {
@@ -250,14 +268,21 @@ static void txn_start(txn *t, const char *what, const char *path, const char *bo
     if (!head || head + body_len > t->tx_cap)
         return;
     memcpy(t->tx + head, body, body_len);
-    t->tx_len = head + body_len;
-    t->tx_off = 0;
-    t->rx_len = 0;
-    t->h = connect_server(what);
-    if (t->h < 0)
+    txn_send(t, what, head + body_len);
+}
+
+/* txn_start() for a body already in the transaction's buffer, at `off`. */
+static void txn_start_at(txn *t, const char *what, const char *path, size_t off, size_t body_len)
+{
+    static char head[HB_HEAD_ROOM];
+    size_t n = bps_http_head(head, sizeof head, "POST", cfg.server_host, cfg.server_port, path,
+                             body_len ? "application/json" : NULL, body_len, NULL);
+    t->state = TXN_FAILED;
+    if (!n || n > off || off + body_len > t->tx_cap)
         return;
-    t->state = TXN_SENDING;
-    t->deadline_us = port_mono_us() + TXN_TIMEOUT_US;
+    memmove(t->tx + n, t->tx + off, body_len);
+    memcpy(t->tx, head, n);
+    txn_send(t, what, n + body_len);
 }
 
 static void txn_poll(txn *t)
@@ -281,7 +306,7 @@ static void txn_poll(txn *t)
             return;
         t->state = TXN_RECEIVING;
     }
-    int r = read_response(t->h, t->rx, sizeof t->rx, &t->rx_len, &t->resp);
+    int r = read_response(t->h, t->rx, t->rx_cap, &t->rx_len, &t->resp);
     if (r != 0) {
         txn_close(t);
         t->state = r > 0 ? TXN_DONE : TXN_FAILED;
@@ -984,6 +1009,299 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
     mode.phase = C_SYNC;
 }
 
+/* ---- Maintenance: commands from the server ----
+ *
+ * Heartbeat replies carry commands (a reboot, trace logging), each with an id
+ * the server gives in increasing order, until the client acknowledges it in a
+ * heartbeat. A command runs once: only ids above the highest run so far,
+ * which the board keeps across restarts (port_keep_command()), so a reply
+ * replayed or repeated, or the reboot command still in the first reply after
+ * the reboot, runs nothing again. A reboot is acknowledged after the restart,
+ * with the reason, `requested`. */
+
+#define MAX_ACKS 4
+#define MAX_COMMANDS 8
+/* A reboot lets the upload in progress (or the pass over the card's stored
+ * chunks) finish for this long, then gives it up; then waits this long at
+ * most for the card's queue to be written. */
+#define REBOOT_UPLOAD_WAIT_US 15000000
+#define REBOOT_CARD_WAIT_US 5000000
+#define LOG_MAX_S 86400
+/* The most of a heartbeat the trace log takes, and how soon the next
+ * heartbeat goes while lines are left over. */
+#define LOG_HB_BYTES 2048
+#define LOG_DRAIN_US 1000000
+
+static const char *const BOOT_NAMES[] = {"unknown",  "power_on", "requested", "watchdog",
+                                         "brownout", "panic",    "other"};
+
+typedef struct {
+    int64_t id;
+    const char *result; /* "done", "unsupported" */
+} ack;
+
+static struct {
+    int64_t last_run; /* the highest command id run */
+    ack acks[MAX_ACKS];  /* to send */
+    uint32_t n_acks, acks_sending;
+    ack answered[MAX_ACKS]; /* the latest answers, to repeat if asked again */
+    uint32_t n_answered;
+    int boot_reason;
+    bool boot_reported, boot_sending;
+    bool rebooting;
+    int reboot_phase; /* 0: letting an upload finish; 1: closing the card; 2: restarting */
+    uint64_t reboot_us;
+    uint64_t log_until_us;
+    bps_log_batch log_sending;
+} maint;
+
+/* "1762950000123", without printf's 64-bit support. */
+static const char *id_text(char out[24], int64_t v)
+{
+    char d[24];
+    int n = 0;
+    uint64_t u = v < 0 ? 0 : (uint64_t)v;
+    do {
+        d[n++] = (char)('0' + u % 10);
+        u /= 10;
+    } while (u);
+    for (int i = 0; i < n; i++)
+        out[i] = d[n - 1 - i];
+    out[n] = 0;
+    return out;
+}
+
+static void ack_add(int64_t id, const char *result)
+{
+    for (uint32_t i = 0; i < maint.n_acks; i++)
+        if (maint.acks[i].id == id)
+            return;
+    if (maint.n_acks == MAX_ACKS) { /* the oldest goes: it is asked again if still pending */
+        memmove(maint.acks, maint.acks + 1, sizeof maint.acks[0] * (MAX_ACKS - 1));
+        maint.n_acks--;
+        if (maint.acks_sending)
+            maint.acks_sending--;
+    }
+    maint.acks[maint.n_acks++] = (ack){id, result};
+}
+
+static void remember_answer(int64_t id, const char *result)
+{
+    if (maint.n_answered == MAX_ACKS) {
+        memmove(maint.answered, maint.answered + 1, sizeof maint.answered[0] * (MAX_ACKS - 1));
+        maint.n_answered--;
+    }
+    maint.answered[maint.n_answered++] = (ack){id, result};
+    ack_add(id, result);
+}
+
+/* A command is run: it is never run again, even after a restart. */
+static void command_ran(int64_t id, const char *result, bool restarting)
+{
+    maint.last_run = id;
+    port_keep_command(id, restarting);
+    if (!restarting)
+        remember_answer(id, result);
+}
+
+static void maint_setup(void)
+{
+    port_boot b;
+    memset(&maint, 0, sizeof maint);
+    port_boot_info(&b);
+    maint.boot_reason = b.reason >= 0 && b.reason <= BPS_BOOT_OTHER ? b.reason : BPS_BOOT_UNKNOWN;
+    maint.last_run = b.last_command > 0 ? b.last_command : 0;
+    char id[24];
+    if (maint.boot_reason == BPS_BOOT_REQUESTED && maint.last_run) {
+        port_log("boot: restarted as the server asked (command %s)", id_text(id, maint.last_run));
+        remember_answer(maint.last_run, "done");
+    } else {
+        port_log("boot: started (%s)", BOOT_NAMES[maint.boot_reason]);
+    }
+}
+
+static void logging_set(bool on, uint32_t secs, uint64_t now)
+{
+    if (on) {
+        if (secs < 1)
+            secs = 1;
+        if (secs > LOG_MAX_S)
+            secs = LOG_MAX_S;
+        maint.log_until_us = now + (uint64_t)secs * 1000000;
+        bps_log_set_capture(true);
+        port_log("trace logging: on for %lu s", (unsigned long)secs);
+    } else if (bps_log_capturing()) {
+        port_log("trace logging: off");
+        bps_log_set_capture(false);
+    }
+}
+
+/* The trace log turns itself off when its time is up, whether or not the
+ * server is heard from. */
+static void logging_poll(uint64_t now)
+{
+    if (bps_log_capturing() && now >= maint.log_until_us) {
+        port_log("trace logging: time is up; off");
+        bps_log_set_capture(false);
+    }
+}
+
+static void reboot_start(int64_t id, uint64_t now)
+{
+    char t[24];
+    command_ran(id, "done", true);
+    maint.rebooting = true;
+    maint.reboot_phase = 0;
+    maint.reboot_us = now;
+    port_log("reboot: asked by the server (command %s); restarting once the upload in progress "
+             "is done",
+             id_text(t, id));
+}
+
+/* One command of a heartbeat reply: the object at `obj`. */
+static void command_run(const char *obj, size_t len, int64_t id, uint64_t now)
+{
+    char cmd[24], t[24];
+    if (id <= maint.last_run) {
+        /* Run already: the server has not had the answer (or this is a
+         * reply replayed). Answered again, unless restarting for it. */
+        if (maint.rebooting)
+            return;
+        const char *result = "done";
+        for (uint32_t i = 0; i < maint.n_answered; i++)
+            if (maint.answered[i].id == id)
+                result = maint.answered[i].result;
+        ack_add(id, result);
+        return;
+    }
+    if (!bps_json_string(obj, len, "command", cmd, sizeof cmd))
+        cmd[0] = 0;
+    if (strcmp(cmd, "reboot") == 0) {
+        reboot_start(id, now);
+    } else if (strcmp(cmd, "logging") == 0) {
+        char level[16] = "on";
+        double secs = 0;
+        bps_json_string(obj, len, "log_level", level, sizeof level);
+        bps_json_number(obj, len, "log_duration_s", &secs);
+        /* One level here: any but "off" captures everything. */
+        bool on = strcmp(level, "off") != 0;
+        logging_set(on, secs < 1 ? 1 : secs > LOG_MAX_S ? LOG_MAX_S : (uint32_t)secs, now);
+        command_ran(id, "done", false);
+    } else {
+        port_log("command %s: '%s' is not supported by this firmware", id_text(t, id), cmd);
+        command_ran(id, "unsupported", false);
+    }
+}
+
+/* The commands in a heartbeat reply, by increasing id. */
+static void commands_reply(const char *body, size_t len, uint64_t now)
+{
+    struct {
+        int64_t id;
+        size_t obj, len;
+    } c[MAX_COMMANDS];
+    int n = 0;
+    size_t it = 0, obj, olen;
+    while (n < MAX_COMMANDS && bps_json_array_next(body, len, "commands", &it, &obj, &olen)) {
+        int64_t id;
+        if (!bps_json_int(body + obj, olen, "command_id", &id) || id <= 0)
+            continue;
+        int k = n++;
+        for (; k > 0 && c[k - 1].id > id; k--)
+            c[k] = c[k - 1];
+        c[k].id = id;
+        c[k].obj = obj;
+        c[k].len = olen;
+    }
+    for (int i = 0; i < n && !maint.rebooting; i++)
+        command_run(body + c[i].obj, c[i].len, c[i].id, now);
+}
+
+/* Restarting, once asked: true while the client is closing down, and the
+ * rest of the loop is left alone. */
+static bool reboot_poll(uint64_t now)
+{
+    if (!maint.rebooting)
+        return false;
+    if (maint.reboot_phase == 0) {
+        bool busy = bps_upload_sending() || bps_spool_busy();
+        if (busy && now - maint.reboot_us < REBOOT_UPLOAD_WAIT_US)
+            return false; /* the loop goes on meanwhile */
+        if (busy)
+            port_log("reboot: giving up the upload in progress");
+        drop_connections();
+        port_sd_close();
+        maint.reboot_phase = 1;
+        maint.reboot_us = now;
+    }
+    if (maint.reboot_phase == 1) {
+        if (!port_sd_idle() && now - maint.reboot_us < REBOOT_CARD_WAIT_US)
+            return true;
+        if (!port_sd_idle())
+            port_log("reboot: the SD card's queue is still being written; restarting anyway");
+        port_log("reboot: restarting");
+        maint.reboot_phase = 2;
+        port_restart();
+    }
+    return true;
+}
+
+/* What the heartbeat says of maintenance: acknowledgements, why the board
+ * started (until delivered), and the trace log. Last in the heartbeat: the
+ * log's lines take what room is left. */
+static void maint_json(bps_json *j, uint64_t now)
+{
+    maint.acks_sending = maint.n_acks;
+    if (maint.n_acks) {
+        char t[24];
+        bps_json_arr(j, "acks");
+        for (uint32_t i = 0; i < maint.n_acks; i++) {
+            if (i)
+                bps_json_raw(j, ",");
+            bps_json_raw(j, "{\"command_id\":");
+            bps_json_raw(j, id_text(t, maint.acks[i].id));
+            bps_json_str(j, "result", maint.acks[i].result);
+            bps_json_raw(j, "}");
+        }
+        bps_json_raw(j, "]");
+    }
+    maint.boot_sending = !maint.boot_reported;
+    if (maint.boot_sending) {
+        bps_json_str(j, "reboot_reason", BOOT_NAMES[maint.boot_reason]);
+    }
+    memset(&maint.log_sending, 0, sizeof maint.log_sending);
+    bool on = bps_log_capturing();
+    /* The log object's own fields, and the heartbeat's end. */
+    if ((!on && !bps_log_pending()) || j->overflow || j->cap - j->len < 96)
+        return;
+    bps_json_obj(j, "log");
+    bps_json_str(j, "level", on ? "on" : "off");
+    if (on) {
+        uint64_t left = maint.log_until_us > now ? maint.log_until_us - now : 0;
+        bps_json_i64(j, "remaining_s", (int64_t)((left + 999999) / 1000000));
+    }
+    bps_json_i64(j, "now_ms", (int64_t)(now / 1000));
+    size_t room = j->cap - j->len, end = 1 + 1 + 1; /* "}" "}" and the NUL */
+    size_t budget = room > end ? room - end : 0;
+    bps_log_json(j, budget < LOG_HB_BYTES ? budget : LOG_HB_BYTES, now / 1000, &maint.log_sending);
+    bps_json_raw(j, "}");
+}
+
+/* The server has the heartbeat (2xx). */
+static void maint_delivered(uint64_t now)
+{
+    uint32_t n = maint.acks_sending < maint.n_acks ? maint.acks_sending : maint.n_acks;
+    memmove(maint.acks, maint.acks + n, sizeof maint.acks[0] * (maint.n_acks - n));
+    maint.n_acks -= n;
+    maint.acks_sending = 0;
+    if (maint.boot_sending)
+        maint.boot_reported = true;
+    bps_log_delivered(&maint.log_sending);
+    if (maint.log_sending.valid && maint.log_sending.more && now + LOG_DRAIN_US < hb_next_us)
+        hb_next_us = now + LOG_DRAIN_US; /* more lines are waiting */
+    memset(&maint.log_sending, 0, sizeof maint.log_sending);
+}
+
 static void heartbeat_reply(uint64_t now)
 {
     const char *body = hb_txn.rx + hb_txn.resp.body_off;
@@ -993,6 +1311,7 @@ static void heartbeat_reply(uint64_t now)
     bool has_t = bps_trigger_parse(body, len, &t), has_v = bps_validation_parse(body, len, &v);
     if (capturing && (has_t || has_v))
         apply_trigger(&t, &v);
+    commands_reply(body, len, now);
     char m[16];
     double interval = mode.interval_s;
     if (!bps_json_string(body, len, "mode", m, sizeof m))
@@ -1071,10 +1390,9 @@ static uint32_t dropouts_total(void) { return LOAD(&cap.dropouts) + stats.overru
 
 static void start_heartbeat(uint64_t now)
 {
-    static char body[2304];
     char path[96];
     bps_json j;
-    bps_json_init(&j, body, sizeof body);
+    bps_json_init(&j, hb_tx + HB_HEAD_ROOM, sizeof hb_tx - HB_HEAD_ROOM);
     bps_json_raw(&j, "{");
     bps_json_key(&j, "clock");
     bps_clock_status st;
@@ -1141,12 +1459,13 @@ static void start_heartbeat(uint64_t now)
         }
         bps_json_i64(&j, "chunks_rejected", (int64_t)stats.chunks_rejected);
     }
+    maint_json(&j, now);
     bps_json_raw(&j, "}");
     mode.final_hb = mode.run == MODE_BATCH && mode.phase == C_FINAL;
     if (j.overflow)
         port_log("heartbeat: too long for its buffer; not sent");
     path_for(path, sizeof path, "heartbeat");
-    txn_start(&hb_txn, "a heartbeat", path, body, j.overflow ? 0 : j.len);
+    txn_start_at(&hb_txn, "a heartbeat", path, HB_HEAD_ROOM, j.overflow ? 0 : j.len);
 }
 
 static void heartbeat_poll(uint64_t now)
@@ -1165,6 +1484,7 @@ static void heartbeat_poll(uint64_t now)
         if (hb_failing)
             port_log("heartbeat: delivered again");
         hb_failing = false;
+        maint_delivered(now);
         heartbeat_reply(now);
     } else if (txn_unknown(&hb_txn)) {
         port_log("server forgot this client; re-registering");
@@ -1404,8 +1724,13 @@ void bps_client_setup(const bps_settings *s)
     reg_txn.tx = reg_tx, reg_txn.tx_cap = sizeof reg_tx;
     hb_txn.tx = hb_tx, hb_txn.tx_cap = sizeof hb_tx;
     pos_txn.tx = pos_tx, pos_txn.tx_cap = sizeof pos_tx;
+    val_txn.rx = val_rx, val_txn.rx_cap = sizeof val_rx;
+    reg_txn.rx = reg_rx, reg_txn.rx_cap = sizeof reg_rx;
+    hb_txn.rx = hb_rx, hb_txn.rx_cap = sizeof hb_rx;
+    pos_txn.rx = pos_rx, pos_txn.rx_cap = sizeof pos_rx;
     port_log("bps client %s on %s, id %s, %lu bytes free", cfg.version, cfg.board, id_str,
              (unsigned long)port_free_heap());
+    maint_setup();
     bps_devices_setup(&cfg.buses);
     port_wifi_begin(cfg.wifi_ssid, cfg.wifi_password, hostname);
     set_state(ST_WIFI);
@@ -1414,6 +1739,9 @@ void bps_client_setup(const bps_settings *s)
 void bps_client_loop(void)
 {
     uint64_t now = port_mono_us();
+    if (reboot_poll(now))
+        return;
+    logging_poll(now);
     port_beacon pb;
     for (int i = 0; i < 16 && port_beacon_take(&pb); i++)
         bps_beacon_push(&beacon, pb.bssid, pb.tsf_us, pb.mono_ns);

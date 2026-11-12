@@ -21,10 +21,16 @@ uint64_t port_mono_us(void);
 void port_unique_id(uint8_t out[8]);
 /* Free heap bytes (the ring buffer leaves 32 KB of it). */
 size_t port_free_heap(void);
+/* Prints a line to the serial port, and hands it to bps_log_capture()
+ * (logbuf.h) for the trace log. Any task or core; never from an interrupt. */
 #if defined(__GNUC__)
 __attribute__((format(printf, 1, 2)))
 #endif
 void port_log(const char *fmt, ...);
+/* The trace log's lock (logbuf.h): takes it if it is free, and never waits.
+ * Never called from an interrupt. */
+bool port_log_trylock(void);
+void port_log_unlock(void);
 
 /* Starts (or restarts) joining the network; Wi-Fi power saving off. After
  * port_wifi_off() it turns the radio back on first. */
@@ -158,6 +164,36 @@ void port_ml_unload(void);
  * seconds). False where there is none. */
 bool port_worker_start(void (*fn)(void));
 void port_worker_kick(void);
+
+/* Whether everything queued for the storage card has been written (true
+ * without a card): the client waits for it before restarting. */
+bool port_sd_idle(void);
+
+/* ---- Maintenance (commands from the server; client.c) ---- */
+
+/* Why the board last started. */
+enum {
+    BPS_BOOT_UNKNOWN,
+    BPS_BOOT_POWER_ON,
+    BPS_BOOT_REQUESTED, /* port_restart() after port_keep_command(id, true) */
+    BPS_BOOT_WATCHDOG,
+    BPS_BOOT_BROWNOUT,
+    BPS_BOOT_PANIC,
+    BPS_BOOT_OTHER,
+};
+typedef struct {
+    int reason;           /* BPS_BOOT_* */
+    int64_t last_command; /* the last command run before the start; 0 if none or forgotten */
+} port_boot;
+/* Called once, at setup. A requested restart is reported once: its mark is
+ * cleared. */
+void port_boot_info(port_boot *out);
+/* Keeps `id`, the last command run, across restarts (and power cycles where
+ * the board can); with `restarting`, marks the coming software restart as one
+ * the server asked for. */
+void port_keep_command(int64_t id, bool restarting);
+/* Restarts the board now. */
+void port_restart(void);
 
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);

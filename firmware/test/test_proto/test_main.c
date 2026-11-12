@@ -148,9 +148,43 @@ static void test_api_version_is_semver(void)
     TEST_ASSERT_EQUAL_INT(3, sscanf(BPS_API_VERSION, "%u.%u.%u%c", &major, &minor, &patch, &extra));
 }
 
+// The objects of an array, one at a time, as a heartbeat reply's commands.
+static void test_json_array_of_objects(void)
+{
+    const char *j = "{\"mode\":{\"mode\":\"live\"},\"commands\": [ {\"command_id\":1762950000123,"
+                    "\"command\":\"reboot\"}, {\"command_id\":2,\"note\":\"a } and \\\" in it\","
+                    "\"command\":\"logging\"} ],\"x\":1}";
+    size_t len = strlen(j), it = 0, obj, olen;
+    int64_t id;
+    char cmd[16];
+    TEST_ASSERT_TRUE(bps_json_array_next(j, len, "commands", &it, &obj, &olen));
+    TEST_ASSERT_TRUE(bps_json_int(j + obj, olen, "command_id", &id));
+    TEST_ASSERT_EQUAL_INT64(1762950000123LL, id);
+    TEST_ASSERT_TRUE(bps_json_string(j + obj, olen, "command", cmd, sizeof cmd));
+    TEST_ASSERT_EQUAL_STRING("reboot", cmd);
+    TEST_ASSERT_TRUE(bps_json_array_next(j, len, "commands", &it, &obj, &olen));
+    TEST_ASSERT_TRUE(bps_json_int(j + obj, olen, "command_id", &id));
+    TEST_ASSERT_EQUAL_INT64(2, id);
+    TEST_ASSERT_TRUE(bps_json_string(j + obj, olen, "command", cmd, sizeof cmd));
+    TEST_ASSERT_EQUAL_STRING("logging", cmd);
+    TEST_ASSERT_EQUAL_CHAR('}', j[obj + olen - 1]);
+    TEST_ASSERT_FALSE(bps_json_array_next(j, len, "commands", &it, &obj, &olen));
+    // None, or not an array of objects, or cut short.
+    it = 0;
+    TEST_ASSERT_FALSE(bps_json_array_next(j, len, "missing", &it, &obj, &olen));
+    it = 0;
+    TEST_ASSERT_FALSE(bps_json_array_next(j, len, "mode", &it, &obj, &olen));
+    it = 0;
+    TEST_ASSERT_FALSE(bps_json_array_next("{\"commands\":[]}", 15, "commands", &it, &obj, &olen));
+    it = 0;
+    const char *cut = "{\"commands\":[{\"command_id\":3,\"comm";
+    TEST_ASSERT_FALSE(bps_json_array_next(cut, strlen(cut), "commands", &it, &obj, &olen));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_json_array_of_objects);
     RUN_TEST(test_api_version_is_semver);
     RUN_TEST(test_http_head);
     RUN_TEST(test_http_parse);

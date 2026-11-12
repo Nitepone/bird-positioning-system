@@ -16,7 +16,47 @@ static uint64_t now_us = 1000000;
 
 // ---- The board ----
 
-void port_log(const char *fmt, ...) { (void)fmt; }
+// Lines logged go to the trace log as on a board (logbuf.h).
+void bps_log_capture(uint64_t mono_us, const char *text);
+static bool log_locked; // the trace log's lock, held by "another task"
+bool port_log_trylock(void)
+{
+    if (log_locked)
+        return false;
+    log_locked = true;
+    return true;
+}
+void port_log_unlock(void) { log_locked = false; }
+static char last_log[256];
+void port_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(last_log, sizeof last_log, fmt, ap);
+    va_end(ap);
+    bps_log_capture(port_mono_us(), last_log);
+}
+// What survives a restart, as on an ESP32 (NVS): the last command run, and a
+// mark on a restart the server asked for.
+static int64_t kept_command;
+static bool restart_marked;
+static int restarts;      // port_restart() calls
+static int power_cycle;   // the next boot is a power cycle: the mark is lost
+void port_boot_info(port_boot *out)
+{
+    out->last_command = kept_command;
+    out->reason = restart_marked && !power_cycle ? BPS_BOOT_REQUESTED : BPS_BOOT_POWER_ON;
+    restart_marked = false;
+    power_cycle = 0;
+}
+void port_keep_command(int64_t id, bool restarting)
+{
+    kept_command = id;
+    restart_marked = restart_marked || restarting;
+}
+void port_restart(void) { restarts++; }
+static bool sd_busy;
+bool port_sd_idle(void) { return !sd_busy; }
 uint64_t port_mono_us(void) { return now_us; }
 void port_unique_id(uint8_t out[8]) { memset(out, 7, 8); }
 size_t port_free_heap(void) { return 8u << 20; }
@@ -283,6 +323,10 @@ static void put_model(void)
 // The card starts empty.
 static void boot(bool model)
 {
+    bps_log_reset(); // RAM does not survive a restart
+    log_locked = false;
+    sd_busy = false;
+    now_us = 1000000; // as loop_once() has it once capture starts
     for (int i = 0; i < 32; i++) {
         free(files[i].data);
         memset(&files[i], 0, sizeof files[i]);
@@ -595,9 +639,278 @@ static void test_registration_reports_the_version_and_api_version(void)
     txn_reset(&reg_txn);
 }
 
+// ---- Maintenance: commands in heartbeat replies, the trace log ----
+
+static char reply_buf[2048];
+static const char *SERVER_ERROR = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+
+// A 200 reply with `body`.
+static const char *ok_reply(const char *body)
+{
+    snprintf(reply_buf, sizeof reply_buf, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    return reply_buf;
+}
+
+// Sends a heartbeat now, answered with `r`; its body (until the next request).
+static char hb_body[4096];
+static const char *heartbeat_answered(const char *r)
+{
+    reply = r;
+    room = SIZE_MAX;
+    hb_interval_us = 5000000;
+    hb_next_us = now_us;
+    request_len = 0;
+    for (int i = 0; i < 20 && (i == 0 || hb_txn.state != TXN_IDLE); i++)
+        heartbeat_poll(now_us);
+    TEST_ASSERT_EQUAL_INT(TXN_IDLE, hb_txn.state);
+    size_t n = request_len < sizeof request ? request_len : sizeof request - 1;
+    request[n] = 0;
+    const char *body = strstr((const char *)request, "\r\n\r\n");
+    TEST_ASSERT_NOT_NULL(body);
+    snprintf(hb_body, sizeof hb_body, "%s", body + 4);
+    return hb_body;
+}
+
+#define REBOOT_REPLY "{\"mode\":{\"mode\":\"live\",\"interval_s\":300}," \
+                     "\"commands\":[{\"command_id\":1762950000123,\"command\":\"reboot\"}]}"
+
+// Runs the loop until the client restarts (or `ms` pass).
+static void run_until_restart(uint32_t ms)
+{
+    int before = restarts;
+    for (uint32_t i = 0; i < ms / 10 && restarts == before; i++)
+        run_ms(10);
+}
+
+// A reboot runs once: the reply carrying it may come again (repeated, or
+// replayed), before the restart or after it, and it is acknowledged with the
+// reason once the board is back.
+static void test_a_reboot_runs_once_and_is_acknowledged_after_the_restart(void)
+{
+    kept_command = 0, restart_marked = false, restarts = 0;
+    boot(false);
+    const char *hb = heartbeat_answered(ok_reply(REBOOT_REPLY));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"reboot_reason\":\"power_on\""));
+    TEST_ASSERT_TRUE(maint.rebooting);
+    TEST_ASSERT_EQUAL_INT64(1762950000123LL, kept_command); // before restarting
+    TEST_ASSERT_TRUE(restart_marked);
+    // The same reply again, before the restart: no second reboot, no ack yet.
+    hb = heartbeat_answered(ok_reply(REBOOT_REPLY));
+    TEST_ASSERT_NULL(strstr(hb, "\"reboot_reason\"")); // delivered already
+    TEST_ASSERT_NULL(strstr(hb, "\"acks\""));
+    run_until_restart(1000);
+    TEST_ASSERT_EQUAL_INT(1, restarts);
+
+    // The restart: RAM is gone, what the board keeps is not.
+    boot(false);
+    TEST_ASSERT_FALSE(maint.rebooting);
+    hb = heartbeat_answered(ok_reply(REBOOT_REPLY)); // still pending at the server
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"acks\":[{\"command_id\":1762950000123,\"result\":\"done\"}]"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"reboot_reason\":\"requested\""));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    run_ms(30000);
+    TEST_ASSERT_EQUAL_INT(1, restarts);
+    // A replay much later: answered again, never run again.
+    hb = heartbeat_answered(ok_reply(REBOOT_REPLY));
+    TEST_ASSERT_NULL(strstr(hb, "\"reboot_reason\""));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"command_id\":1762950000123"));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "\"acks\""));
+    TEST_ASSERT_FALSE(maint.rebooting);
+
+    // A power cycle (the restart mark is lost, the last command kept): the
+    // same id is still not run.
+    power_cycle = 1;
+    boot(false);
+    hb = heartbeat_answered(ok_reply(REBOOT_REPLY));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"reboot_reason\":\"power_on\""));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    run_ms(20000);
+    TEST_ASSERT_EQUAL_INT(1, restarts);
+}
+
+// Commands run in order of their ids, each once, however a reply lists them.
+static void test_commands_run_in_order_once_each(void)
+{
+    kept_command = 0, restart_marked = false, restarts = 0;
+    boot(false);
+    heartbeat_answered(ok_reply("{\"commands\":["
+        "{\"command_id\":12,\"command\":\"logging\",\"log_level\":\"off\",\"log_duration_s\":0},"
+        "{\"command_id\":11,\"command\":\"logging\",\"log_level\":\"on\",\"log_duration_s\":60},"
+        "{\"command_id\":11,\"command\":\"logging\",\"log_level\":\"on\",\"log_duration_s\":60},"
+        "{\"command_id\":13,\"command\":\"format_card\"}]}"));
+    TEST_ASSERT_FALSE(bps_log_capturing()); // on (11), then off (12)
+    TEST_ASSERT_EQUAL_INT64(13, maint.last_run);
+    const char *hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "{\"command_id\":11,\"result\":\"done\"}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "{\"command_id\":12,\"result\":\"done\"}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "{\"command_id\":13,\"result\":\"unsupported\"}"));
+    // The trace log carries what was captured meanwhile.
+    TEST_ASSERT_NOT_NULL(strstr(hb, "trace logging: on for 60 s"));
+    // Asked again (the answers were lost): answered as before, not run again.
+    hb = heartbeat_answered(ok_reply("{\"commands\":[{\"command_id\":13,\"command\":\"format_card\"},"
+        "{\"command_id\":11,\"command\":\"logging\",\"log_level\":\"on\",\"log_duration_s\":60}]}"));
+    TEST_ASSERT_FALSE(bps_log_capturing());
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "{\"command_id\":13,\"result\":\"unsupported\"}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "{\"command_id\":11,\"result\":\"done\"}"));
+}
+
+// Trace logging turns itself off when its time is up, without the server.
+static void test_trace_logging_stops_by_itself(void)
+{
+    kept_command = 0, restart_marked = false;
+    boot(false);
+    heartbeat_answered(ok_reply("{\"commands\":[{\"command_id\":20,\"command\":\"logging\","
+                                "\"log_level\":\"on\",\"log_duration_s\":30}]}"));
+    TEST_ASSERT_TRUE(bps_log_capturing());
+    server_up = false; // the server goes away
+    run_ms(29000);
+    TEST_ASSERT_TRUE(bps_log_capturing());
+    run_ms(2000);
+    TEST_ASSERT_FALSE(bps_log_capturing());
+    TEST_ASSERT_EQUAL_STRING("trace logging: time is up; off", last_log);
+    // The lines from meanwhile still go, with the level now off.
+    server_up = true;
+    const char *hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"log\":{\"level\":\"off\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "time is up"));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "\"log\""));
+}
+
+// A heartbeat's log lines count as delivered only once the server answered
+// it with a 2xx: after a failed one they go again.
+static void test_log_lines_go_again_after_a_failed_heartbeat(void)
+{
+    kept_command = 0, restart_marked = false;
+    boot(false);
+    logging_set(true, 600, now_us);
+    port_log("line one");
+    const char *hb = heartbeat_answered(SERVER_ERROR);
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"line one\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"reboot_reason\":\"power_on\""));
+    port_log("line two");
+    hb = heartbeat_answered(SERVER_ERROR);
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"line one\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"line two\""));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"line one\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"remaining_s\":600"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"reboot_reason\":\"power_on\""));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "line one"));
+    TEST_ASSERT_NULL(strstr(hb, "line two"));
+    TEST_ASSERT_NULL(strstr(hb, "\"reboot_reason\"")); // delivered: said once
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"dropped\":0,\"lines\":[[")); // "delivered again"
+    TEST_ASSERT_NOT_NULL(strstr(hb, "heartbeat: delivered again"));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"dropped\":0,\"lines\":[]"));
+}
+
+// Whether `s` is one JSON value with its brackets balanced and its strings
+// closed (escapes included), and nothing after it.
+static bool json_balanced(const char *s)
+{
+    int depth = 0;
+    bool in_str = false;
+    for (const char *p = s; *p; p++) {
+        if (in_str) {
+            if (*p == '\\') {
+                if (!*++p)
+                    return false;
+            } else if (*p == '"') {
+                in_str = false;
+            } else if ((unsigned char)*p < 0x20 || (unsigned char)*p >= 0x80) {
+                return false;
+            }
+        } else if (*p == '"') {
+            in_str = true;
+        } else if (*p == '{' || *p == '[') {
+            depth++;
+        } else if (*p == '}' || *p == ']') {
+            if (--depth < 0)
+                return false;
+            if (depth == 0 && p[1])
+                return false;
+        }
+    }
+    return depth == 0 && !in_str;
+}
+
+// However much is logged, the heartbeat stays within its buffer and valid;
+// what does not fit goes in the next ones, which come sooner.
+static void test_a_full_trace_log_never_overflows_the_heartbeat(void)
+{
+    kept_command = 0, restart_marked = false;
+    boot(false);
+    logging_set(true, 600, now_us);
+    char line[300];
+    memset(line, '"', sizeof line - 1); // each escapes to two bytes
+    line[sizeof line - 1] = 0;
+    line[5] = '\\', line[6] = '\n', line[7] = (char)0xc3; // and more to clean up
+    for (int i = 0; i < 200; i++)
+        port_log("%03d %s", i, line);
+    int last = -1;
+    for (int beat = 0; beat < 30; beat++) {
+        const char *hb = heartbeat_answered(ok_reply("{}"));
+        TEST_ASSERT_TRUE(strlen(hb) < sizeof hb_tx - HB_HEAD_ROOM);
+        TEST_ASSERT_TRUE_MESSAGE(json_balanced(hb), hb);
+        if (beat == 0) {
+            // The ring kept the newest; the rest were counted.
+            TEST_ASSERT_NULL(strstr(hb, "\"dropped\":0,"));
+            // More is waiting: the next heartbeat comes within a second.
+            TEST_ASSERT_TRUE(hb_next_us <= now_us + LOG_DRAIN_US);
+        }
+        // Lines arrive in order, none twice.
+        for (const char *p = strstr(hb, "\"lines\":["); p && (p = strstr(p, ",\"")); p += 2) {
+            int n;
+            if (sscanf(p + 2, "%3d", &n) == 1 && p[5] == ' ') {
+                TEST_ASSERT_TRUE(n > last);
+                last = n;
+            }
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(199, last);
+    TEST_ASSERT_TRUE(last > 0);
+}
+
+// A reboot waits for the card's queue to be written, for a while.
+static void test_a_reboot_closes_the_card_first(void)
+{
+    kept_command = 0, restart_marked = false, restarts = 0;
+    boot(false);
+    heartbeat_answered(ok_reply(REBOOT_REPLY));
+    sd_busy = true;
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_INT(0, restarts);
+    TEST_ASSERT_EQUAL_INT(1, maint.reboot_phase);
+    sd_busy = false;
+    run_ms(20);
+    TEST_ASSERT_EQUAL_INT(1, restarts);
+    // A card that never finishes is waited for 5 s at most.
+    boot(false);
+    kept_command = 0;
+    maint.last_run = 0;
+    heartbeat_answered(ok_reply(REBOOT_REPLY));
+    sd_busy = true;
+    run_until_restart(4500);
+    TEST_ASSERT_EQUAL_INT(1, restarts);
+    run_until_restart(1000);
+    TEST_ASSERT_EQUAL_INT(2, restarts);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_a_reboot_runs_once_and_is_acknowledged_after_the_restart);
+    RUN_TEST(test_commands_run_in_order_once_each);
+    RUN_TEST(test_trace_logging_stops_by_itself);
+    RUN_TEST(test_log_lines_go_again_after_a_failed_heartbeat);
+    RUN_TEST(test_a_full_trace_log_never_overflows_the_heartbeat);
+    RUN_TEST(test_a_reboot_closes_the_card_first);
     RUN_TEST(test_registration_reports_the_version_and_api_version);
     RUN_TEST(test_batch_mode_saves_audio_while_a_contact_connects);
     RUN_TEST(test_rejected_chunks_count_once_as_gated);

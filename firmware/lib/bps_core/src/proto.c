@@ -280,6 +280,46 @@ bool bps_json_number(const char *json, size_t len, const char *key, double *out)
     return false;
 }
 
+bool bps_json_array_next(const char *json, size_t len, const char *key, size_t *it, size_t *obj,
+                         size_t *obj_len)
+{
+    size_t p = *it;
+    if (p == 0) {
+        p = json_value_at(json, len, key, 0);
+        if (!p || p >= len || json[p] != '[')
+            return false;
+        p++;
+    }
+    while (p < len && (json[p] == ' ' || json[p] == ',' || json[p] == '\n' || json[p] == '\r' ||
+                       json[p] == '\t'))
+        p++;
+    if (p >= len || json[p] != '{')
+        return false; /* the end of the array, or not an object */
+    int depth = 0;
+    bool in_str = false;
+    for (size_t q = p; q < len; q++) {
+        char c = json[q];
+        if (in_str) {
+            if (c == '\\')
+                q++;
+            else if (c == '"')
+                in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            if (--depth == 0) {
+                *obj = p;
+                *obj_len = q + 1 - p;
+                *it = q + 1;
+                return true;
+            }
+        }
+    }
+    return false; /* cut short */
+}
+
 /* ---- UUIDs ---- */
 
 static const char MARKER[7] = {'b', 'p', 's', '-', 'm', 'c', 'u'};

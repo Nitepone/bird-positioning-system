@@ -5,9 +5,9 @@
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
-    BatteryStatus, Capabilities, ClientId, ClockStatus, DeviceStatus, Heartbeat, ModeSetting,
-    ModeStatus, NANOS_PER_SEC, RegisterRequest, StorageStatus, Timestamp, TriggerConfig, Uuid,
-    ValidationConfig,
+    BatteryStatus, Capabilities, ClientId, ClockStatus, CommandResult, DeviceStatus, Heartbeat,
+    LogLevel, ModeSetting, ModeStatus, NANOS_PER_SEC, RebootReason, RegisterRequest, StorageStatus,
+    Timestamp, TriggerConfig, Uuid, ValidationConfig,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,57 @@ pub struct ClientRecord {
     /// The mode the operator set, which heartbeat replies pass on; the mode
     /// the client runs in is in its health.
     pub mode: ModeSetting,
+    /// When the client last started, and why, as it reported (clients that
+    /// can tell, from API 1.1.0).
+    pub last_reboot: Option<RebootInfo>,
+}
+
+/// A client's latest start, as it reported in its first heartbeat after it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RebootInfo {
+    pub reason: RebootReason,
+    /// When it started (server clock): the heartbeat's arrival less its uptime.
+    pub at: Timestamp,
+}
+
+/// Whether a client captures its trace log, as its latest heartbeat said.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LoggingStatus {
+    pub level: LogLevel,
+    /// Seconds until the client turns capture off by itself, from the
+    /// heartbeat's arrival (`ClientHealth::at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_s: Option<u32>,
+}
+
+/// A maintenance command for a client (see [`bsp_proto::Command`]).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CommandRecord {
+    pub id: i64,
+    #[serde(skip)]
+    pub client_id: ClientId,
+    /// `reboot` or `logging`.
+    pub command: String,
+    /// The command's own fields (`log_level`, `log_duration_s`).
+    pub params: serde_json::Value,
+    pub created_at: Timestamp,
+    /// When a heartbeat reply last carried it.
+    pub delivered_at: Option<Timestamp>,
+    pub acked_at: Option<Timestamp>,
+    /// How the client answered, or `superseded` when a newer command of the
+    /// same kind took its place before it was acknowledged. None while pending.
+    pub result: Option<String>,
+}
+
+impl CommandRecord {
+    /// As carried in heartbeat replies; None if it cannot be (a corrupt row).
+    pub fn to_command(&self) -> Option<bsp_proto::Command> {
+        let mut v = self.params.clone();
+        let obj = v.as_object_mut()?;
+        obj.insert("command_id".into(), self.id.into());
+        obj.insert("command".into(), self.command.clone().into());
+        serde_json::from_value(v).ok()
+    }
 }
 
 /// What a client's latest heartbeat said about the client itself (its clock
@@ -70,6 +121,8 @@ pub struct ClientHealth {
     pub validation_note: Option<String>,
     #[serde(default)]
     pub chunks_rejected: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingStatus>,
 }
 
 impl ClientHealth {
@@ -87,6 +140,10 @@ impl ClientHealth {
             validation: hb.validation.clone(),
             validation_note: hb.validation_note.clone(),
             chunks_rejected: hb.chunks_rejected,
+            logging: hb.log.as_ref().map(|l| LoggingStatus {
+                level: l.level,
+                remaining_s: l.remaining_s,
+            }),
         }
     }
 }
@@ -179,7 +236,8 @@ CREATE TABLE IF NOT EXISTS clients (
     last_addr TEXT NOT NULL DEFAULT '',
     clock TEXT,
     health TEXT,
-    mode TEXT
+    mode TEXT,
+    last_reboot TEXT
 );
 CREATE TABLE IF NOT EXISTS detections (
     id TEXT PRIMARY KEY,
@@ -207,6 +265,17 @@ CREATE TABLE IF NOT EXISTS battery_history (
     charging INTEGER
 );
 CREATE INDEX IF NOT EXISTS battery_history_client_ts ON battery_history(client_id, ts);
+CREATE TABLE IF NOT EXISTS client_commands (
+    id INTEGER PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    params TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    delivered_at INTEGER,
+    acked_at INTEGER,
+    result TEXT
+);
+CREATE INDEX IF NOT EXISTS client_commands_client ON client_commands(client_id, id);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -285,6 +354,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
     let clock: Option<String> = r.get("clock")?;
     let health: Option<String> = r.get("health")?;
     let mode: Option<String> = r.get("mode")?;
+    let last_reboot: Option<String> = r.get("last_reboot")?;
     Ok(ClientRecord {
         id: id.parse().unwrap_or_default(),
         name: r.get("name")?,
@@ -305,6 +375,25 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
         mode: mode
             .and_then(|m| serde_json::from_str(&m).ok())
             .unwrap_or_default(),
+        last_reboot: last_reboot.and_then(|b| serde_json::from_str(&b).ok()),
+    })
+}
+
+/// How long commands are kept once answered.
+pub const COMMAND_RETENTION_NS: i64 = 7 * 86_400 * NANOS_PER_SEC;
+
+fn row_to_command(r: &rusqlite::Row) -> rusqlite::Result<CommandRecord> {
+    let client: String = r.get("client_id")?;
+    let params: String = r.get("params")?;
+    Ok(CommandRecord {
+        id: r.get("id")?,
+        client_id: client.parse().unwrap_or_default(),
+        command: r.get("command")?,
+        params: serde_json::from_str(&params).unwrap_or_else(|_| serde_json::json!({})),
+        created_at: r.get("created_at")?,
+        delivered_at: r.get("delivered_at")?,
+        acked_at: r.get("acked_at")?,
+        result: r.get("result")?,
     })
 }
 
@@ -333,6 +422,7 @@ impl Db {
         add_column_if_missing(&conn, "clients", "api_version", "TEXT")?;
         add_column_if_missing(&conn, "clients", "health", "TEXT")?;
         add_column_if_missing(&conn, "clients", "mode", "TEXT")?;
+        add_column_if_missing(&conn, "clients", "last_reboot", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -507,10 +597,131 @@ impl Db {
         stmt.query_map([], row_to_client)?.collect()
     }
 
+    /// Records the client's latest start. Returns false if unknown.
+    pub fn set_last_reboot(&self, id: ClientId, b: &RebootInfo) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE clients SET last_reboot = ?2 WHERE id = ?1",
+            params![id.to_string(), json(b)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Queues a command for the client, superseding any pending command of
+    /// the same kind, and returns it. Its id is at least `now` in ms and
+    /// above every id given before, so it keeps increasing even across a
+    /// database reset (clients run only ids above the highest they have run).
+    pub fn queue_command(
+        &self,
+        client: ClientId,
+        command: &str,
+        params: &serde_json::Value,
+        now: Timestamp,
+    ) -> rusqlite::Result<CommandRecord> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let max: Option<i64> =
+            tx.query_row("SELECT max(id) FROM client_commands", [], |r| r.get(0))?;
+        let id = (now / 1_000_000).max(max.map_or(0, |m| m + 1));
+        tx.execute(
+            "UPDATE client_commands SET result = 'superseded'
+             WHERE client_id = ?1 AND command = ?2 AND result IS NULL",
+            params![client.to_string(), command],
+        )?;
+        tx.execute(
+            "INSERT INTO client_commands (id, client_id, command, params, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, client.to_string(), command, params.to_string(), now],
+        )?;
+        tx.execute(
+            "DELETE FROM client_commands WHERE result IS NOT NULL AND created_at < ?1",
+            [now - COMMAND_RETENTION_NS],
+        )?;
+        let rec = tx.query_row(
+            "SELECT * FROM client_commands WHERE id = ?1",
+            [id],
+            row_to_command,
+        )?;
+        tx.commit()?;
+        Ok(rec)
+    }
+
+    /// The client's commands not yet answered, oldest first.
+    pub fn pending_commands(&self, client: ClientId) -> rusqlite::Result<Vec<CommandRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT * FROM client_commands WHERE client_id = ?1 AND result IS NULL ORDER BY id",
+        )?;
+        stmt.query_map([client.to_string()], row_to_command)?
+            .collect()
+    }
+
+    /// Notes that a heartbeat reply carries these commands.
+    pub fn mark_delivered(&self, ids: &[i64], now: Timestamp) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("UPDATE client_commands SET delivered_at = ?2 WHERE id = ?1")?;
+        for id in ids {
+            stmt.execute(params![id, now])?;
+        }
+        Ok(())
+    }
+
+    /// Records the client's answer to one of its pending commands, and
+    /// returns that command; None (and nothing changes) if it is not one,
+    /// e.g. an answer repeated after the first was recorded.
+    pub fn ack_command(
+        &self,
+        client: ClientId,
+        id: i64,
+        result: CommandResult,
+        now: Timestamp,
+    ) -> rusqlite::Result<Option<CommandRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let result = serde_json::to_value(result)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let n = conn.execute(
+            "UPDATE client_commands SET acked_at = ?3, result = ?4
+             WHERE id = ?1 AND client_id = ?2 AND result IS NULL",
+            params![id, client.to_string(), now, result],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT * FROM client_commands WHERE id = ?1",
+            [id],
+            row_to_command,
+        )
+        .optional()
+    }
+
+    /// The client's latest command of a kind, answered or not.
+    pub fn latest_command(
+        &self,
+        client: ClientId,
+        command: &str,
+    ) -> rusqlite::Result<Option<CommandRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM client_commands WHERE client_id = ?1 AND command = ?2
+             ORDER BY id DESC LIMIT 1",
+            params![client.to_string(), command],
+            row_to_command,
+        )
+        .optional()
+    }
+
     pub fn delete_client(&self, id: ClientId) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM battery_history WHERE client_id = ?1",
+            [id.to_string()],
+        )?;
+        conn.execute(
+            "DELETE FROM client_commands WHERE client_id = ?1",
             [id.to_string()],
         )?;
         Ok(conn.execute("DELETE FROM clients WHERE id = ?1", [id.to_string()])? > 0)
@@ -948,6 +1159,7 @@ mod tests {
             validation: Some(ValidationConfig::None),
             validation_note: None,
             chunks_rejected: 0,
+            logging: None,
         };
         assert!(
             db.record_heartbeat(id, "addr2", Some(&clock), &health)
@@ -1310,6 +1522,7 @@ mod tests {
                 validation: None,
                 validation_note: None,
                 chunks_rejected: 0,
+                logging: None,
             };
             db.record_heartbeat(id, "addr", None, &health).unwrap();
         };
@@ -1331,6 +1544,7 @@ mod tests {
             validation: None,
             validation_note: None,
             chunks_rejected: 0,
+            logging: None,
         };
         db.record_heartbeat(a, "addr", None, &no_battery).unwrap();
 

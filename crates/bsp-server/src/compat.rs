@@ -80,6 +80,31 @@ pub fn check(client: Option<&str>) -> Result<ApiCompat, String> {
     )
 }
 
+/// The first API version with maintenance commands (reboot, trace logging).
+pub const COMMANDS_SINCE: ApiVersion = ApiVersion {
+    major: 1,
+    minor: 1,
+    patch: 0,
+};
+
+/// Whether a client that reports `client` takes maintenance commands: one of
+/// the server's major version from [`COMMANDS_SINCE`] on. Old firmware (no
+/// version) does not, and is never sent any.
+pub fn takes_commands(client: Option<&str>) -> bool {
+    let server: ApiVersion = API_VERSION.parse().expect("API_VERSION is a version");
+    client
+        .and_then(|c| c.parse::<ApiVersion>().ok())
+        .is_some_and(|c| {
+            c.major == server.major
+                && (c.major, c.minor, c.patch)
+                    >= (
+                        COMMANDS_SINCE.major,
+                        COMMANDS_SINCE.minor,
+                        COMMANDS_SINCE.patch,
+                    )
+        })
+}
+
 /// The error for a client refused as [`ApiCompat::Incompatible`], naming both versions.
 pub fn refusal(client: &str) -> String {
     format!(
@@ -163,6 +188,17 @@ mod tests {
     fn the_refusal_names_both_versions() {
         let msg = refusal("2.0.0");
         assert!(msg.contains("2.0.0") && msg.contains(API_VERSION), "{msg}");
+    }
+
+    #[test]
+    fn only_clients_from_1_1_take_commands() {
+        assert!(!takes_commands(None));
+        assert!(!takes_commands(Some("1.0.0")));
+        assert!(!takes_commands(Some("1.0.9")));
+        assert!(!takes_commands(Some("junk")));
+        assert!(!takes_commands(Some("2.1.0")));
+        assert!(takes_commands(Some("1.1.0")));
+        assert!(takes_commands(Some("1.4.2")));
     }
 
     #[test]

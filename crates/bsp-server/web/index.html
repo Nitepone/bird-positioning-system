@@ -535,6 +535,26 @@
             <span id="mode-msg"></span>
           </form>
           <p class="hint" id="mode-hint"></p>
+          <h4>Maintenance <span class="info" id="maint-info" tabindex="0"></span></h4>
+          <div class="filters">
+            <button type="button" id="reboot-btn" onclick="rebootClient()">Reboot</button>
+            <span id="reboot-state"></span>
+          </div>
+          <form class="filters" id="log-form" onsubmit="saveLogging(event)">
+            <label>Trace logging <select id="log-level" onchange="logFormChanged()">
+              <option value="on">On</option>
+              <option value="off">Off</option>
+            </select></label>
+            <label id="log-duration-label">for <select id="log-duration" onchange="logFormChanged()">
+              <option value="600">10 min</option>
+              <option value="3600" selected>1 h</option>
+              <option value="21600">6 h</option>
+              <option value="86400">24 h</option>
+            </select></label>
+            <button type="submit" id="log-set">Set</button>
+            <span id="log-state"></span>
+          </form>
+          <p class="hint" id="maint-hint"></p>
         </div>
       </details>
 
@@ -559,8 +579,9 @@
 
 <section id="page-logs">
   <h2>Client events</h2>
-  <p>
-    Kind: <input id="ev-kind" size="15" placeholder="any">
+  <p class="filters">
+    <label>Client <select id="ev-client" onchange="refreshEvents()"></select></label>
+    <label title="client_log: the lines of a client's trace log">Kind <input id="ev-kind" size="15" placeholder="any"></label>
     <label><input type="checkbox" id="ev-hide-hb" checked> hide heartbeats</label>
   </p>
   <table id="events">
@@ -642,6 +663,10 @@ function showPage() {
   if (page === "home") { renderDashboard(); timelineFetchedAt = 0; }
   if (page === "detections") enterDetections(params);
   if (page === "clients" && params.get("client")) clockClient = params.get("client");
+  if (page === "logs") {
+    evClient = params.get("client") || "";
+    if (params.has("kind")) document.getElementById("ev-kind").value = params.get("kind");
+  }
   refresh();
 }
 
@@ -1885,19 +1910,35 @@ async function clearPositioning() {
 }
 
 // ---- logs page ----
+let evClient = "";  // the client filter, kept while the select is rebuilt
+
+function renderEventClientFilter() {
+  const sel = document.getElementById("ev-client");
+  if (document.activeElement !== sel) {
+    const opts = `<option value="">any</option>` +
+      clients.map(c => `<option value="${c.id}">${esc(displayName(c) || c.id.slice(0, 8))}</option>`).join("");
+    if (sel.innerHTML !== opts) sel.innerHTML = opts;
+    sel.value = evClient;
+  }
+  evClient = sel.value;
+}
+
 async function refreshEvents() {
+  renderEventClientFilter();
   const kind = document.getElementById("ev-kind").value.trim();
   const hide = document.getElementById("ev-hide-hb").checked && kind !== "heartbeat";
   const q = new URLSearchParams({ limit: 200 });
+  if (evClient) q.set("client_id", evClient);
   if (kind) q.set("kind", kind);
   if (hide) q.set("exclude_kind", "heartbeat");
   const evs = await api("/events?" + q);
+  // A trace log line is shown as the line it is.
   document.querySelector("#events tbody").innerHTML = evs.map(e => `<tr>
       <td>${e.id}</td>
       <td>${fmtTime(e.ts)}</td>
       <td>${esc(clientName(e.client_id))}</td>
       <td>${esc(e.kind)}</td>
-      <td class="mono">${esc(JSON.stringify(e.detail))}</td>
+      <td class="mono">${esc(e.kind === "client_log" ? e.detail.text : JSON.stringify(e.detail))}</td>
     </tr>`).join("");
 }
 
@@ -2144,7 +2185,8 @@ function renderClientDetail() {
   document.getElementById("client-top").innerHTML = [
     item("Hardware ID", `<span class="mono">${esc(c.id)}</span>`),
     item("IP", esc(addrHost(c.last_addr) || "-"), c.last_addr),
-    item("Up for", h ? fmtDuration(h.uptime_s) + asOf : "-", h ? `since ${fmtTime(h.at - h.uptime_s * 1e9)}` : ""),
+    item("Up for", h ? fmtDuration(h.uptime_s) + asOf : "-", h ? `since ${fmtTime(h.at - h.uptime_s * 1e9)}` +
+      (c.last_reboot ? `; started by: ${REBOOT_REASONS[c.last_reboot.reason] || c.last_reboot.reason}` : "") : ""),
     item("Last heard", fmtAgo(c.last_seen), fmtTime(c.last_seen)),
   ].join("");
 
@@ -2174,11 +2216,15 @@ function renderClientDetail() {
     tile("Mode" + asOf, esc(md.text), [md.sub, interval].filter(Boolean).map(esc).join(" · "), md.cls),
     h?.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
       h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
+    c.last_reboot ? tile("Last start", esc(REBOOT_REASONS[c.last_reboot.reason] || c.last_reboot.reason),
+      `${fmtAgo(c.last_reboot.at)} ${info(`${fmtTime(c.last_reboot.at)}. Why the client last started, as it reported ` +
+        "in its first heartbeat after.")}`, ["watchdog", "brownout", "panic"].includes(c.last_reboot.reason) ? "warn" : "") : "",
     tile("Firmware", esc(c.version || "-"),
       [`<span class="${api.cls}" title="${esc(api.sub)}">${esc(api.text)}</span>`,
        ...[c.hostname, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : ""].filter(Boolean).map(esc)].join("<br>")),
   ].join("");
   fillModeForm(c);
+  renderMaintenance(c);
 
   const charts = typeof echarts !== "undefined";
   const bh = historyData?.key === historyKey(c.id) ? historyData.battery : null;
@@ -2323,6 +2369,129 @@ async function saveMode(ev) {
     await refreshClients();
     refreshClientsPage();
   } catch (e) { msg.textContent = e.message; }
+}
+
+// ---- maintenance: reboot and trace logging (clients on API 1.1.0 or later) ----
+// Both reach the client in the reply to its next heartbeat (a batch client's:
+// at its next contact), and it answers in the heartbeat after.
+
+const REBOOT_REASONS = {
+  requested: "reboot from here", power_on: "power on", watchdog: "watchdog", brownout: "brownout",
+  panic: "crash", other: "other reset", unknown: "unknown",
+};
+
+/// "its next heartbeat" or, for a batch client, "its next contact".
+function nextContact(c) { return c.health?.mode?.mode === "batch" ? "its next contact" : "its next heartbeat"; }
+
+/// The latest reboot command as { text, cls, title }, or null.
+function rebootState(c) {
+  const r = c.maintenance?.reboot;
+  if (!r) return null;
+  if (r.result === "unsupported") return { text: "not supported by this client", cls: "warn" };
+  if (r.result === "failed") return { text: "the client could not reboot", cls: "bad" };
+  if (r.result === "done") return { text: `rebooted ${fmtAgo(r.acked_at)}`, cls: "ok", title: `acknowledged ${fmtTime(r.acked_at)}` };
+  if (r.result) return { text: r.result, cls: "muted" };
+  if (r.delivered_at) return { text: "rebooting…", cls: "warn",
+    title: `Sent ${fmtTime(r.delivered_at)}. It is acknowledged in the client's first heartbeat after the restart.` };
+  return { text: `pending: at ${nextContact(c)}`, cls: "muted", title: `asked ${fmtTime(r.created_at)}` };
+}
+
+/// Trace logging as { text, cls, title }.
+function loggingState(c) {
+  const m = c.maintenance, l = m?.logging;
+  if (l && l.result == null) {
+    const what = l.params?.log_level === "off" ? "off" : `on for ${fmtDuration(l.params?.log_duration_s)}`;
+    return { text: `pending (${what}): at ${nextContact(c)}`, cls: "muted" };
+  }
+  if (l?.result === "unsupported") return { text: "not supported by this client", cls: "warn" };
+  if (m?.logging_until) return { text: `on until ${fmtClock(m.logging_until / 1e6, false)}`, cls: "ok",
+    title: `It turns itself off at ${fmtTime(m.logging_until)}.` };
+  return { text: "off", cls: "muted" };
+}
+
+let logFormFor = null, logDirty = false;
+
+function renderMaintenance(c) {
+  const supported = !!c.maintenance?.supported;
+  document.getElementById("maint-info").innerHTML = info(
+    "Reboot: the client restarts cleanly (its upload in progress finishes or is given up, its SD card is " +
+    "closed) once its next heartbeat reply carries the request; a batch client at its next contact.\n" +
+    "Trace logging: the client sends every line it logs with its heartbeats, shown on the Logs page. " +
+    "It turns itself off when the time is up, even if it cannot reach the server.");
+  const show = (id, v) => {
+    const el = document.getElementById(id);
+    el.textContent = v ? v.text : "";
+    el.className = v ? v.cls : "";
+    el.title = v?.title || "";
+  };
+  show("reboot-state", supported ? rebootState(c) : null);
+  const ls = supported ? loggingState(c) : null;
+  show("log-state", ls);
+  if (ls && c.maintenance.logging_until) {
+    const link = document.createElement("a");
+    link.href = `#/logs?client=${c.id}&kind=client_log`;
+    link.textContent = "lines";
+    const el = document.getElementById("log-state");
+    el.append(" · ", link);
+  }
+  document.getElementById("reboot-btn").disabled = !supported;
+  for (const id of ["log-level", "log-duration", "log-set"]) document.getElementById(id).disabled = !supported;
+  document.getElementById("maint-hint").textContent = supported ? "" :
+    `Not supported by this client's firmware (API ${c.api_version || "unknown"}): it needs API 1.1.0 or later.`;
+  if (logFormFor !== c.id || !logDirty) {
+    logFormFor = c.id;
+    logDirty = false;
+    document.getElementById("log-level").value = c.maintenance?.logging_until ? "off" : "on";
+  }
+  document.getElementById("log-duration-label").hidden = document.getElementById("log-level").value === "off";
+}
+
+function logFormChanged() {
+  logDirty = true;
+  document.getElementById("log-duration-label").hidden = document.getElementById("log-level").value === "off";
+}
+
+/// The server's reason from an api() error, else the message.
+function apiReason(e) {
+  const m = /\{.*\}$/.exec(e.message);
+  try { return m ? JSON.parse(m[0]).error : e.message; } catch { return e.message; }
+}
+
+async function rebootClient() {
+  const c = clients.find(c => c.id === clockClient);
+  if (!c) return;
+  const name = displayName(c) || c.id.slice(0, 8);
+  if (!confirm(`Reboot ${name}?\n\nIt restarts once ${nextContact(c)} brings the request, and is back within a few ` +
+      "seconds. Audio is not recorded while it restarts.")) return;
+  const el = document.getElementById("reboot-state");
+  try {
+    await api(`/clients/${c.id}/reboot`, { method: "POST" });
+    await refreshClients();
+    refreshClientsPage();
+  } catch (e) {
+    el.textContent = apiReason(e);
+    el.className = "bad";
+  }
+}
+
+async function saveLogging(ev) {
+  ev.preventDefault();
+  const id = clockClient, el = document.getElementById("log-state");
+  const level = document.getElementById("log-level").value;
+  const duration_s = Number(document.getElementById("log-duration").value);
+  try {
+    await api(`/clients/${id}/logging`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(level === "off" ? { level } : { level, duration_s }),
+    });
+    logDirty = false;
+    await refreshClients();
+    refreshClientsPage();
+  } catch (e) {
+    el.textContent = apiReason(e);
+    el.className = "bad";
+  }
 }
 
 /// The reports as chart rows, with a gap row wherever heartbeats stopped.

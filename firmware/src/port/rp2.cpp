@@ -6,6 +6,8 @@
 #include <I2S.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <hardware/watchdog.h>
+#include <pico/mutex.h>
 #include <pico/unique_id.h>
 #ifdef BPS_NET_DEBUG
 #include <lwip/priv/tcp_priv.h>
@@ -20,6 +22,7 @@ extern "C" {
 #include <cyw43.h>
 
 #include "capture.h"
+#include "logbuf.h"
 #include "port.h"
 }
 
@@ -40,6 +43,19 @@ extern "C" void port_unique_id(uint8_t out[8])
 
 extern "C" size_t port_free_heap(void) { return rp2040.getFreeHeap(); }
 
+// The trace log's lock, shared by both cores; only ever tried, never waited
+// for. Set up in port_board_init(), before anything logs.
+static mutex_t log_mutex;
+static volatile bool log_mutex_ready;
+
+extern "C" bool port_log_trylock(void)
+{
+    uint32_t owner;
+    return log_mutex_ready && mutex_try_enter(&log_mutex, &owner);
+}
+
+extern "C" void port_log_unlock(void) { mutex_exit(&log_mutex); }
+
 extern "C" void port_log(const char *fmt, ...)
 {
     char buf[256];
@@ -48,6 +64,58 @@ extern "C" void port_log(const char *fmt, ...)
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     Serial.printf("[%10lu] %s\r\n", (unsigned long)millis(), buf);
+    bps_log_capture(port_mono_us(), buf);
+}
+
+// ---- Restarts ----
+//
+// The watchdog's scratch registers 0-3 (the SDK's watchdog_reboot() uses 4-7)
+// keep the last command run, and a mark on a restart the server asked for,
+// across the watchdog reset that restarts the board. A power cycle (or the
+// RUN pin) clears them, so the command is forgotten then.
+
+#define KEEP_MAGIC 0x62707372u         // "bpsr"
+#define KEEP_RESTART (KEEP_MAGIC ^ 1u) // ... and the restart was asked for
+
+static uint32_t keep_check(void)
+{
+    return watchdog_hw->scratch[0] ^ watchdog_hw->scratch[1] ^ watchdog_hw->scratch[2] ^
+           0x5a5a5a5au;
+}
+
+static void keep_write(int64_t id, bool restart)
+{
+    watchdog_hw->scratch[1] = (uint32_t)id;
+    watchdog_hw->scratch[2] = (uint32_t)((uint64_t)id >> 32);
+    watchdog_hw->scratch[0] = restart ? KEEP_RESTART : KEEP_MAGIC;
+    watchdog_hw->scratch[3] = keep_check();
+}
+
+extern "C" void port_boot_info(port_boot *out)
+{
+    uint32_t m = watchdog_hw->scratch[0];
+    bool valid = (m == KEEP_MAGIC || m == KEEP_RESTART) && watchdog_hw->scratch[3] == keep_check();
+    out->last_command =
+        valid ? (int64_t)((uint64_t)watchdog_hw->scratch[2] << 32 | watchdog_hw->scratch[1]) : 0;
+    // A watchdog that was enabled timed out; any other watchdog reset is one
+    // asked for: ours, or one from a tool (picotool, a USB reset).
+    if (watchdog_enable_caused_reboot())
+        out->reason = BPS_BOOT_WATCHDOG;
+    else if (watchdog_caused_reboot())
+        out->reason = valid && m == KEEP_RESTART ? BPS_BOOT_REQUESTED : BPS_BOOT_OTHER;
+    else
+        out->reason = BPS_BOOT_POWER_ON;
+    keep_write(out->last_command, false); // the mark is reported once
+}
+
+extern "C" void port_keep_command(int64_t id, bool restarting) { keep_write(id, restarting); }
+
+extern "C" void port_restart(void)
+{
+    Serial.flush();
+    watchdog_reboot(0, 0, 10);
+    for (;;)
+        tight_loop_contents();
 }
 
 extern "C" void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
@@ -263,6 +331,7 @@ extern "C" bool port_beacon_take(port_beacon *out)
 extern "C" bool port_i2c_begin(int, int, uint32_t) { return false; }
 extern "C" bool port_i2c_xfer(uint8_t, const uint8_t *, size_t, uint8_t *, size_t) { return false; }
 extern "C" bool port_sd_begin(int, int, int, int) { return false; }
+extern "C" bool port_sd_idle(void) { return true; }
 extern "C" void port_sd_info_get(port_sd_info *out) { *out = port_sd_info{}; }
 extern "C" bool port_sd_write(const char *, const void *, size_t, bool) { return false; }
 extern "C" void port_sd_close(void) {}
@@ -300,6 +369,8 @@ extern "C" bool port_button(void)
 
 extern "C" void port_board_init(void)
 {
+    mutex_init(&log_mutex);
+    log_mutex_ready = true;
     i2s.setSysClk(48000);
     Serial.begin(115200);
 #if BPS_LED_PIN == BPS_LED_BUILTIN

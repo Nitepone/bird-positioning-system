@@ -5,7 +5,9 @@ use crate::beacon_clock::TsfLine;
 use crate::clip_audio;
 use crate::clock_history::{self, ClockReport};
 use crate::compat::{self, ApiCompat};
-use crate::db::{self, BatteryPoint, ClientRecord, DetectionFilter, Event, SpeciesSeen};
+use crate::db::{
+    self, BatteryPoint, ClientRecord, CommandRecord, DetectionFilter, Event, SpeciesSeen,
+};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
 use crate::state::{PositioningRequest, SharedState};
 use crate::waveform;
@@ -14,12 +16,12 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
-    ClientId, MAX_BATCH_INTERVAL_S, MIN_BATCH_INTERVAL_S, ModeSetting, NANOS_PER_SEC, Timestamp,
-    Uuid, now_ns,
+    ClientId, LogLevel, MAX_BATCH_INTERVAL_S, MAX_LOG_DURATION_S, MIN_BATCH_INTERVAL_S,
+    ModeSetting, NANOS_PER_SEC, Timestamp, Uuid, now_ns,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -36,6 +38,8 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/clients/{id}/clock", get(client_clock))
         .route("/clients/{id}/mode", put(set_client_mode))
+        .route("/clients/{id}/reboot", post(reboot_client))
+        .route("/clients/{id}/logging", put(set_client_logging))
         .route("/clients/{id}/battery_history", get(battery_history))
         .route("/clients/{id}/detections_hourly", get(detections_hourly))
         .route("/detections", get(list_detections))
@@ -72,11 +76,45 @@ struct ClientView {
     /// follows, when it follows one.
     beacon_line: Option<TsfLine>,
     positioning_requested: bool,
+    maintenance: MaintenanceView,
+}
+
+/// A client's maintenance (API 1.1.0): whether it takes commands, its latest
+/// reboot and trace logging commands, and its trace log as it last reported.
+#[derive(Serialize)]
+struct MaintenanceView {
+    /// Its firmware takes maintenance commands. Commands are never sent to
+    /// one that does not.
+    supported: bool,
+    /// The latest reboot command, and how the client answered it (`result`
+    /// null while pending; `delivered_at` once a heartbeat reply carried it).
+    reboot: Option<CommandRecord>,
+    /// The latest trace logging command, likewise.
+    logging: Option<CommandRecord>,
+    /// While the client captures its log: until when (server clock), as its
+    /// latest heartbeat said. It stops by itself then.
+    logging_until: Option<Timestamp>,
+}
+
+fn maintenance_view(state: &SharedState, c: &ClientRecord, now: Timestamp) -> MaintenanceView {
+    let latest = |kind| state.db.latest_command(c.id, kind).ok().flatten();
+    let logging_until = c.health.as_ref().and_then(|h| {
+        let l = h.logging?;
+        let until = h.at + l.remaining_s? as i64 * NANOS_PER_SEC;
+        (l.level != LogLevel::Off && until > now).then_some(until)
+    });
+    MaintenanceView {
+        supported: compat::takes_commands(c.api_version.as_deref()),
+        reboot: latest("reboot"),
+        logging: latest("logging"),
+        logging_until,
+    }
 }
 
 fn view(state: &SharedState, record: ClientRecord, now: Timestamp) -> ClientView {
     let req = state.positioning_request();
     ClientView {
+        maintenance: maintenance_view(state, &record, now),
         api_compat: compat::check(record.api_version.as_deref()).unwrap_or(ApiCompat::Incompatible),
         active: state.is_active(&record, now),
         synced: state.is_synced(&record, now),
@@ -188,6 +226,90 @@ async fn set_client_mode(
     }
     state.event(Some(id), "mode_set", serde_json::to_value(mode)?);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The client, if it takes maintenance commands; else why not (404, or 409
+/// for firmware older than the commands).
+fn commandable(state: &SharedState, id: ClientId) -> ApiResult<ClientRecord> {
+    let c = state
+        .db
+        .get_client(id)?
+        .ok_or_else(|| ApiError::not_found("client"))?;
+    if !compat::takes_commands(c.api_version.as_deref()) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "not supported by this client's firmware: it speaks API {}, and maintenance \
+                 commands need {}.{}.{} or later",
+                c.api_version.as_deref().unwrap_or("unknown"),
+                compat::COMMANDS_SINCE.major,
+                compat::COMMANDS_SINCE.minor,
+                compat::COMMANDS_SINCE.patch
+            ),
+        ));
+    }
+    Ok(c)
+}
+
+/// `POST /clients/{id}/reboot`: the client restarts cleanly once a heartbeat
+/// reply has carried the command (for a batch client, at its next contact),
+/// and acknowledges it after the restart. Asking again while one is pending
+/// returns that one.
+async fn reboot_client(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+) -> ApiResult<(StatusCode, Json<CommandRecord>)> {
+    commandable(&state, id)?;
+    if let Some(c) = state
+        .db
+        .pending_commands(id)?
+        .into_iter()
+        .find(|c| c.command == "reboot")
+    {
+        return Ok((StatusCode::OK, Json(c)));
+    }
+    let c = state.db.queue_command(id, "reboot", &json!({}), now_ns())?;
+    state.event(Some(id), "reboot_requested", json!({ "command_id": c.id }));
+    Ok((StatusCode::ACCEPTED, Json(c)))
+}
+
+#[derive(Deserialize)]
+struct LoggingRequest {
+    level: LogLevel,
+    /// Needed to turn it on: 1 to [`MAX_LOG_DURATION_S`].
+    duration_s: Option<u32>,
+}
+
+/// `PUT /clients/{id}/logging`: the client captures its log (`on`) for
+/// `duration_s` from when it gets this, sending the lines with its
+/// heartbeats, or stops (`off`). It turns capture off by itself when the
+/// time is up, whether or not it hears from the server.
+async fn set_client_logging(
+    State(state): State<SharedState>,
+    Path(id): Path<ClientId>,
+    Json(req): Json<LoggingRequest>,
+) -> ApiResult<(StatusCode, Json<CommandRecord>)> {
+    let duration = match (req.level, req.duration_s) {
+        (LogLevel::Off, _) => 0,
+        (LogLevel::On, Some(d)) if (1..=MAX_LOG_DURATION_S).contains(&d) => d,
+        (LogLevel::On, _) => {
+            return Err(ApiError::bad_request(format!(
+                "duration_s must be 1 to {MAX_LOG_DURATION_S}"
+            )));
+        }
+        (LogLevel::Unknown, _) => {
+            return Err(ApiError::bad_request(
+                "level must be \"on\" or \"off\" (the firmware has one log level)",
+            ));
+        }
+    };
+    commandable(&state, id)?;
+    let params = json!({ "log_level": req.level, "log_duration_s": duration });
+    let c = state.db.queue_command(id, "logging", &params, now_ns())?;
+    let mut detail = params;
+    detail["command_id"] = c.id.into();
+    state.event(Some(id), "logging_requested", detail);
+    Ok((StatusCode::ACCEPTED, Json(c)))
 }
 
 async fn delete_client(

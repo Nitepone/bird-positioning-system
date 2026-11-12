@@ -205,7 +205,7 @@ const CLIENT_API = "/api/v1/client";
 const CONTROL_API = "/api/v1/control";
 const VERSION = "web-0.1.0";
 // The client-server API version this page speaks (bsp_proto::API_VERSION; a server test keeps them equal).
-const API_VERSION = "1.0.0";
+const API_VERSION = "1.1.0";
 const RAW_AUDIO = {
   echoCancellation: false,
   noiseSuppression: false,
@@ -770,6 +770,11 @@ function onChunk(c, { start, pcm }) {
   enqueue(startNs, encodeWav(c.ctx.sampleRate, pcm));
 }
 
+// Maintenance commands (reboot, trace logging) are for the microcontroller
+// client: this page answers each as unsupported, once.
+let commandAcks = [];
+const commandsAnswered = new Set();
+
 async function sendHeartbeat() {
   const clock = clockStatus();
   const detail = takeSyncDetail();
@@ -780,15 +785,23 @@ async function sendHeartbeat() {
     chunks_gated: stats.chunksGated,
     queue_len: queue.length,
     capture_dropouts: stats.dropouts,
+    acks: commandAcks,
   };
   try {
-    await withServer(() => clientApi(`/${clientId}/heartbeat`, {
+    const reply = await withServer(() => clientApi(`/${clientId}/heartbeat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(hb),
     }));
     stats.dropouts -= hb.capture_dropouts;
     lastServerError = "";
+    commandAcks = [];
+    for (const c of reply?.commands || []) {
+      if (commandsAnswered.has(c.command_id)) continue;
+      commandsAnswered.add(c.command_id);
+      commandAcks.push({ command_id: c.command_id, result: "unsupported" });
+      log("command", `the server asked for ${c.command}; this page does not support it`);
+    }
   } catch {}
 }
 

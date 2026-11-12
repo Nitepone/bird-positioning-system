@@ -14,7 +14,7 @@
  * field or endpoint), the patch with a fix that changes nothing on the wire.
  * The same string as API_VERSION in crates/bsp-proto/src/lib.rs; a test there
  * keeps them equal. */
-#define BPS_API_VERSION "1.0.0"
+#define BPS_API_VERSION "1.1.0"
 #define BPS_HEADER_START_NS "x-bsp-start-ns"
 /* When the sample after the chunk's last was captured: with the start, the
  * chunk's actual duration (its sample clock is never exactly nominal). */
@@ -73,6 +73,14 @@ bool bps_json_int(const char *json, size_t len, const char *key, int64_t *out);
 /* The first string stored under `"key"` (one without escapes); false if
  * none, or longer than `cap` - 1. */
 bool bps_json_string(const char *json, size_t len, const char *key, char *out, size_t cap);
+
+/* The objects of the array stored under `"key"`, one per call: start with
+ * `*it` = 0; each call sets `[*obj, *obj + *obj_len)` to the next object and
+ * returns true, or returns false at the end of the array (or if there is no
+ * such array, or it is cut short). The lookups above then work within one
+ * object. */
+bool bps_json_array_next(const char *json, size_t len, const char *key, size_t *it, size_t *obj,
+                         size_t *obj_len);
 
 /* ---- UUIDs ---- */
 
