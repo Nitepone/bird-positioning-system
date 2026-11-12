@@ -6,6 +6,7 @@ pub mod audio_buffer;
 pub mod beacon_clock;
 pub mod clip_audio;
 pub mod clock_history;
+pub mod compat;
 pub mod config;
 pub mod db;
 pub mod pipeline;
@@ -33,6 +34,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
+
+/// This build of the server, from `git describe` (see build.rs).
+pub const BUILD: &str = env!("BPS_GIT_DESCRIBE");
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 /// Charting library for the web UI, embedded so the UI works offline.
@@ -287,6 +291,178 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use bsp_proto::{API_VERSION, Uuid};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    fn test_state() -> SharedState {
+        let species_filter = Arc::new(LocalSpeciesFilter::new(
+            Arc::new(MockIdentifier { threshold_db: 10.0 }),
+            settings::Settings::default().thresholds(),
+        ));
+        let beacon_clocks = Arc::new(beacon_clock::BeaconClocks::default());
+        let (calls_tx, _calls_rx) = mpsc::unbounded_channel();
+        let cfg = ServerConfig::default();
+        Arc::new(AppState {
+            audio: audio_buffer::AudioBuffers::new(cfg.audio_retention_s, beacon_clocks.clone()),
+            beacon_clocks,
+            clock_history: Default::default(),
+            udp_port: 2473,
+            started_at: now_ns(),
+            positioning: Default::default(),
+            calls_tx,
+            identifier: species_filter.clone(),
+            species_filter,
+            geo: None,
+            settings: Default::default(),
+            local_species: std::sync::RwLock::new(settings::LocalSpeciesStatus::NoLocation),
+            db: Db::in_memory().unwrap(),
+            cfg,
+        })
+    }
+
+    async fn call(
+        state: &SharedState,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("10.0.0.9:5000".parse::<SocketAddr>().unwrap()));
+        let resp = web_router(state.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn registration(id: u128, version: &str, api_version: Option<&str>) -> Value {
+        let mut r = json!({
+            "client_id": Uuid::from_u128(id), "hostname": "h", "version": version,
+            "capabilities": { "sample_rate": 48000, "channels": 1, "sample_format": "I32",
+                              "clock_source": "c", "device_name": "d" },
+        });
+        if let Some(v) = api_version {
+            r["api_version"] = v.into();
+        }
+        r
+    }
+
+    async fn register(
+        state: &SharedState,
+        id: u128,
+        api_version: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let body = registration(id, "bps-mcu abc1234", api_version);
+        call(state, "POST", "/api/v1/client/register", Some(body)).await
+    }
+
+    /// The client as the control API lists it.
+    async fn listed(state: &SharedState, id: u128) -> Value {
+        let (status, c) = call(
+            state,
+            "GET",
+            &format!("/api/v1/control/clients/{}", Uuid::from_u128(id)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        c
+    }
+
+    #[tokio::test]
+    async fn registers_clients_of_the_same_major_api_version() {
+        let state = test_state();
+        let (status, reply) = register(&state, 1, Some(API_VERSION)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply["api_version"], API_VERSION);
+        let c = listed(&state, 1).await;
+        assert_eq!(c["version"], "bps-mcu abc1234");
+        assert_eq!(c["api_version"], API_VERSION);
+        assert_eq!(c["api_compat"], "compatible");
+
+        // A newer minor is accepted, but flagged.
+        let (major, _) = API_VERSION.split_once('.').unwrap();
+        let (status, _) = register(&state, 2, Some(&format!("{major}.99.0"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed(&state, 2).await["api_compat"], "client_newer");
+    }
+
+    #[tokio::test]
+    async fn registers_old_firmware_without_an_api_version_as_legacy() {
+        let state = test_state();
+        let (status, reply) = register(&state, 1, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply["api_version"], API_VERSION);
+        let c = listed(&state, 1).await;
+        assert_eq!(c["api_version"], Value::Null);
+        assert_eq!(c["api_compat"], "legacy");
+    }
+
+    #[tokio::test]
+    async fn refuses_another_major_api_version_and_says_why() {
+        let state = test_state();
+        let (status, body) = register(&state, 1, Some("9.0.0")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("9.0.0") && msg.contains(API_VERSION), "{msg}");
+        // The Clients page still lists it, flagged.
+        let c = listed(&state, 1).await;
+        assert_eq!(c["api_compat"], "incompatible");
+        assert_eq!(c["version"], "bps-mcu abc1234");
+        // Retries do not flood the log.
+        register(&state, 1, Some("9.0.0")).await;
+        let (_, events) = call(&state, "GET", "/api/v1/control/events?limit=50", None).await;
+        let refused = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "register_refused")
+            .count();
+        assert_eq!(refused, 1);
+        // Once updated, it registers.
+        let (status, _) = register(&state, 1, Some(API_VERSION)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed(&state, 1).await["api_compat"], "compatible");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_malformed_api_version() {
+        let state = test_state();
+        let (status, body) = register(&state, 1, Some("latest")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("latest"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_servers_versions() {
+        let (status, s) = call(&test_state(), "GET", "/api/v1/control/status", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(s["api_version"], API_VERSION);
+        assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(s["build"], BUILD);
+    }
+
+    /// The browser client's copy of the API version is the same.
+    #[test]
+    fn browser_client_speaks_the_same_api_version() {
+        assert!(CLIENT_HTML.contains(&format!("const API_VERSION = \"{API_VERSION}\";")));
+    }
+
     /// The web UI's own unit tests (`web/*.test.js`), when node is installed.
     #[test]
     fn web_ui_js_tests() {

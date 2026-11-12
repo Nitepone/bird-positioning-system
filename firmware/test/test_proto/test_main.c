@@ -1,6 +1,7 @@
 // HTTP framing, JSON and UUIDs.
 #include <unity.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include "proto.h"
@@ -138,9 +139,19 @@ static void test_json_int_and_string(void)
     TEST_ASSERT_EQUAL_STRING("live", s);
 }
 
+/* The API version is MAJOR.MINOR.PATCH (the Rust side's copy is checked against
+ * it by a test in crates/bsp-proto). */
+static void test_api_version_is_semver(void)
+{
+    unsigned major, minor, patch;
+    char extra;
+    TEST_ASSERT_EQUAL_INT(3, sscanf(BPS_API_VERSION, "%u.%u.%u%c", &major, &minor, &patch, &extra));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_api_version_is_semver);
     RUN_TEST(test_http_head);
     RUN_TEST(test_http_parse);
     RUN_TEST(test_json_writer);

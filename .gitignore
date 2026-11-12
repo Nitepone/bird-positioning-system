@@ -8,6 +8,7 @@
 !/firmware/bps.conf.example
 /firmware/.pio
 /firmware/host/bps-host-client
+/firmware/host/.version
 /firmware/scripts/__pycache__
 /.venv-ml
 /trigger-models/birdnet-tiny-2.0-hybrid/model.tflite

@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about = "bsp server: bird call identification and location")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BPS_GIT_DESCRIBE"), ")"), about = "bsp server: bird call identification and location")]
 struct Args {
     /// TOML configuration file (defaults are used when omitted).
     #[arg(short, long)]

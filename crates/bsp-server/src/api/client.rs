@@ -4,6 +4,7 @@ use super::{ApiError, ApiResult};
 use crate::audio_buffer::TsfStamp;
 use crate::clip_audio;
 use crate::clock_history::ClockReport;
+use crate::compat::{self, ApiCompat};
 use crate::db::ClientHealth;
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
@@ -14,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
-    AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
+    API_VERSION, AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
     HeartbeatResponse, NANOS_PER_SEC, RegisterRequest, RegisterResponse, TriggerConfig,
     ValidationConfig, ValidationReport, now_ns,
 };
@@ -36,19 +37,41 @@ async fn register(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisterResponse>> {
+    let compat = compat::check(req.api_version.as_deref())
+        .map_err(|e| ApiError::bad_request(format!("invalid api_version: {e}")))?;
     let name = clean_name(req.name.as_deref().unwrap_or(""));
+    // A client already refused for its version is not logged at each retry.
+    let was_refused = state
+        .db
+        .get_client(req.client_id)?
+        .is_some_and(|c| compat::check(c.api_version.as_deref()) == Ok(ApiCompat::Incompatible));
+    // A refused client is kept too, so that the Clients page shows it.
     let is_new = state
         .db
         .register_client(&req, &name, &addr.to_string(), now_ns())?;
-    state.event(
-        Some(req.client_id),
-        "register",
-        json!({ "new": is_new, "addr": addr.to_string(), "hostname": req.hostname,
-                "version": req.version, "capabilities": req.capabilities, "name": name }),
-    );
+    let detail = json!({ "new": is_new, "addr": addr.to_string(), "hostname": req.hostname,
+                         "version": req.version, "api_version": req.api_version,
+                         "api_compat": compat, "capabilities": req.capabilities, "name": name });
+    if compat == ApiCompat::Incompatible {
+        let msg = compat::refusal(req.api_version.as_deref().unwrap_or_default());
+        if !was_refused {
+            tracing::warn!(client = %req.client_id, "registration refused: {msg}");
+            state.event(Some(req.client_id), "register_refused", detail);
+        }
+        return Err(ApiError(StatusCode::CONFLICT, msg));
+    }
+    if compat == ApiCompat::ClientNewer {
+        tracing::warn!(
+            client = %req.client_id,
+            "client speaks API {}, newer than the server's {API_VERSION}",
+            req.api_version.as_deref().unwrap_or_default()
+        );
+    }
+    state.event(Some(req.client_id), "register", detail);
     let d = &state.cfg.clients;
     let (trigger, validation) = capture_settings(&state).await;
     Ok(Json(RegisterResponse {
+        api_version: Some(API_VERSION.into()),
         udp_timesync_port: state.udp_port,
         heartbeat_interval_s: d.heartbeat_interval_s,
         chunk_secs: d.chunk_secs,

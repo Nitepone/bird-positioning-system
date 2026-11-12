@@ -573,9 +573,32 @@ static void test_a_chunk_saved_during_a_pass_is_not_swept_up(void)
     TEST_ASSERT_EQUAL_INT(0, count(".flac"));
 }
 
+// The registration says which build the client is and which API version it
+// speaks, so the server can tell a unit running old firmware.
+static void test_registration_reports_the_version_and_api_version(void)
+{
+    boot(false);
+    cfg.version = "bps-mcu 1a2b3c4-dirty";
+    room = SIZE_MAX;
+    start_register();
+    for (int i = 0; i < 20 && request_len == 0; i++)
+        txn_poll(&reg_txn);
+    TEST_ASSERT_GREATER_THAN(0, request_len);
+    request[request_len < sizeof request ? request_len : sizeof request - 1] = 0;
+    const char *body = strstr((const char *)request, "\r\n\r\n");
+    TEST_ASSERT_NOT_NULL(body);
+    char v[48];
+    TEST_ASSERT_TRUE(bps_json_string(body, strlen(body), "version", v, sizeof v));
+    TEST_ASSERT_EQUAL_STRING("bps-mcu 1a2b3c4-dirty", v);
+    TEST_ASSERT_TRUE(bps_json_string(body, strlen(body), "api_version", v, sizeof v));
+    TEST_ASSERT_EQUAL_STRING(BPS_API_VERSION, v);
+    txn_reset(&reg_txn);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_registration_reports_the_version_and_api_version);
     RUN_TEST(test_batch_mode_saves_audio_while_a_contact_connects);
     RUN_TEST(test_rejected_chunks_count_once_as_gated);
     RUN_TEST(test_stored_uploads_and_a_model_being_loaded_keep_to_their_reads);

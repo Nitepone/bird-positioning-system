@@ -21,6 +21,15 @@ pub const NANOS_PER_MS: i64 = 1_000_000;
 
 pub const CLIENT_API_PREFIX: &str = "/api/v1/client";
 
+/// Version of the client-server API (register, heartbeat, audio, time sync):
+/// semver, apart from the version of any client or of the server. Raise the
+/// major version for a change that old clients or servers cannot handle, the
+/// minor for a compatible addition (a new optional field or endpoint), the
+/// patch for a fix that changes nothing on the wire. The firmware's copy is
+/// `BPS_API_VERSION` in firmware/lib/bps_core/src/proto.h; a test keeps them
+/// equal.
+pub const API_VERSION: &str = "1.0.0";
+
 /// Header carrying the timestamp of the first sample of an uploaded WAV chunk.
 pub const HEADER_START_NS: &str = "x-bsp-start-ns";
 
@@ -59,7 +68,12 @@ pub struct Capabilities {
 pub struct RegisterRequest {
     pub client_id: ClientId,
     pub hostname: String,
+    /// The client's own build, e.g. "bps-mcu 3f7c789-dirty".
     pub version: String,
+    /// The [`API_VERSION`] the client speaks. Clients from before it was
+    /// added leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
     pub capabilities: Capabilities,
     /// Name the client suggests for itself. A name set by the operator takes
     /// precedence; the suggestion is shown while there is none.
@@ -146,6 +160,9 @@ pub enum ValidationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
+    /// The [`API_VERSION`] the server implements. Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
     pub udp_timesync_port: u16,
     pub heartbeat_interval_s: u32,
     pub chunk_secs: f32,
@@ -201,6 +218,31 @@ pub struct ClockStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The firmware's `BPS_API_VERSION` is the same string as [`API_VERSION`].
+    #[test]
+    fn api_version_matches_the_firmwares() {
+        let header = include_str!("../../../firmware/lib/bps_core/src/proto.h");
+        let c = header
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define BPS_API_VERSION "))
+            .expect("proto.h defines BPS_API_VERSION")
+            .trim()
+            .trim_matches('"');
+        assert_eq!(c, API_VERSION);
+        let parts: Vec<_> = API_VERSION.split('.').collect();
+        assert!(parts.len() == 3 && parts.iter().all(|p| p.parse::<u32>().is_ok()));
+    }
+
+    #[test]
+    fn register_messages_without_api_version_still_parse() {
+        let old = r#"{"client_id":"00000000-0000-0000-0000-000000000001","hostname":"h","version":"v",
+            "capabilities":{"sample_rate":48000,"channels":1,"sample_format":"I32",
+            "clock_source":"c","device_name":"d"}}"#;
+        let req: RegisterRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(req.api_version, None);
+        assert!(!serde_json::to_string(&req).unwrap().contains("api_version"));
+    }
 
     #[test]
     fn bssids_round_trip() {

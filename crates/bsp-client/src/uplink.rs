@@ -2,8 +2,8 @@
 
 use anyhow::{Context, bail};
 use bsp_proto::{
-    CLIENT_API_PREFIX, Capabilities, ClientId, HEADER_START_NS, Heartbeat, RegisterRequest,
-    RegisterResponse, Timestamp,
+    API_VERSION, CLIENT_API_PREFIX, Capabilities, ClientId, HEADER_START_NS, Heartbeat,
+    RegisterRequest, RegisterResponse, Timestamp,
 };
 use reqwest::StatusCode;
 use std::collections::VecDeque;
@@ -70,7 +70,8 @@ impl Session {
         let req = RegisterRequest {
             client_id: self.id,
             hostname: self.hostname.clone(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: format!("bsp-client {}", crate::VERSION),
+            api_version: Some(API_VERSION.into()),
             capabilities: self.caps.clone(),
             name: self.name.clone(),
         };
@@ -80,8 +81,14 @@ impl Session {
             .json(&req)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            bail!("register failed: {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            // The server's reason, e.g. an incompatible API version.
+            let why = resp.json::<bsp_proto::ErrorBody>().await.ok();
+            match why {
+                Some(e) => bail!("register failed: {status}: {}", e.error),
+                None => bail!("register failed: {status}"),
+            }
         }
         resp.json().await.context("decoding register response")
     }
@@ -92,7 +99,12 @@ impl Session {
         loop {
             match self.register().await {
                 Ok(r) => {
-                    tracing::info!(id = %self.id, "registered with {}", self.base);
+                    tracing::info!(
+                        id = %self.id,
+                        "registered with {} (its API version: {})",
+                        self.base,
+                        r.api_version.as_deref().unwrap_or("unknown")
+                    );
                     return r;
                 }
                 Err(e) => {

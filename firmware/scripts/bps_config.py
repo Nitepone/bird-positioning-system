@@ -12,11 +12,13 @@ Used two ways:
     bps_config.py check-env            validate BPS_SET_* environment variables
     bps_config.py max-lookback RING_KB the longest look-back a ring buffer allows
     bps_config.py drivers              device kinds for DEVICES: kind, bus, what it is
+    bps_config.py version              the firmware version from git (or $BPS_GIT_DESCRIBE)
 """
 
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 SAMPLE_RATE = 48000
@@ -364,6 +366,8 @@ def cli(argv):
     elif cmd == "drivers":
         for kind, d in DRIVERS.items():
             print(f"{kind}\t{d['bus']}\t{d['about']}")
+    elif cmd == "version":
+        print(git_describe(os.path.dirname(os.path.abspath(__file__))))
     elif cmd == "max-lookback" and len(argv) == 3 and argv[2].isdigit():
         print(max_lookback_ms(int(argv[2])))
     elif (cmd in ("write", "check") and len(argv) == 3) or (cmd == "check-env" and len(argv) == 2):
@@ -385,6 +389,25 @@ def cli(argv):
         print((__doc__ or "").strip())
         return 2
     return 0
+
+
+def git_describe(project_dir):
+    """What the firmware reports as its version: `git describe --tags --always --dirty`.
+
+    $BPS_GIT_DESCRIBE wins when set (./build.sh --docker computes it on the
+    host, where the container cannot see .git). "unknown" if git cannot tell.
+    """
+    described = os.environ.get("BPS_GIT_DESCRIBE", "").strip()
+    if not described:
+        try:
+            described = subprocess.run(
+                ["git", "-C", project_dir, "describe", "--tags", "--always", "--dirty"],
+                capture_output=True, text=True, timeout=30, check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            described = ""
+    # It goes into a C string and a JSON one.
+    return re.sub(r"[^A-Za-z0-9._+/-]", "_", described) or "unknown"
 
 
 def scons(env):
@@ -410,7 +433,10 @@ def scons(env):
         env.Exit(1)
         return
     print(f"bps: using {path} ({cfg['BOARD']}, server {cfg['SERVER_HOST']}:{cfg['SERVER_PORT']})")
+    version = git_describe(env["PROJECT_DIR"])
+    print(f"bps: firmware version bps-mcu {version}")
     env.Append(CPPDEFINES=[(n, env.StringifyMacro(v) if s else v) for n, v, s in defines(cfg)])
+    env.Append(CPPDEFINES=[("BPS_GIT_DESCRIBE", env.StringifyMacro(version))])
 
 
 try:

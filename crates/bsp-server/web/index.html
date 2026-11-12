@@ -33,6 +33,7 @@
     /* Status text; >= 5:1 contrast on --page in both themes (as on the client page). */
     --ok: #1e7b34;
     --bad: #c62828;
+    --warn: #9a5b00;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -58,6 +59,7 @@
       --tick-unexpected: #d95926;
       --ok: #6cc785;
       --bad: #f28b82;
+      --warn: #e0b050;
     }
   }
   :root[data-theme="dark"] {
@@ -83,6 +85,7 @@
     --tick-unexpected: #d95926;
     --ok: #6cc785;
     --bad: #f28b82;
+    --warn: #e0b050;
   }
 
   body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; margin: 0;
@@ -223,6 +226,7 @@
   .empty { color: var(--ink-2); padding: 2em 0; }
   .ok { color: var(--ok); }
   .bad { color: var(--bad); font-weight: bold; }
+  .warn { color: var(--warn); font-weight: bold; }
 
   /* Clients page */
   .scroll-x { overflow-x: auto; max-width: 100%; }
@@ -485,7 +489,9 @@
     <thead><tr><th>Client</th><th>Status</th>
       <th title="Batch: the radio is off between contacts and audio waits on the SD card, so detections wait for its uploads.">Mode</th>
       <th id="th-error">Timestamp error</th><th>Best RTT</th><th>Battery</th>
-      <th>SD card</th><th>Up for</th><th>Last heard</th></tr></thead>
+      <th>SD card</th><th>Up for</th>
+      <th title="The client's own build, and the version of the client-server API it speaks.">Version</th>
+      <th>Last heard</th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
@@ -957,10 +963,12 @@ document.getElementById("clip-normalize").addEventListener("change", e => {
 renderClipControls();
 
 // ---- status / banner (all pages) ----
+let serverStatus = null;
 async function refreshStatus() {
-  const s = await api("/status");
-  document.getElementById("status").textContent =
-    `${s.identifier} | ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} monitors`;
+  const s = serverStatus = await api("/status");
+  const el = document.getElementById("status");
+  el.textContent = `${s.identifier} | ${s.clients_active} active, ${s.clients_synced} synced, ${s.clients_total} monitors`;
+  el.title = `bsp-server ${s.version} (${s.build}), client API ${s.api_version}`;
 }
 
 /// Bumped when the client list changes here (a deletion), so a fetch begun before it can't undo it.
@@ -1913,6 +1921,25 @@ function clockState(c) {
   return c.synced ? { cls: "ok", text: "synced" } : { cls: "bad", text: "NOT synced" };
 }
 
+/// A client's API version as shown: text, class, and what it means. The server
+/// accepts the same major version, and refuses (but lists) any other.
+function apiView(c) {
+  const ours = serverStatus ? ` The server implements API ${serverStatus.api_version}.` : "";
+  switch (c.api_compat) {
+    case "incompatible":
+      return { text: `API ${c.api_version}: incompatible`, cls: "bad",
+               sub: `The server refused this client's registration: its major version differs.${ours} Update the client or the server.` };
+    case "legacy":
+      return { text: "API unknown", cls: "warn",
+               sub: `The client does not report an API version, so it is probably running old firmware. It is accepted as compatible.${ours}` };
+    case "client_newer":
+      return { text: `API ${c.api_version}: newer`, cls: "warn",
+               sub: `The client speaks a newer minor version than the server. It is accepted, but anything new it sends may be ignored. Update the server.${ours}` };
+    default:
+      return { text: `API ${c.api_version}`, cls: "muted", sub: `Compatible with the server.${ours}` };
+  }
+}
+
 function fmtNsUs(ns) { return ns == null ? "-" : (ns / 1e3).toFixed(1) + " µs"; }
 
 function fmtBytes(n) {
@@ -2057,6 +2084,7 @@ function renderClientTable() {
     "that AP's other clients to microseconds and is used with them.";
   document.querySelector("#client-list tbody").innerHTML = clients.map(c => {
     const k = c.clock, st = clockState(c), bat = batteryView(c), card = storageView(c), md = modeView(c);
+    const api = apiView(c);
     const cell = (v, short, extra = "") => v
       ? `<td class="${v.cls}" title="${esc(v.sub)}">${esc(short ?? v.text)}${extra}</td>` : "<td>-</td>";
     return `<tr class="${c.active ? "" : "inactive"} ${c.id === clockClient ? "selected" : ""}">
@@ -2069,6 +2097,7 @@ function renderClientTable() {
       ${cell(bat, null, bat?.charging ? chargingBadge(true) : "")}
       ${cell(card)}
       <td>${c.health ? fmtDuration(c.health.uptime_s) : "-"}</td>
+      <td>${esc(c.version || "-")}<br><span class="${api.cls}" title="${esc(api.sub)}">${esc(api.text)}</span></td>
       <td>${fmtAgo(c.last_seen)}</td>
     </tr>`;
   }).join("");
@@ -2131,7 +2160,7 @@ function renderClientDetail() {
   ].join("");
 
   // Hardware Info: power, storage, radio, devices, firmware.
-  const bat = batteryView(c), card = storageView(c), md = modeView(c);
+  const bat = batteryView(c), card = storageView(c), md = modeView(c), api = apiView(c);
   const interval = c.health?.mode?.mode === "batch"
     ? `in contact every ${fmtInterval(c.health.mode.interval_s)}` : `heartbeat every ${data.heartbeat_interval_s} s`;
   document.getElementById("sum-hardware").innerHTML = [
@@ -2146,7 +2175,8 @@ function renderClientDetail() {
     h?.devices.length ? tile("Devices", `${h.devices.filter(d => d.present).length} of ${h.devices.length} found`,
       h.devices.map(d => `${esc(d.kind)} (${deviceWhere(d)}): ${d.present ? "found" : "<b>not found</b>"}`).join("<br>")) : "",
     tile("Firmware", esc(c.version || "-"),
-      [c.hostname, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : ""].filter(Boolean).map(esc).join("<br>")),
+      [`<span class="${api.cls}" title="${esc(api.sub)}">${esc(api.text)}</span>`,
+       ...[c.hostname, c.capabilities?.device_name ? `mic: ${c.capabilities.device_name}` : ""].filter(Boolean).map(esc)].join("<br>")),
   ].join("");
   fillModeForm(c);
 

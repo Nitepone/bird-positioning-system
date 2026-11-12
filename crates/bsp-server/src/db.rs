@@ -27,7 +27,10 @@ pub struct ClientRecord {
     pub suggested_name: String,
     pub position: Option<Vec3>,
     pub hostname: String,
+    /// The client's own build.
     pub version: String,
+    /// The API version it registered with; None when it gave none (old firmware).
+    pub api_version: Option<String>,
     pub capabilities: Option<Capabilities>,
     pub first_seen: Timestamp,
     pub last_seen: Timestamp,
@@ -169,6 +172,7 @@ CREATE TABLE IF NOT EXISTS clients (
     x REAL, y REAL, z REAL,
     hostname TEXT NOT NULL DEFAULT '',
     version TEXT NOT NULL DEFAULT '',
+    api_version TEXT,
     capabilities TEXT,
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
@@ -291,6 +295,7 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
         },
         hostname: r.get("hostname")?,
         version: r.get("version")?,
+        api_version: r.get("api_version")?,
         capabilities: caps.and_then(|c| serde_json::from_str(&c).ok()),
         first_seen: r.get("first_seen")?,
         last_seen: r.get("last_seen")?,
@@ -325,6 +330,7 @@ impl Db {
             "suggested_name",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        add_column_if_missing(&conn, "clients", "api_version", "TEXT")?;
         add_column_if_missing(&conn, "clients", "health", "TEXT")?;
         add_column_if_missing(&conn, "clients", "mode", "TEXT")?;
         Ok(Self {
@@ -352,11 +358,12 @@ impl Db {
             .optional()?
             .is_some();
         conn.execute(
-            "INSERT INTO clients (id, hostname, version, capabilities, first_seen, last_seen, last_addr,
-                                  suggested_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET hostname = ?2, version = ?3, capabilities = ?4,
-                                           last_seen = ?5, last_addr = ?6, suggested_name = ?7",
+            "INSERT INTO clients (id, hostname, version, api_version, capabilities, first_seen,
+                                  last_seen, last_addr, suggested_name)
+             VALUES (?1, ?2, ?3, ?8, ?4, ?5, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET hostname = ?2, version = ?3, api_version = ?8,
+                                           capabilities = ?4, last_seen = ?5, last_addr = ?6,
+                                           suggested_name = ?7",
             params![
                 id.to_string(),
                 req.hostname,
@@ -364,7 +371,8 @@ impl Db {
                 json(&req.capabilities),
                 now,
                 addr,
-                suggested_name
+                suggested_name,
+                req.api_version
             ],
         )?;
         Ok(!existed)
@@ -835,6 +843,7 @@ mod tests {
             client_id: id,
             hostname: "host".into(),
             version: "0".into(),
+            api_version: Some("1.0.0".into()),
             capabilities: Capabilities {
                 sample_rate: 48000,
                 channels: 1,
@@ -865,6 +874,22 @@ mod tests {
             (c.name.as_str(), c.suggested_name.as_str()),
             ("Oak tree", "Gate")
         );
+    }
+
+    #[test]
+    fn keeps_the_latest_registrations_versions() {
+        let db = Db::in_memory().unwrap();
+        let id = Uuid::from_u128(1);
+        let mut req = register_request(id);
+        req.version = "bps-mcu 1a2b3c4".into();
+        db.register_client(&req, "", "addr", 1).unwrap();
+        let c = db.get_client(id).unwrap().unwrap();
+        assert_eq!(c.version, "bps-mcu 1a2b3c4");
+        assert_eq!(c.api_version.as_deref(), Some("1.0.0"));
+        // Old firmware, flashed over the new, leaves the API version out.
+        req.api_version = None;
+        db.register_client(&req, "", "addr", 2).unwrap();
+        assert_eq!(db.get_client(id).unwrap().unwrap().api_version, None);
     }
 
     #[test]
@@ -991,6 +1016,7 @@ mod tests {
         let c = db.get_client(Uuid::from_u128(1)).unwrap().unwrap();
         assert_eq!((c.name.as_str(), c.suggested_name.as_str()), ("Old", ""));
         assert!(c.health.is_none());
+        assert_eq!(c.api_version, None);
         drop(db);
         // Opening again finds the column already there.
         Db::open(&path).unwrap();

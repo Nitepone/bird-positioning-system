@@ -16,7 +16,7 @@ sudo setcap cap_net_bind_service=+ep target/release/bsp-server   # allow ports 8
 
 Open the web UI at `https://SERVER/` (plain `http://` redirects there). Its pages are
 **Dashboard** and **Detections** (what was heard), **Config** (settings, in a **Server** and a **Clients** section), **Clients**
-(each client's clock synchronisation, battery and SD card) and **Logs** (raw events).
+(each client's clock synchronisation, battery, SD card and software version) and **Logs** (raw events).
 
 On first start the server creates a self-signed certificate in `tls/`, so your browser warns
 once; accept it to continue. To use a real certificate, put it at `tls/cert.pem` and its key at
@@ -295,6 +295,17 @@ container: with `picotool` if installed, otherwise by copying `firmware.uf2` to 
 BOOTSEL drive. An ESP32 flashes over its USB serial port (`-p /dev/ttyUSB0` if detection picks
 the wrong one). The firmware is written to `firmware/.pio/build/<board>/`.
 
+**Which firmware is running?** Every build reports `bps-mcu <version>`, with the version from
+`git describe --tags --always --dirty` when it is built: the tag if the commit is tagged,
+otherwise the short commit hash (or `<tag>-<commits since>-g<hash>` once an older commit has a
+tag), and `-dirty` if the tree had uncommitted changes. It is in the board's log at startup, in the
+client's registration and in the **Version** column of the **Clients** page. `./build.sh --docker`
+works it out on your computer, because the container cannot see `.git`, and passes it in
+as `BPS_GIT_DESCRIBE`; set that variable yourself to build without git. Without either, the version
+is `unknown`. The firmware is rebuilt whenever the version changes. `bsp-client`,
+`firmware/host` and the server work out their versions the same way (`bsp-client --version`,
+`bsp-server --version`, and `build` in `GET /api/v1/control/status`).
+
 For several boards, keep one config per board: `./configure.sh north.conf`, then
 `./build.sh -f north.conf`. Each board's client ID is derived from its chip's unique ID, so it
 stays the same across reflashes without any storage. The settings, including the Wi-Fi password,
@@ -364,6 +375,7 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
+| Client is refused with "incompatible API version" | It and the server speak different major versions of the [client-server API](#api-version): update the client's firmware or the server so they match. The refused client is listed on the **Clients** page, flagged |
 | Microcontroller never appears | Its log (`./build.sh -m`): is Wi-Fi joining (the Pico W and ESP32 boards only use 2.4 GHz)? Does `SERVER_HOST`/`SERVER_PORT` point at the client port? |
 | Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
 | SD card shows "no card" | Is it FAT32? The log says `sd: card mounted` once it is found; the board retries every 5 s |
@@ -492,7 +504,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 **APIs:**
 
 - Client endpoints, under `/api/v1/client`:
-  - `POST /register`: the response's `flac_uploads` says whether the server takes FLAC uploads
+  - `POST /register`: the client's `version` (its own build) and `api_version` (see
+    [API version](#api-version)); the response's `api_version` is the server's, and its
+    `flac_uploads` says whether the server takes FLAC uploads. A different major `api_version` is
+    refused with `409` and `{"error": ...}` naming both versions
   - `POST /{id}/heartbeat`: clock status and counts, and from boards that have them `battery`
     (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
     `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`), `devices` (`kind`, `bus`,
@@ -509,10 +524,12 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 - The client endpoints are served on port 2473 (plain HTTP) and also on the web ports (HTTPS), where
   the browser client at `/client` uses them. The control endpoints are served only on the web ports.
 - Control endpoints, under `/api/v1/control`:
-  - `GET /status`
+  - `GET /status`: among others the server's `version`, its `build` (`git describe`) and the
+    `api_version` it implements
   - `GET|PUT /settings`: site location and confidence levels
   - `GET /local-species`: species expected at the site
-  - `GET /clients`
+  - `GET /clients`: each client's `version` and `api_version` (null for old firmware), and
+    `api_compat`: `compatible`, `client_newer`, `legacy` or `incompatible`
   - `GET|PUT|DELETE /clients/{id}`
   - `PUT /clients/{id}/mode`: `{"mode": "live" | "batch", "interval_s": 30-3600}`
   - `GET /clients/{id}/clock?minutes=`: the client's clock reports (one per heartbeat) over the
@@ -531,6 +548,27 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /samples/{client_id}/waveform?from=&to=`: the same as an SVG waveform
   - `GET /events`
   - `GET|DELETE /positioning-request`
+
+<a id="api-version"></a>
+**API version:** the client-server API (register, heartbeat, audio and time sync) has its own
+semantic version, apart from the version of any client or of the server. It is `API_VERSION` in
+`crates/bsp-proto/src/lib.rs` and `BPS_API_VERSION` in `firmware/lib/bps_core/src/proto.h` (a test
+in `bsp-proto` fails if they differ), and the browser client at `/client` has a copy that a server
+test checks. Every client sends it as `api_version` in its registration, and the server answers
+with the one it implements, in the register reply and in `GET /api/v1/control/status`.
+
+- **Major:** raise it for a change that old clients or old servers cannot handle (a removed or
+  renamed field or endpoint, or a changed meaning). The minor and patch versions then restart at 0.
+- **Minor:** a backward-compatible addition, such as a new optional field or endpoint that older
+  peers can ignore.
+- **Patch:** a fix with no change on the wire.
+
+The server registers a client whose major version equals its own. A newer minor version is accepted
+too, but flagged on the **Clients** page (the client may send what the server ignores). A client that
+sends no `api_version` is old firmware: it is accepted as compatible, and flagged as unknown. Any
+other major version is refused with an error that names both versions, and the **Clients** page
+lists the client as incompatible. Servers and clients must keep to the rules above for this to
+work: new fields stay optional, and a reader ignores fields it does not know.
 
 **Known limitations:**
 

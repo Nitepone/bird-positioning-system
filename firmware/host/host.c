@@ -28,6 +28,7 @@
 #include "capture.h"
 #include "client.h"
 #include "port.h"
+#include "proto.h"
 
 uint64_t port_mono_us(void)
 {
@@ -346,6 +347,21 @@ int port_sd_result(const void **data, uint32_t *total)
     return sd_result;
 }
 
+/* No on-device models on the host: validation reports that it cannot run them. */
+void *port_big_alloc(size_t n) { return malloc(n); }
+void port_big_free(void *p) { free(p); }
+bool port_ml_load(const void *model, size_t model_bytes, size_t arena_bytes, port_ml_tensor *in,
+                  port_ml_tensor *out, size_t *arena_used, char *err, size_t err_cap)
+{
+    (void)model, (void)model_bytes, (void)arena_bytes, (void)in, (void)out, (void)arena_used;
+    snprintf(err, err_cap, "the host build cannot run models");
+    return false;
+}
+bool port_ml_invoke(void) { return false; }
+void port_ml_unload(void) {}
+bool port_worker_start(void (*fn)(void)) { (void)fn; return false; }
+void port_worker_kick(void) {}
+
 void port_led(bool on) { (void)on; }
 
 static volatile uint64_t enter_until;
@@ -362,6 +378,11 @@ static void *stdin_thread(void *arg)
 
 bool port_button(void) { return port_mono_us() < enter_until; }
 
+/* From `git describe --tags --always --dirty`, set by the Makefile. */
+#ifndef BPS_GIT_DESCRIBE
+#define BPS_GIT_DESCRIBE "unknown"
+#endif
+
 int main(int argc, char **argv)
 {
     bps_settings s = {
@@ -373,7 +394,7 @@ int main(int argc, char **argv)
         .client_id = "",
         .device_name = "WAV replay (host build)",
         .board = "host",
-        .version = "bps-mcu 0.1.0 (host)",
+        .version = "bps-mcu " BPS_GIT_DESCRIBE " (host)",
         .sample_rate = 48000,
         .mic_channel = 0,
         .ring_bytes = 160 * 1024,
@@ -382,7 +403,7 @@ int main(int argc, char **argv)
     };
     const char *wav_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:bd:")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:i:w:r:l:S:bd:V")) != -1) {
         switch (opt) {
         case 's': s.server_host = optarg; break;
         case 'p': s.server_port = (uint16_t)atoi(optarg); break;
@@ -400,9 +421,13 @@ int main(int argc, char **argv)
             sd_dir = optarg;
             s.buses.devices = "sd";
             break;
+        case 'V':
+            printf("%s, API %s\n", s.version, BPS_API_VERSION);
+            return 0;
         default:
             fprintf(stderr, "usage: %s -s SERVER -w FILE.wav [-p PORT] [-n NAME] [-i UUID] "
-                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS] [-b] [-d DIR]\n", argv[0]);
+                            "[-r RING_KB] [-l LOOKBACK_MS] [-S STALL_MS] [-b] [-d DIR] | -V\n",
+                    argv[0]);
             return 2;
         }
     }

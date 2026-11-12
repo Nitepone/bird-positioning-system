@@ -96,7 +96,7 @@ pio_run() {
         local a
         for a in "${extra[@]}"; do
             case $a in
-                BPS_CONF=*) args+=(-e "$a") ;;
+                BPS_CONF=* | BPS_GIT_DESCRIBE=*) args+=(-e "$a") ;;
                 *) args+=("$a") ;;
             esac
         done
@@ -136,6 +136,13 @@ if [[ $runner == docker ]]; then
     fi
 fi
 
+# The firmware's version, from git: the container cannot see .git, so it is
+# worked out here and handed in (bps_config.py prefers it to running git).
+version_env=()
+if [[ $runner == docker ]]; then
+    version_env=(BPS_GIT_DESCRIBE="${BPS_GIT_DESCRIBE:-$("${cfgpy[@]}" version)}")
+fi
+
 # ---- Build ----
 
 if ((clean)); then
@@ -144,7 +151,7 @@ if ((clean)); then
 fi
 if ((flash || !monitor)); then
     say "Building $BOARD from $(basename "$conf") ($runner)"
-    pio_run "${conf_mount[@]}" "$conf_env" -- run -e "$BOARD"
+    pio_run "${conf_mount[@]}" "$conf_env" "${version_env[@]}" -- run -e "$BOARD"
     say "Built $out ($(du -h "$out" | cut -f1))"
 fi
 
@@ -203,7 +210,7 @@ if ((flash)); then
         flash_pico_from_host
     else
         p=$(find_port) || die "no serial port found: connect the ESP32 by USB, or pass -p PORT"
-        pio_run --device "$p" "${conf_mount[@]}" "$conf_env" -- run -e "$BOARD" -t upload --upload-port "$p"
+        pio_run --device "$p" "${conf_mount[@]}" "$conf_env" "${version_env[@]}" -- run -e "$BOARD" -t upload --upload-port "$p"
     fi
 fi
 

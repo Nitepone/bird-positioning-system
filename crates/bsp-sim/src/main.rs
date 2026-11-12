@@ -5,8 +5,8 @@
 use anyhow::{Context, bail};
 use bsp_core::audio;
 use bsp_proto::{
-    CLIENT_API_PREFIX, Capabilities, ClockStatus, HEADER_START_NS, Heartbeat, RegisterRequest,
-    Uuid, now_ns,
+    API_VERSION, CLIENT_API_PREFIX, Capabilities, ClockStatus, HEADER_START_NS, Heartbeat,
+    RegisterRequest, Uuid, now_ns,
 };
 use clap::Parser;
 use serde_json::json;
@@ -138,7 +138,8 @@ async fn main() -> anyhow::Result<()> {
         let req = RegisterRequest {
             client_id: *id,
             hostname: format!("sim-{k}"),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: format!("bsp-sim {}", env!("CARGO_PKG_VERSION")),
+            api_version: Some(API_VERSION.into()),
             capabilities: Capabilities {
                 sample_rate: SR,
                 channels: 1,

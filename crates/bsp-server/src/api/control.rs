@@ -4,6 +4,7 @@ use super::{ApiError, ApiResult};
 use crate::beacon_clock::TsfLine;
 use crate::clip_audio;
 use crate::clock_history::{self, ClockReport};
+use crate::compat::{self, ApiCompat};
 use crate::db::{self, BatteryPoint, ClientRecord, DetectionFilter, Event, SpeciesSeen};
 use crate::settings::{self, ConfidenceLevel, LocalSpeciesStatus, Settings};
 use crate::state::{PositioningRequest, SharedState};
@@ -55,6 +56,8 @@ pub fn router() -> Router<SharedState> {
 struct ClientView {
     #[serde(flatten)]
     record: ClientRecord,
+    /// How the client's API version fits the server's.
+    api_compat: ApiCompat,
     active: bool,
     /// Usable for positioning: synced to the server clock, or to its access
     /// point's other clients.
@@ -74,6 +77,7 @@ struct ClientView {
 fn view(state: &SharedState, record: ClientRecord, now: Timestamp) -> ClientView {
     let req = state.positioning_request();
     ClientView {
+        api_compat: compat::check(record.api_version.as_deref()).unwrap_or(ApiCompat::Incompatible),
         active: state.is_active(&record, now),
         synced: state.is_synced(&record, now),
         synced_to_server: state.is_synced_to_server(&record, now),
@@ -90,6 +94,8 @@ async fn status(State(state): State<SharedState>) -> ApiResult<Json<serde_json::
     let clients = state.db.list_clients()?;
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "build": crate::BUILD,
+        "api_version": bsp_proto::API_VERSION,
         "server_time": now,
         "started_at": state.started_at,
         "identifier": state.identifier.name(),

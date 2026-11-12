@@ -307,6 +307,7 @@ static void start_register(void)
     bps_json_str(&j, "client_id", id_str);
     bps_json_str(&j, "hostname", hostname);
     bps_json_str(&j, "version", cfg.version);
+    bps_json_str(&j, "api_version", BPS_API_VERSION);
     bps_json_obj(&j, "capabilities");
     bps_json_i64(&j, "sample_rate", cfg.sample_rate);
     bps_json_i64(&j, "channels", 1);
@@ -575,7 +576,10 @@ static void register_poll(uint64_t now)
         start_run(now);
         return;
     }
-    if (status)
+    if (status == 409) /* the server refuses this API version, which is its major's */
+        port_log("registration refused: API " BPS_API_VERSION " is not compatible with the "
+                 "server's; retrying in %lu s", (unsigned long)(reg_delay_us / 1000000));
+    else if (status)
         port_log("registration failed: server returned %d; retrying in %lu s", status,
                  (unsigned long)(reg_delay_us / 1000000));
     else

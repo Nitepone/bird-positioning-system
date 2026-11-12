@@ -18,8 +18,17 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uplink::{Session, Stats, UploadQueue};
 
+/// This build, as the client's version and for `--version`: the crate's
+/// version and `git describe` (see build.rs).
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BPS_GIT_DESCRIBE"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(version, about = "bsp client: capture, filter and upload bird audio")]
+#[command(version = VERSION, about = "bsp client: capture, filter and upload bird audio")]
 struct Args {
     /// Server client-API URL (port 2473 by default; not the web UI port).
     #[arg(short, long, default_value = "http://127.0.0.1:2473")]

@@ -39,7 +39,11 @@
 #define BPS_DEVICES ""
 #endif
 
-#define BPS_FIRMWARE_VERSION "bps-mcu 0.1.0"
+/* From `git describe --tags --always --dirty`, set by scripts/bps_config.py. */
+#ifndef BPS_GIT_DESCRIBE
+#define BPS_GIT_DESCRIBE "unknown"
+#endif
+#define BPS_FIRMWARE_VERSION "bps-mcu " BPS_GIT_DESCRIBE
 #define BPS_SAMPLE_RATE 48000
 
 #endif
