@@ -212,8 +212,9 @@ the recordings saved; chunks sent and gated; its I2C and SPI parts and whether e
 memory, so they start afresh when it restarts). Health comes from the latest heartbeat and is kept
 in the database, so a client that went quiet still shows how it was, e.g. a flat battery. Use the
 page to compare networks or placements, or to screenshot a client for a bug report. The **Events**
-page also gets `battery_low` (under 20%), `storage_inserted`, `storage_removed` and `storage_low`
-(under 1 GB free) events.
+page also gets `battery_low` (under 20%), `storage_inserted`, `storage_removed`, `storage_low`
+(under 1 GB free), and `storage_paused` and `storage_resumed` (the card closed for a low battery,
+and opened again) events.
 
 ### Microcontroller clients (Pico W / ESP32)
 
@@ -263,7 +264,21 @@ upload is aborted keeps what was sent; recording pauses below 16 MB free. The ca
 from its own task, so a slow card never holds up the network; it can be pulled out and put back
 while the board runs (with no card-detect pin, the board notices within a few seconds). Use a
 FAT32-formatted card. The heartbeat reports whether a card is in, its free space,
-and the recordings saved since the board started.
+and the recordings saved since the board started. A card that answers but will not mount (one
+that has failed, or is not FAT32) is logged once, then every 10 minutes while it stays so, with
+what it answered; an empty slot logs nothing.
+
+**The card and a low battery.** A card that loses power, or browns out, while it writes can corrupt
+its controller's own records and never start again. As a cell runs down, every Wi-Fi burst and
+card write dips it lower, so when the battery gauge reads the cell under `SD_MIN_MV` (default
+3400 mV) the board finishes what it had queued, closes the card and unmounts it, and keeps no
+audio on it until the cell is back at `SD_RESUME_MV` (default 3550 mV). Meanwhile the card's tile
+on the device's page reads **closed**, and the device lists it as a problem. In batch mode the
+radio still stays off between contacts (going live would only drain the cell faster), so the
+audio of that time is lost. Boards without a gauge, or running off the charger with no cell, use
+the card regardless; `SD_MIN_MV=0` turns this off. It guards against a cell running down, not
+against sharp dips from a supply that cannot meet the board's peak current: those need a bulk
+capacitor at the card's power pin.
 
 **Operation modes: saving power.** A board with an SD card can run in **batch** mode instead of
 **live**: it turns its Wi-Fi radio off and keeps its audio on the card, and every few minutes (5
@@ -567,7 +582,8 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
 - `lib/bps_core/` is portable C11 with no vendor headers: C ports of the clock measurement
   and noise gate, plus the audio timestamper, the access point clock (`beacon.c`), the ring
   buffer, the client's state machines, the I2C/SPI devices (`devices.c`, with a driver per kind:
-  `dev_max17048.c`, `dev_sd.c`), the copy of recordings on the card (`record.c`) and the trace
+  `dev_max17048.c`, `dev_sd.c`), the copy of recordings on the card (`record.c`), the card's
+  low-battery cutoff (`power.c`) and the trace
   log's ring (`logbuf.c`, fed by every port's `port_log`). A new kind of
   device is a driver, a line in the table in `devices.c` and its entry in `DRIVERS` in
   `scripts/bps_config.py`.
@@ -604,7 +620,8 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     takes updates over the air (ESP32)
   - `POST /{id}/heartbeat`: clock status and counts, and from boards that have them `battery`
     (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
-    `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`), `devices` (`kind`, `bus`,
+    `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`, and `paused: true` while the card
+    is closed for a low battery), `devices` (`kind`, `bus`,
     `address`, `present`) and `mode` (`mode`: `live` or `batch`, `interval_s`, `backlog`,
     `backlog_bytes`, `delivered_through`, `next_contact_s`, `radio_on_pct`, `gap`, `note`). From
     API 1.1.0, optionally: `acks` (`[{"command_id": ..., "result": "done" | "unsupported" |

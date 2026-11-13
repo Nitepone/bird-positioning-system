@@ -32,6 +32,9 @@ typedef struct {
     bps_bus_settings buses; /* peripherals: battery gauge, storage card */
     const bps_build *build; /* what this firmware is (registration); NULL if unknown */
     int ota_min_battery;    /* % of charge an update needs on a battery that is not charging */
+    /* The storage card is closed while the cell is under sd_cut_mv, until it
+     * is back at sd_resume_mv (power.h); 0: never. */
+    int sd_cut_mv, sd_resume_mv;
 } bps_settings;
 
 void bps_client_setup(const bps_settings *s);

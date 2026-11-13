@@ -251,6 +251,7 @@ bool port_sd_write(const char *p, const void *b, size_t n, bool a)
     return true;
 }
 void port_sd_close(void) {}
+void port_sd_hold(bool h) { (void)h; }
 bool port_sd_remove(const char *p)
 {
     file *f = find(p);
@@ -431,6 +432,8 @@ static void boot(bool model)
                          : (bps_bus_settings){-1, -1, -1, -1, -1, ""};
     s.build = NULL;
     s.ota_min_battery = 50;
+    s.sd_cut_mv = 3400;
+    s.sd_resume_mv = 3550;
     bps_client_setup(&s);
     chunk_len = 9 * RATE;
     bps_trigger_config t;

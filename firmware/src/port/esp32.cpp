@@ -661,6 +661,8 @@ extern "C" bool port_i2c_xfer(uint8_t addr, const uint8_t *tx, size_t tx_len, ui
 #define SD_SPI_HZ 20000000
 #define SD_RETRY_MS 5000
 #define SD_CHECK_MS 5000
+// While a card answers but will not mount, how often to say so again.
+#define SD_FAIL_LOG_MS (10 * 60 * 1000)
 
 enum { SD_WRITE, SD_CLOSE, SD_REMOVE, SD_READ, SD_LIST };
 
@@ -757,6 +759,15 @@ static void sd_set_absent(void)
     portEXIT_CRITICAL(&sd_mux);
 }
 
+// Whether port_sd_hold() holds the card.
+static bool sd_held(void)
+{
+    portENTER_CRITICAL(&sd_mux);
+    bool held = sd_info.held;
+    portEXIT_CRITICAL(&sd_mux);
+    return held;
+}
+
 static void sd_refresh(void)
 {
     uint64_t total = SD.totalBytes(), used = SD.usedBytes();
@@ -792,9 +803,12 @@ static void sd_make_dirs(const char *path)
     strcpy(made, dir);
 }
 
-// Whether a card answers its reset command (CMD0). Mounting an empty slot
-// logs a handful of the SD library's errors every try; this logs nothing.
-static bool sd_answers(void)
+// A card's reply to its reset command (CMD0): 0x01 (idle) from a working card,
+// 0xff if nothing answers. Mounting an empty slot logs a handful of the SD
+// library's errors every try; this logs nothing.
+#define SD_NO_REPLY 0xff
+#define SD_R1_IDLE 0x01
+static uint8_t sd_reset_reply(void)
 {
     static const uint8_t cmd0[] = {0x40, 0, 0, 0, 0, 0x95};
     uint8_t r = 0xff;
@@ -810,7 +824,7 @@ static bool sd_answers(void)
     digitalWrite(sd_cs, HIGH);
     SPI.transfer(0xff);
     SPI.endTransaction();
-    return r != 0xff;
+    return r;
 }
 
 static void sd_task(void *)
@@ -819,6 +833,11 @@ static void sd_task(void *)
     char open_path[sizeof(((sd_item *)0)->path)] = "";
     bool mounted = false;
     int64_t next_try = 0, next_check = 0;
+    // A card that answers but will not mount: the tries that failed in a row,
+    // and when to say so again. The SD library's own errors go only to the
+    // serial port, so without these lines a trace log would show nothing.
+    uint32_t failed = 0;
+    int64_t next_fail_log = 0;
     static uint8_t sector[512];
     auto lose = [&](const char *why) {
         if (f)
@@ -832,18 +851,41 @@ static void sd_task(void *)
     };
     for (;;) {
         int64_t now = esp_timer_get_time() / 1000;
-        if (!mounted && now >= next_try) {
+        bool held = sd_held();
+        if (!mounted && !held && now >= next_try) {
             next_try = now + SD_RETRY_MS;
+            uint8_t reply = sd_reset_reply();
             // Files open at once: one being written, one read, a directory listed.
-            if (sd_answers() && SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 4)) {
+            if (reply != SD_NO_REPLY && SD.begin(sd_cs, SPI, SD_SPI_HZ, "/sd", 4)) {
                 mounted = true;
                 next_check = now + SD_CHECK_MS;
                 sd_refresh();
                 port_log("sd: card mounted, %lu of %lu MB free",
                          (unsigned long)(sd_info.free_bytes >> 20),
                          (unsigned long)(sd_info.total_bytes >> 20));
+                if (failed)
+                    port_log("sd: mounted after %lu failed tries", (unsigned long)failed);
+                failed = 0;
             } else {
                 SD.end();
+                if (reply == SD_NO_REPLY) {
+                    // An empty slot stays quiet, unless a failing card just left it.
+                    if (failed)
+                        port_log("sd: the card stopped answering after %lu failed tries "
+                                 "(taken out?)", (unsigned long)failed);
+                    failed = 0;
+                } else if (failed++ == 0 || now >= next_fail_log) {
+                    next_fail_log = now + SD_FAIL_LOG_MS;
+                    if (reply == SD_R1_IDLE)
+                        port_log("sd: a card answers but will not mount (%lu tries so far): its "
+                                 "start-up or its file system failed; try another card, or "
+                                 "format this one FAT32",
+                                 (unsigned long)failed);
+                    else
+                        port_log("sd: a card answers its reset with 0x%02x, not 0x01, and will "
+                                 "not mount (%lu tries so far): check its wiring and power",
+                                 reply, (unsigned long)failed);
+                }
             }
         }
         size_t size;
@@ -893,8 +935,19 @@ static void sd_task(void *)
             sd_pending--;
             portEXIT_CRITICAL(&sd_mux);
         }
+        // Held: once what was queued is written, close and unmount the card, so
+        // nothing touches it until the battery recovers.
+        if (held && mounted && port_sd_idle()) {
+            if (f)
+                f.close();
+            open_path[0] = 0;
+            SD.end();
+            mounted = false;
+            sd_set_absent();
+            port_log("sd: card closed and unmounted until the battery recovers");
+        }
         // Between files, check the card is still there, and its free space.
-        if (mounted && !f && now >= next_check) {
+        if (mounted && !held && !f && now >= next_check) {
             next_check = now + SD_CHECK_MS;
             if (SD.readRAW(sector, 0))
                 sd_refresh();
@@ -942,6 +995,8 @@ static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, b
                     uint32_t offset = 0, uint32_t rlen = 0)
 {
     void *mem = nullptr;
+    if (op != SD_CLOSE && sd_held())
+        return false; // not counted as dropped: the battery is low, not the card
     if (!sd_q || !sd_info.present ||
         xRingbufferSendAcquire(sd_q, &mem, sizeof(sd_item) + len, 0) != pdTRUE) {
         sd_count(len, 0);
@@ -978,6 +1033,16 @@ extern "C" bool port_sd_idle(void)
 }
 
 extern "C" bool port_sd_remove(const char *path) { return sd_send(SD_REMOVE, path, nullptr, 0, false); }
+
+extern "C" void port_sd_hold(bool hold)
+{
+    if (hold)
+        port_sd_close(); // queued first: the file in progress ends cleanly
+    portENTER_CRITICAL(&sd_mux);
+    sd_info.held = hold;
+    portEXIT_CRITICAL(&sd_mux);
+    // Letting go: the card's task mounts it again at its next try.
+}
 
 // One read or listing at a time: the result has one buffer.
 static bool sd_request(uint8_t op, const char *path, const void *buf, size_t len, uint32_t offset,

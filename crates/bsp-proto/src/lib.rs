@@ -1043,6 +1043,11 @@ pub struct StorageStatus {
     /// too slow to keep up.
     #[serde(default)]
     pub dropped_bytes: u64,
+    /// The client closed the card because its battery is low (a card that
+    /// loses power while it writes can be ruined); `present` is then false.
+    /// It opens the card again once the battery recovers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 /// A peripheral on one of the client's buses.

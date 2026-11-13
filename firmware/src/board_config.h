@@ -44,6 +44,15 @@
 #define BPS_OTA_MIN_BATTERY 50
 #endif
 
+/* The cell voltage (mV) under which the storage card is closed, and the one
+ * at which it is opened again (power.h); 0: never closed. */
+#ifndef BPS_SD_MIN_MV
+#define BPS_SD_MIN_MV 3400
+#endif
+#ifndef BPS_SD_RESUME_MV
+#define BPS_SD_RESUME_MV 3550
+#endif
+
 /* From `git describe --tags --always --dirty`, set by scripts/bps_config.py. */
 #ifndef BPS_GIT_DESCRIBE
 #define BPS_GIT_DESCRIBE "unknown"

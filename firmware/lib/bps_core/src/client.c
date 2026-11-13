@@ -10,6 +10,7 @@
 #include "devices.h"
 #include "logbuf.h"
 #include "ota.h"
+#include "power.h"
 #include "port.h"
 #include "proto.h"
 #include "record.h"
@@ -888,6 +889,16 @@ static bool card_has_room(void)
     return info.present && info.free_bytes >= BPS_RECORD_MIN_FREE;
 }
 
+/* The card is closed for a low battery (power_poll()): batch mode keeps the
+ * radio off rather than going live, which would only drain the cell faster;
+ * the audio meanwhile is not kept. */
+static bool card_held(void)
+{
+    port_sd_info info;
+    port_sd_info_get(&info);
+    return info.held;
+}
+
 /* Turns the radio off until the next contact. */
 static void go_off(uint64_t now)
 {
@@ -931,7 +942,7 @@ static void contact_poll(uint64_t now)
     if (mode.run != MODE_BATCH || closing_down())
         return; /* for an update the radio stays on */
     bool over = now - mode.contact_us > CONTACT_MAX_US;
-    if (!card_has_room()) {
+    if (!card_has_room() && !card_held()) {
         /* Audio would be lost with the radio off: upload it as it comes. */
         port_log("mode: the storage card is gone or full; live until it is back");
         mode.note = "batch mode needs a storage card with room";
@@ -1003,7 +1014,7 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
     }
     if (mode.run == MODE_BATCH)
         return;
-    if (!card_has_room()) {
+    if (!card_has_room() && !card_held()) {
         if (!mode.note)
             port_log("mode: batch needs a storage card with room; staying live");
         mode.note = "batch mode needs a storage card with room";
@@ -1155,6 +1166,40 @@ static void logging_poll(uint64_t now)
     if (bps_log_capturing() && now >= maint.log_until_us) {
         port_log("trace logging: time is up; off");
         bps_log_set_capture(false);
+    }
+}
+
+/* The low-battery cutoff for the storage card (power.h): checked once a
+ * second (the gauge reads every 10 s), in every state, on or off the air. */
+#define POWER_POLL_US 1000000
+static struct {
+    bps_power p;
+    uint64_t next_us;
+} power;
+
+static void power_poll(uint64_t now)
+{
+    if (now < power.next_us)
+        return;
+    power.next_us = now + POWER_POLL_US;
+    const bps_power_cfg pc = {(uint32_t)(cfg.sd_cut_mv > 0 ? cfg.sd_cut_mv : 0),
+                              (uint32_t)(cfg.sd_resume_mv > 0 ? cfg.sd_resume_mv : 0)};
+    uint32_t mv = 0;
+    bool have = bps_devices_cell_mv(&mv);
+    switch (bps_power_update(&power.p, &pc, have, mv)) {
+    case BPS_POWER_WENT_LOW:
+        port_log("power: battery %lu mV, under %lu: closing the storage card until it is back "
+                 "at %lu mV",
+                 (unsigned long)mv, (unsigned long)pc.cut_mv, (unsigned long)pc.resume_mv);
+        port_sd_hold(true);
+        break;
+    case BPS_POWER_RECOVERED:
+        if (have)
+            port_log("power: battery %lu mV: opening the storage card again", (unsigned long)mv);
+        else
+            port_log("power: no battery now: opening the storage card again");
+        port_sd_hold(false);
+        break;
     }
 }
 
@@ -1941,6 +1986,7 @@ void bps_client_loop(void)
     if (reboot_poll(now))
         return;
     logging_poll(now);
+    power_poll(now);
     port_beacon pb;
     for (int i = 0; i < 16 && port_beacon_take(&pb); i++)
         bps_beacon_push(&beacon, pb.bssid, pb.tsf_us, pb.mono_ns);
@@ -2008,7 +2054,7 @@ void bps_client_loop(void)
         bps_upload_poll(now);
         count_gated();
         /* Early if the card went: what is recorded cannot be kept. */
-        if (now >= mode.next_contact_us || !card_has_room())
+        if (now >= mode.next_contact_us || (!card_has_room() && !card_held()))
             wake(now);
         break;
     }

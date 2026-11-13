@@ -198,3 +198,18 @@ bool bps_devices_battery(int32_t *centi_percent, int32_t *centi_pct_per_h)
     }
     return false;
 }
+
+bool bps_devices_cell_mv(uint32_t *millivolts)
+{
+    for (size_t i = 0; i < n_devs; i++) {
+        const bps_device *d = &devs[i];
+        if (strcmp(d->drv->role, "battery") != 0 || !d->present)
+            continue;
+        const bps_max17048 *g = &d->u.gauge;
+        if (!g->valid || !g->battery)
+            continue;
+        *millivolts = g->millivolts;
+        return true;
+    }
+    return false;
+}

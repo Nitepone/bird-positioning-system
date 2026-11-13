@@ -105,8 +105,15 @@ typedef struct {
     uint64_t total_bytes, free_bytes;
     uint32_t errors;        /* failed writes and mounts lost, so far */
     uint64_t dropped_bytes; /* not written: no card, or the queue to it was full */
+    bool held;              /* closed by port_sd_hold() (then not `present`) */
 } port_sd_info;
 void port_sd_info_get(port_sd_info *out);
+
+/* Holding the card (the battery is low, power.h): what is already queued is
+ * written, the open file closed and the card unmounted, and no card I/O runs
+ * until it is let go (writes, removes, reads and listings return false, and
+ * do not count as dropped). Letting go mounts it again. */
+void port_sd_hold(bool hold);
 
 /* Queues `len` bytes for the file at `path` (relative to the card's root;
  * missing directories are made), replacing the file (`append` false) or added

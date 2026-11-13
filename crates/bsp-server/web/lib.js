@@ -151,6 +151,7 @@ function deviceIssues(c) {
   const s = h?.storage;
   if (s && s.present && s.free_bytes != null && s.free_bytes < STORAGE_LOW_BYTES) add("warn", `Storage card nearly full (${fmtBytes(s.free_bytes)} free)`, "overview");
   if (s && s.errors) add("warn", `${plural(s.errors, "storage card write error")}`, "overview");
+  if (s && s.paused) add("warn", "Storage card closed while the battery is low: recordings are not kept", "overview");
   const missing = (h?.devices || []).filter(d => !d.present).map(d => d.kind);
   if (c.active && missing.length) add("warn", `Not found: ${missing.join(", ")}`, "overview");
   if (h?.mode?.note) add("warn", h.mode.note, "overview");
@@ -173,7 +174,7 @@ const EVENT_GROUPS = [
   { id: "detect", label: "Identification", kinds: ["identified", "identify_error", "validation"] },
   { id: "command", label: "Commands", kinds: ["reboot_requested", "logging_requested", "command_acked", "mode_set", "config", "settings", "position_request", "species_muted", "species_unmuted"] },
   { id: "firmware", label: "Firmware", kinds: ["firmware_uploaded", "firmware_deleted", "firmware_policy_set", "firmware_offered", "firmware_update_deferred", "firmware_update_failed", "firmware_updated"] },
-  { id: "health", label: "Health", kinds: ["battery_low", "storage_low", "capture_dropout", "client_log_dropped"] },
+  { id: "health", label: "Health", kinds: ["battery_low", "storage_low", "storage_paused", "storage_resumed", "capture_dropout", "client_log_dropped"] },
   { id: "audio", label: "Audio uploads", kinds: ["audio"], quiet: true },
   { id: "log", label: "Trace log", kinds: ["client_log"], quiet: true },
   { id: "heartbeat", label: "Heartbeats", kinds: ["heartbeat"], quiet: true },
@@ -183,7 +184,7 @@ function eventGroup(kind) { return (EVENT_GROUPS.find(g => g.kinds.includes(kind
 function eventLevel(e) {
   const k = e.kind, d = e.detail || {};
   if (["register_refused", "identify_error", "firmware_update_failed", "clock_unsynced", "battery_low"].includes(k)) return "bad";
-  if (["inactive", "capture_dropout", "storage_low", "firmware_update_deferred", "client_log_dropped"].includes(k)) return "warn";
+  if (["inactive", "capture_dropout", "storage_low", "storage_paused", "firmware_update_deferred", "client_log_dropped"].includes(k)) return "warn";
   if (k === "client_rebooted" && ["watchdog", "brownout", "panic"].includes(d.reason)) return "warn";
   if (k === "command_acked" && d.result && d.result !== "done") return "warn";
   return "";
@@ -216,6 +217,8 @@ function eventSummary(e) {
     case "settings": return "Server settings saved";
     case "species_muted": return `Muted ${d.scientific}`;
     case "species_unmuted": return `Unmuted ${d.scientific}`;
+    case "storage_paused": return "Storage card closed: the battery is low";
+    case "storage_resumed": return "Storage card opened again: the battery recovered";
     case "capture_dropout": return `${plural(d.count ?? 1, "gap")} in the captured audio`;
     case "firmware_uploaded": return `Build ${d.describe} uploaded for ${d.hardware_id} (${fmtBytes(d.size)})`;
     case "firmware_deleted": return `Build ${d.describe || d.build_id} deleted`;

@@ -120,12 +120,15 @@ COMMON_DEFAULTS = {
     "SPI_MOSI": "none",
     "DEVICES": "",
     "OTA_MIN_BATTERY": "50",
+    "SD_MIN_MV": "3400",
+    "SD_RESUME_MV": "3550",
 }
 
 KEYS = ["BOARD", "WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST", "SERVER_PORT", "CLIENT_NAME",
         "I2S_BCLK", "I2S_WS", "I2S_DATA", "MIC_CHANNEL", "BUTTON_PIN", "LED_PIN",
         "I2C_SDA", "I2C_SCL", "SPI_SCK", "SPI_MISO", "SPI_MOSI", "DEVICES",
-        "LOOKBACK_MS", "RING_KB", "DEVICE_NAME", "CLIENT_ID", "OTA_MIN_BATTERY"]
+        "LOOKBACK_MS", "RING_KB", "DEVICE_NAME", "CLIENT_ID", "OTA_MIN_BATTERY",
+        "SD_MIN_MV", "SD_RESUME_MV"]
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -311,6 +314,16 @@ def validate(cfg):
         errors.append("OTA_MIN_BATTERY must be 0-100 (the battery charge, in %, a firmware "
                       "update needs)")
 
+    sd_min = cfg.get("SD_MIN_MV", "")
+    sd_resume = cfg.get("SD_RESUME_MV", "")
+    if not sd_min.isdigit() or not (int(sd_min) == 0 or 3000 <= int(sd_min) <= 4000):
+        errors.append("SD_MIN_MV must be 0 (never) or 3000-4000 (the cell voltage, in mV, under "
+                      "which the storage card is closed)")
+    elif int(sd_min) and (not sd_resume.isdigit() or not
+                          int(sd_min) + 50 <= int(sd_resume) <= 4200):
+        errors.append(f"SD_RESUME_MV must be {int(sd_min) + 50}-4200 (at least 50 mV over "
+                      "SD_MIN_MV, so the card does not open and close over and over)")
+
     ring = cfg.get("RING_KB", "")
     lookback = cfg.get("LOOKBACK_MS", "")
     if not ring.isdigit() or not 32 <= int(ring) <= 1024:
@@ -345,6 +358,8 @@ def defines(cfg):
         ("BPS_LOOKBACK_MS", int(cfg["LOOKBACK_MS"]), False),
         ("BPS_RING_BYTES", int(cfg["RING_KB"]) * 1024, False),
         ("BPS_OTA_MIN_BATTERY", int(cfg.get("OTA_MIN_BATTERY") or 50), False),
+        ("BPS_SD_MIN_MV", int(cfg.get("SD_MIN_MV") or 3400), False),
+        ("BPS_SD_RESUME_MV", int(cfg.get("SD_RESUME_MV") or 3550), False),
     ] + [(f"BPS_{k}", pin_value(cfg[k]), False) for keys in BUS_KEYS.values() for k in keys] + [
         ("BPS_DEVICES", format_devices(parse_devices(cfg.get("DEVICES", ""))), True),
     ]

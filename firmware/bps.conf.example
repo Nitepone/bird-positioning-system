@@ -24,3 +24,5 @@ DEVICES=none                # e.g. 'max17048@0x36 sd@2' (battery gauge, microSD 
 LOOKBACK_MS=750             # audio kept before the sound that opened the gate
 RING_KB=160                 # RAM asked for the ring buffer
 OTA_MIN_BATTERY=50          # ESP32: battery % an over-the-air update needs, unless charging
+SD_MIN_MV=3400              # ESP32: close the storage card under this cell voltage (0: never)
+SD_RESUME_MV=3550           # ESP32: open it again at this voltage

@@ -292,15 +292,25 @@ const BATTERY_LOW_PCT: f32 = 20.0;
 const STORAGE_LOW_BYTES: u64 = 1 << 30;
 
 /// Events for changes in a client's health between two heartbeats: its
-/// storage card put in or taken out, or running out of room, and its battery
-/// running low.
+/// storage card put in or taken out, closed for a low battery and opened
+/// again, or running out of room, and its battery running low.
 fn health_events(
     before: Option<&ClientHealth>,
     now: &ClientHealth,
 ) -> Vec<(&'static str, serde_json::Value)> {
     let mut events = Vec::new();
     let card = |h: Option<&ClientHealth>| h.and_then(|h| h.storage);
-    let present = |h| card(h).is_some_and(|s| s.present);
+    // A card closed for a low battery is still in: it is paused, not removed.
+    let paused = |h| card(h).is_some_and(|s| s.paused);
+    let present = |h| card(h).is_some_and(|s| s.present || s.paused);
+    if card(Some(now)).is_some() && paused(Some(now)) != paused(before) {
+        let kind = if paused(Some(now)) {
+            "storage_paused"
+        } else {
+            "storage_resumed"
+        };
+        events.push((kind, json!({ "storage": now.storage })));
+    }
     // A first report of an empty slot says nothing new.
     if card(Some(now)).is_some() && present(before) != present(Some(now)) {
         let kind = if present(Some(now)) {
@@ -629,6 +639,7 @@ mod tests {
                 recorded_bytes: 0,
                 errors: 0,
                 dropped_bytes: 0,
+                paused: false,
             }),
             devices: Vec::new(),
             mode: None,
@@ -669,6 +680,23 @@ mod tests {
         assert!(kinds(Some(&low), &health(Some(18.0), roomy)).is_empty());
         // No gauge, no card: nothing.
         assert!(kinds(None, &health(None, None)).is_empty());
+    }
+
+    #[test]
+    fn a_card_closed_for_a_low_battery_is_paused_not_removed() {
+        let roomy = Some((true, 8 << 30));
+        let fine = health(Some(80.0), roomy);
+        let mut paused = health(Some(10.0), Some((false, 0)));
+        paused.storage.as_mut().unwrap().paused = true;
+        assert_eq!(kinds(Some(&fine), &paused), ["storage_paused", "battery_low"]);
+        assert!(kinds(Some(&paused), &paused).is_empty());
+        // Opened again: resumed, not inserted.
+        assert_eq!(kinds(Some(&paused), &fine), ["storage_resumed"]);
+        // The battery recovered but the card does not mount: resumed, then removed.
+        assert_eq!(
+            kinds(Some(&paused), &health(Some(10.0), Some((false, 0)))),
+            ["storage_resumed", "storage_removed"]
+        );
     }
 
     #[test]

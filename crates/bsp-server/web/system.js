@@ -77,6 +77,7 @@ function storageView(c) {
   if (!s) return null;
   const problems = [s.errors ? plural(s.errors, "write error") : "", s.dropped_bytes ? `${fmtBytes(s.dropped_bytes)} not written` : ""].filter(Boolean).join(", ");
   const saved = `${plural(s.recordings, "recording")} (${fmtBytes(s.recorded_bytes)}) saved since it started`;
+  if (s.paused) return { text: "closed", cls: "bad", sub: "the battery is low: the card is closed until it recovers, and recordings are not kept" };
   if (!s.present) return { text: "no card", cls: "muted", sub: "not keeping recordings" + (problems ? `; ${problems}` : "") };
   return { text: `${fmtBytes(s.free_bytes)} free`, cls: s.free_bytes < STORAGE_LOW_BYTES ? "bad" : "",
            sub: `of ${fmtBytes(s.total_bytes)}; ${saved}` + (problems ? `; ${problems}` : "") };

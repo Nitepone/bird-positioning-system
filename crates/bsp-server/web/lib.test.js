@@ -83,6 +83,10 @@ test("device state and issues", () => {
   // A low battery that is charging is not a problem; an offline device's missing parts are not news.
   assert.deepEqual(L.deviceIssues({ ...ok, health: { battery: { percent: 5, charging: true } } }), []);
   assert.deepEqual(L.deviceIssues({ active: false, synced: false, health: { devices: [{ kind: "sd", present: false }] } }), []);
+  // A card closed for a low battery says so.
+  const closed = L.deviceIssues({ ...ok, health: { storage: { present: false, paused: true } } });
+  assert.deepEqual(closed.map(i => i.level), ["warn"]);
+  assert.match(closed[0].text, /closed while the battery is low/);
 });
 
 test("events are grouped and put into words", () => {
@@ -105,6 +109,9 @@ test("events are grouped and put into words", () => {
   assert.equal(s("brand_new", { count: 2, why: "x", nested: { a: 1 } }), "count 2, why x");
   assert.equal(s("brand_new", {}), "brand new");
   assert.equal(L.eventLevel({ kind: "clock_unsynced" }), "bad");
+  assert.equal(L.eventLevel({ kind: "storage_paused" }), "warn");
+  assert.equal(L.eventGroup("storage_resumed"), "health");
+  assert.equal(s("storage_paused", { storage: { present: false, paused: true } }), "Storage card closed: the battery is low");
   assert.equal(L.eventLevel({ kind: "client_rebooted", detail: { reason: "panic" } }), "warn");
   assert.equal(L.eventLevel({ kind: "command_acked", detail: { result: "unsupported" } }), "warn");
   assert.equal(L.eventLevel({ kind: "register" }), "");

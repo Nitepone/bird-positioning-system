@@ -26,7 +26,7 @@ backtitle="bps (bird positioning system) - microcontroller client"
 
 keys=(BOARD WIFI_SSID WIFI_PASSWORD SERVER_HOST SERVER_PORT CLIENT_NAME I2S_BCLK I2S_WS I2S_DATA
     MIC_CHANNEL BUTTON_PIN LED_PIN I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI DEVICES
-    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID OTA_MIN_BATTERY)
+    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID OTA_MIN_BATTERY SD_MIN_MV SD_RESUME_MV)
 bus_keys=(I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI)
 declare -A label=(
     [BOARD]="Board" [WIFI_SSID]="Wi-Fi network" [WIFI_PASSWORD]="Wi-Fi password"
@@ -37,6 +37,7 @@ declare -A label=(
     [SPI_MISO]="SPI MISO pin" [SPI_MOSI]="SPI MOSI pin" [DEVICES]="Devices"
     [LOOKBACK_MS]="Look-back" [RING_KB]="Ring buffer" [DEVICE_NAME]="Mic name"
     [CLIENT_ID]="Client ID" [OTA_MIN_BATTERY]="Update battery"
+    [SD_MIN_MV]="Card cutoff" [SD_RESUME_MV]="Card resume"
 )
 declare -A board_title=()
 board_keys=()
@@ -143,6 +144,12 @@ show() {
             if pico; then echo "${v:-?}% (the Pico boards do not update over the air)"
             else echo "${v:-?}% (unless charging)"; fi
             ;;
+        SD_MIN_MV)
+            if pico; then echo "${v:-?} mV (the Pico boards have no card slot)"
+            elif [[ $v == 0 ]]; then echo "never (the card is used at any voltage)"
+            else echo "${v:-?} mV (the card is closed under this)"; fi
+            ;;
+        SD_RESUME_MV) echo "${v:-?} mV (the card is opened again at this)" ;;
         *) echo "${v:-(not set)}" ;;
     esac
 }
@@ -241,6 +248,8 @@ edit() {
         RING_KB) input RING_KB "Ring buffer" "RAM asked for recent audio, in KB (used in 16 KB blocks; 94 KB holds a second). The board takes what fits while keeping 32 KB free, and logs what it got:" ;;
         DEVICE_NAME) input DEVICE_NAME "Mic name" "Reported to the server as the microphone's name:" ;;
         CLIENT_ID) input CLIENT_ID "Client ID" "UUID to use as this client's ID, or empty to derive a stable one from the chip:" ;;
+        SD_MIN_MV) input SD_MIN_MV "Card cutoff" "A storage card that loses power while it writes can be ruined. When the battery gauge reads the cell under this voltage, in mV, the board closes the card and saves no audio to it until the cell recovers (3000-4000, or 0 for never; boards without a gauge, or running off the charger, use the card regardless):" ;;
+        SD_RESUME_MV) input SD_RESUME_MV "Card resume" "Once closed for a low battery, the card is opened again when the cell is back at this voltage, in mV (at least 50 mV over the cutoff, so it does not open and close over and over):" ;;
         OTA_MIN_BATTERY) input OTA_MIN_BATTERY "Firmware updates" "The ESP32 boards update their firmware over the air when the server offers a new build. On a battery that is not charging, the update waits until the battery gauge reads at least this charge, in % (0-100; boards without a gauge update anyway):" ;;
     esac
     return 0 # a cancelled dialog just leaves the setting as it was

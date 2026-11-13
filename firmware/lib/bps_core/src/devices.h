@@ -86,6 +86,8 @@ void bps_devices_describe(char *out, size_t cap);
  * the first battery gauge with a reading of a battery; false if there is none
  * (no gauge, or one running off the charger with no cell). */
 bool bps_devices_battery(int32_t *centi_percent, int32_t *centi_pct_per_h);
+/* The cell's voltage, from the same gauge; false if there is none. */
+bool bps_devices_cell_mv(uint32_t *millivolts);
 
 /* The drivers (devices.c), for tests. */
 const bps_driver *bps_driver_find(const char *kind, size_t len);

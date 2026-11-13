@@ -234,6 +234,9 @@ static FILE *sd_file;
 static char sd_path[512];
 static port_sd_info sd_info;
 
+/* There is no battery here, so the card is never held. */
+void port_sd_hold(bool hold) { (void)hold; }
+
 /* Written at once: nothing is ever waiting. */
 bool port_sd_idle(void) { return true; }
 

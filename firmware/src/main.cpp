@@ -31,6 +31,8 @@ void setup()
         {BPS_I2C_SDA, BPS_I2C_SCL, BPS_SPI_SCK, BPS_SPI_MISO, BPS_SPI_MOSI, BPS_DEVICES},
         &bps_build_this,
         BPS_OTA_MIN_BATTERY,
+        BPS_SD_MIN_MV,
+        BPS_SD_RESUME_MV,
     };
     bps_client_setup(&settings);
 }

@@ -13,7 +13,7 @@ static void poll(bps_device *d)
 {
     port_sd_info info;
     port_sd_info_get(&info);
-    d->present = info.present;
+    d->present = info.present || info.held; /* closed for a low battery, still in */
 }
 
 static bool start(bps_device *d)
@@ -34,6 +34,8 @@ static void heartbeat(const bps_device *d, bps_json *j)
     bps_record_stats_get(&rec);
     bps_json_obj(j, "storage");
     bps_json_bool(j, "present", info.present);
+    if (info.held) /* closed while the battery is low */
+        bps_json_bool(j, "paused", true);
     if (info.present) {
         bps_json_i64(j, "total_bytes", (int64_t)info.total_bytes);
         bps_json_i64(j, "free_bytes", (int64_t)info.free_bytes);
@@ -52,6 +54,10 @@ static void describe(const bps_device *d, char *out, size_t cap)
     port_sd_info_get(&info);
     bps_record_stats rec;
     bps_record_stats_get(&rec);
+    if (info.held) {
+        snprintf(out, cap, "closed while the battery is low");
+        return;
+    }
     snprintf(out, cap, "%lu of %lu MB free, %lu recordings saved, %lu errors",
              (unsigned long)(info.free_bytes >> 20), (unsigned long)(info.total_bytes >> 20),
              (unsigned long)rec.files, (unsigned long)info.errors);

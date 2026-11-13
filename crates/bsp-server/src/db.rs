@@ -1387,6 +1387,7 @@ mod tests {
                 recorded_bytes: 400_000,
                 errors: 0,
                 dropped_bytes: 0,
+                paused: false,
             }),
             devices: vec![DeviceStatus {
                 kind: "max17048".into(),
