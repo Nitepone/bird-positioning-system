@@ -176,7 +176,7 @@ function renderDevices() {
   ].filter(Boolean).join(" &middot; "));
   const issues = deviceIssues(c);
   $("dev-issues").hidden = !issues.length;
-  setHtml("dev-issues", issues.map(i => `<li class="${i.level}"><span class="grow">${esc(i.text)}</span>` +
+  setHtml("dev-issues", issues.map(i => `<li class="lvl-${i.level}"><span class="grow">${esc(i.text)}</span>` +
     (i.tab && i.tab !== devTab ? `<a href="${deviceLink(c.id, i.tab)}">${esc(TABS.find(t => t[0] === i.tab)[1])}</a>` : "") + `</li>`).join(""));
   setHtml("dev-tabs", TABS.map(([id, name]) => `<a role="tab" href="${deviceLink(c.id, id === "overview" ? "" : id)}" class="${id === devTab ? "current" : ""}" ` +
     `aria-selected="${id === devTab}">${name}</a>`).join(""));

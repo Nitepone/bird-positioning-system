@@ -230,9 +230,10 @@ table.data tbody tr.click:hover td { background: var(--hover); }
 .issues { list-style: none; margin: 0 0 12px; padding: 0; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
 .issues li { padding: 4px 10px; border-left: 4px solid var(--off); display: flex; gap: 10px; align-items: baseline; }
 .issues li + li { border-top: 1px solid var(--rule-soft); }
-.issues li.bad { border-left-color: var(--bad); }
-.issues li.warn { border-left-color: var(--warn); }
-.issues li.info { border-left-color: var(--accent); }
+/* lvl-: a bare "info" would also pick up the .info tooltip badge's 15px circle. */
+.issues li.lvl-bad { border-left-color: var(--bad); }
+.issues li.lvl-warn { border-left-color: var(--warn); }
+.issues li.lvl-info { border-left-color: var(--accent); }
 .issues li .grow { flex: 1; }
 .section { margin-bottom: 18px; }
 .section > h3 { border-bottom: 1px solid var(--rule-soft); padding-bottom: 3px; margin-bottom: 8px; display: flex; gap: 10px; align-items: baseline; }
