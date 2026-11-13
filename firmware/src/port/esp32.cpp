@@ -999,7 +999,10 @@ static bool sd_send(uint8_t op, const char *path, const void *buf, size_t len, b
         return false; // not counted as dropped: the battery is low, not the card
     if (!sd_q || !sd_info.present ||
         xRingbufferSendAcquire(sd_q, &mem, sizeof(sd_item) + len, 0) != pdTRUE) {
-        sd_count(len, 0);
+        // Only a write loses data: a listing's `len` is its suffix, and a
+        // failed read or listing is reported to whoever asked.
+        if (op == SD_WRITE)
+            sd_count(len, 0);
         return false;
     }
     portENTER_CRITICAL(&sd_mux);
