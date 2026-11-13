@@ -62,7 +62,16 @@ pub struct Settings {
     pub trigger: Option<TriggerConfig>,
     /// How clients check a triggered recording before uploading it.
     pub validation: ValidationConfig,
+    /// Species the operator does not want to see (scientific names): a
+    /// species the identifier keeps mistaking something else for. Their
+    /// detections are still made and kept; the web UI leaves them out unless
+    /// asked.
+    pub muted_species: Vec<String>,
 }
+
+/// Most species that can be muted, and the longest name.
+pub const MUTED_SPECIES_MAX: usize = 500;
+pub const SPECIES_NAME_MAX: usize = 120;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -72,6 +81,7 @@ impl Default for Settings {
             min_confidence_unexpected: ConfidenceLevel::High,
             trigger: None,
             validation: ValidationConfig::None,
+            muted_species: Vec::new(),
         }
     }
 }
@@ -111,7 +121,40 @@ impl Settings {
             }
             ValidationConfig::Unknown => return Err("unsupported validation type".into()),
         }
+        if self.muted_species.len() > MUTED_SPECIES_MAX {
+            return Err(format!("at most {MUTED_SPECIES_MAX} species can be muted"));
+        }
+        if let Some(bad) = self
+            .muted_species
+            .iter()
+            .find(|s| s.trim().is_empty() || s.len() > SPECIES_NAME_MAX)
+        {
+            return Err(format!(
+                "a muted species must be a scientific name of 1 to {SPECIES_NAME_MAX} characters, not {bad:?}"
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether `scientific` is muted (names compare without regard to case).
+    pub fn is_muted(&self, scientific: &str) -> bool {
+        self.muted_species
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(scientific))
+    }
+
+    /// Mutes or unmutes a species; false if that changed nothing.
+    pub fn set_muted(&mut self, scientific: &str, muted: bool) -> bool {
+        let scientific = scientific.trim();
+        let was = self.is_muted(scientific);
+        if muted && !was {
+            self.muted_species.push(scientific.to_string());
+            self.muted_species.sort_by_key(|s| s.to_lowercase());
+        } else if !muted && was {
+            self.muted_species
+                .retain(|m| !m.eq_ignore_ascii_case(scientific));
+        }
+        was != muted
     }
 
     /// The trigger clients are asked to run: as set, else the energy trigger

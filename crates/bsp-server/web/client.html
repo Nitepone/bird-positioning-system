@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bird Positioning System Client</title>
+<title>Microphone - Bird Positioning System</title>
 <style>
   /* Colour tokens: copied from index.html so both pages share one theme. */
   :root {
@@ -85,12 +85,18 @@
   body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; margin: 0;
          background: var(--page); color: var(--ink); }
   a { color: var(--link); }
-  #titlebar { background: var(--titlebar); color: #fff; padding: 6px 1em; display: flex; flex-wrap: wrap;
-              align-items: baseline; gap: 0 1em; }
-  #titlebar .brand { font-weight: bold; }
+  /* The same bar as the Birds and System workspaces (app.css), with this page as a third place. */
+  #titlebar { background: var(--titlebar); color: #fff; padding: 0 16px; min-height: 44px; display: flex; flex-wrap: wrap;
+              align-items: center; gap: 4px 20px; }
+  #titlebar .brand { font-weight: 600; }
   #titlebar #title-id { opacity: 0.85; }
   #titlebar a { color: #fff; text-decoration: none; }
-  #titlebar a.right { margin-left: auto; }
+  #titlebar .right { margin-left: auto; }
+  #titlebar .workspaces { display: flex; border: 1px solid rgba(255, 255, 255, 0.35); border-radius: 3px; overflow: hidden; font-size: 13px; }
+  #titlebar .workspaces > * { padding: 2px 12px; }
+  #titlebar .workspaces > * + * { border-left: 1px solid rgba(255, 255, 255, 0.35); }
+  #titlebar .workspaces .current { background: #fff; color: var(--titlebar); font-weight: 600; }
+  #titlebar .workspaces a:hover { background: rgba(255, 255, 255, 0.12); }
   main { margin: 1em; max-width: 50em; }
   section { margin-bottom: 1.2em; }
   h2 { font-size: 16px; margin: 0 0 0.4em; }
@@ -128,8 +134,9 @@
 </head>
 <body>
 <div id="titlebar">
-  <span class="brand">Bird Positioning System Client</span> <span class="mono" id="title-id"></span>
-  <a href="/" class="right">[Server UI]</a>
+  <a class="brand" href="/">Bird Positioning System</a>
+  <span class="workspaces"><a href="/">Birds</a><a href="/system">System</a><span class="current">Microphone</span></span>
+  <span class="mono right" id="title-id" title="This microphone's device ID"></span>
 </div>
 
 <main>
@@ -216,6 +223,9 @@ const RAW_AUDIO = {
   sampleRate: { ideal: 48000 }, // BirdNET's native rate
 };
 const PROCESSING_KEYS = ["echoCancellation", "noiseSuppression", "autoGainControl", "voiceIsolation"];
+/** What each of the browser's audio processing settings is called on the page. */
+const PROCESSING_LABELS = { echoCancellation: "Echo cancellation", noiseSuppression: "Noise suppression",
+                            autoGainControl: "Automatic gain", voiceIsolation: "Voice isolation" };
 const SYNC_INTERVAL_MS = 250;
 const SYNC_WINDOW_MS = 64000; // measurements older than this are forgotten
 const SYNC_BINS = 16;         // each bin of the window keeps its fastest measurement
@@ -817,7 +827,7 @@ async function nameChanged() {
 async function flagPositioning() {
   try {
     await withServer(() => clientApi(`/${clientId}/position-request`, { method: "POST" }));
-    message("Positioning requested: set this client's position on the server's Config page.", "ok");
+    message("Positioning requested: set this microphone's position under System, on its Setup tab.", "ok");
     log("position_request", "positioning requested");
   } catch (e) {
     message("Positioning request failed: " + e.message, "bad");
@@ -1038,9 +1048,10 @@ function render() {
   const s = c?.settings || {};
   const supported = navigator.mediaDevices?.getSupportedConstraints?.() || {};
   const proc = PROCESSING_KEYS.map(k => {
-    if (!c) return [k, supported[k] ? "supported" : "not supported by this browser"];
-    if (!(k in s)) return [k, `<span class="warn">not reported${supported[k] ? "" : " (unsupported)"}</span>`];
-    return [k, s[k] ? `<span class="bad">ON</span>` : `<span class="ok">off</span>`];
+    const name = PROCESSING_LABELS[k];
+    if (!c) return [name, supported[k] ? "can be turned off" : "not offered by this browser"];
+    if (!(k in s)) return [name, `<span class="warn">not reported${supported[k] ? "" : " (not offered)"}</span>`];
+    return [name, s[k] ? `<span class="bad">on</span>` : `<span class="ok">off</span>`];
   });
   const raw = !c ? "-"
     : PROCESSING_KEYS.some(k => s[k] === true) ? `<span class="bad">no: the browser is processing the audio</span>`

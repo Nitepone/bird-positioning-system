@@ -177,6 +177,22 @@ pub struct DetectionFilter {
     /// Has a direction estimate.
     pub located: Option<bool>,
     pub min_confidence: Option<f32>,
+    /// Leave out the species the operator muted (`Settings::muted_species`).
+    pub hide_muted: Option<bool>,
+    /// Scientific names to leave out (case-insensitive): filled in by the
+    /// server from the muted species when `hide_muted` is set.
+    #[serde(skip)]
+    pub exclude_species: Vec<String>,
+}
+
+/// Which events to list; every field is optional.
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    pub after_id: Option<i64>,
+    pub before_id: Option<i64>,
+    pub client_id: Option<ClientId>,
+    pub kinds: Vec<String>,
+    pub exclude_kinds: Vec<String>,
 }
 
 /// A species seen at least once, for search suggestions.
@@ -905,27 +921,29 @@ impl Db {
     }
 
     /// Newest-first events, optionally only those newer than `after_id`.
-    pub fn list_events(
-        &self,
-        after_id: Option<i64>,
-        client_id: Option<ClientId>,
-        kind: Option<&str>,
-        exclude_kind: Option<&str>,
-        limit: u32,
-    ) -> rusqlite::Result<Vec<Event>> {
+    /// Events, newest first. `after_id` and `before_id` bound the ids (for
+    /// following new events, and for paging back); `kinds` keeps only those
+    /// kinds and `exclude_kinds` leaves kinds out (empty: no restriction).
+    pub fn list_events(&self, f: &EventFilter, limit: u32) -> rusqlite::Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, ts, client_id, kind, detail FROM events
              WHERE (?1 IS NULL OR id > ?1) AND (?2 IS NULL OR client_id = ?2)
-               AND (?3 IS NULL OR kind = ?3) AND (?4 IS NULL OR kind != ?4)
-             ORDER BY id DESC LIMIT ?5",
+               AND (?3 IS NULL OR kind IN (SELECT value FROM json_each(?3)))
+               AND (?4 IS NULL OR kind NOT IN (SELECT value FROM json_each(?4)))
+               AND (?5 IS NULL OR id < ?5)
+             ORDER BY id DESC LIMIT ?6",
         )?;
+        let list = |kinds: &[String]| {
+            (!kinds.is_empty()).then(|| serde_json::to_string(kinds).unwrap_or_default())
+        };
         stmt.query_map(
             params![
-                after_id,
-                client_id.map(|c| c.to_string()),
-                kind,
-                exclude_kind,
+                f.after_id,
+                f.client_id.map(|c| c.to_string()),
+                list(&f.kinds),
+                list(&f.exclude_kinds),
+                f.before_id,
                 limit
             ],
             |r| {
@@ -1161,6 +1179,8 @@ impl Db {
                AND (?7 IS NULL OR coalesce(json_extract(body, '$.unexpected'), 0) = ?7)
                AND (?8 IS NULL OR coalesce(json_type(body, '$.location') = 'object', 0) = ?8)
                AND (?9 IS NULL OR json_extract(body, '$.confidence') >= ?9)
+               AND (?11 IS NULL OR lower(json_extract(body, '$.species.scientific'))
+                    NOT IN (SELECT lower(value) FROM json_each(?11)))
              ORDER BY time DESC LIMIT ?10",
         )?;
         let nonempty = |s: &Option<String>| {
@@ -1169,6 +1189,8 @@ impl Db {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
+        let exclude = (!f.exclude_species.is_empty())
+            .then(|| serde_json::to_string(&f.exclude_species).unwrap_or_default());
         let rows = stmt.query_map(
             params![
                 f.before,
@@ -1180,7 +1202,8 @@ impl Db {
                 f.unexpected,
                 f.located,
                 f.min_confidence,
-                limit
+                limit,
+                exclude
             ],
             |r| r.get::<_, String>(0),
         )?;
@@ -1218,6 +1241,79 @@ mod tests {
             build: None,
             ota: false,
         }
+    }
+
+    #[test]
+    fn events_filter_by_several_kinds_and_page_back() {
+        let db = Db::in_memory().unwrap();
+        let a = Uuid::from_u128(1);
+        for (i, kind) in [
+            "register",
+            "heartbeat",
+            "audio",
+            "heartbeat",
+            "client_log",
+            "inactive",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let who = (i % 2 == 0).then_some(a);
+            db.insert_event(i as i64, who, kind, &serde_json::json!({}), 1000)
+                .unwrap();
+        }
+        let kinds = |f: EventFilter| -> Vec<String> {
+            db.list_events(&f, 100)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect()
+        };
+        let list = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(kinds(EventFilter::default()).len(), 6);
+        assert_eq!(
+            kinds(EventFilter {
+                exclude_kinds: list(&["heartbeat", "audio", "client_log"]),
+                ..Default::default()
+            }),
+            ["inactive", "register"]
+        );
+        assert_eq!(
+            kinds(EventFilter {
+                kinds: list(&["audio", "client_log"]),
+                ..Default::default()
+            }),
+            ["client_log", "audio"]
+        );
+        assert_eq!(
+            kinds(EventFilter {
+                client_id: Some(a),
+                ..Default::default()
+            }),
+            ["client_log", "audio", "register"]
+        );
+        // Paging back from the oldest event shown, and following new ones.
+        let all = db.list_events(&EventFilter::default(), 2).unwrap();
+        let older = db
+            .list_events(
+                &EventFilter {
+                    before_id: Some(all[1].id),
+                    ..Default::default()
+                },
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["heartbeat", "audio"]
+        );
+        assert_eq!(
+            kinds(EventFilter {
+                after_id: Some(all[1].id),
+                ..Default::default()
+            }),
+            ["inactive"]
+        );
     }
 
     #[test]
@@ -1516,6 +1612,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(times(DetectionFilter::default()), vec![400, 300, 200, 100]);
+        // Muted species are left out, whatever the case of the name.
+        assert_eq!(
+            times(DetectionFilter {
+                exclude_species: vec!["CORVUS brachyrhynchos".into(), "Nobody nowhere".into()],
+                ..Default::default()
+            }),
+            vec![300, 200]
+        );
         assert_eq!(
             times(DetectionFilter {
                 species: Some("corvus BRACHYRHYNCHOS".into()),

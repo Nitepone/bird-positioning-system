@@ -39,7 +39,18 @@ use tokio::sync::mpsc;
 /// This build of the server, from `git describe` (see build.rs).
 pub const BUILD: &str = env!("BPS_GIT_DESCRIBE");
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
+// The web UI: two workspaces over one stylesheet and shared scripts. "Birds"
+// (`/`) is for whoever wants to know what was heard; "System" (`/system`) is
+// for running and debugging the devices. `/classic` is the single-page UI
+// they replace, kept for comparison.
+const BIRDS_HTML: &str = include_str!("../web/index.html");
+const SYSTEM_HTML: &str = include_str!("../web/system.html");
+const CLASSIC_HTML: &str = include_str!("../web/classic.html");
+const APP_CSS: &str = include_str!("../web/app.css");
+const LIB_JS: &str = include_str!("../web/lib.js");
+const UI_JS: &str = include_str!("../web/ui.js");
+const BIRDS_JS: &str = include_str!("../web/birds.js");
+const SYSTEM_JS: &str = include_str!("../web/system.js");
 /// Charting library for the web UI, embedded so the UI works offline.
 const ECHARTS_JS: &str = include_str!("../web/vendor/echarts-6.1.0/echarts.min.js");
 /// Detections page: grouping detections into the audio samples they were heard in.
@@ -121,39 +132,55 @@ pub fn client_router(state: SharedState) -> Router {
     client_api().with_state(state)
 }
 
+const JS: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+
+/// One of the web UI's own files. They change with the server, so browsers
+/// check back each time (`no-cache`) instead of keeping an old page's script.
+fn static_file(
+    content_type: &'static str,
+    body: &'static str,
+) -> axum::routing::MethodRouter<SharedState> {
+    get(move || async move {
+        (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
+    })
+}
+
 /// Web UI, browser client and control API (served on the `[web]` listeners).
 /// The client API is served here too: browsers only allow microphone access
 /// on HTTPS pages, and those pages cannot call the plain-HTTP client port.
 pub fn web_router(state: SharedState) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route("/", get(|| async { Html(BIRDS_HTML) }))
+        .route("/system", get(|| async { Html(SYSTEM_HTML) }))
+        .route("/classic", get(|| async { Html(CLASSIC_HTML) }))
         .route(
             "/static/echarts-6.1.0.min.js",
             get(|| async {
                 (
                     [
-                        (
-                            axum::http::header::CONTENT_TYPE,
-                            "text/javascript; charset=utf-8",
-                        ),
+                        (header::CONTENT_TYPE, JS),
                         // Versioned path: the content never changes.
-                        (
-                            axum::http::header::CACHE_CONTROL,
-                            "public, max-age=31536000, immutable",
-                        ),
+                        (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
                     ],
                     ECHARTS_JS,
                 )
             }),
         )
+        .route("/static/app.css", static_file(CSS, APP_CSS))
+        .route("/static/lib.js", static_file(JS, LIB_JS))
+        .route("/static/ui.js", static_file(JS, UI_JS))
+        .route("/static/birds.js", static_file(JS, BIRDS_JS))
+        .route("/static/system.js", static_file(JS, SYSTEM_JS))
         .route(
             "/static/detection-samples.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    DETECTION_SAMPLES_JS,
-                )
-            }),
+            static_file(JS, DETECTION_SAMPLES_JS),
         )
         .route(
             "/client",
@@ -1178,12 +1205,119 @@ mod tests {
         assert!(CLIENT_HTML.contains(&format!("const API_VERSION = \"{API_VERSION}\";")));
     }
 
+    /// Every page of the web UI is served, with the files it loads.
+    #[tokio::test]
+    async fn serves_the_web_ui() {
+        let state = test_state();
+        for (path, kind, has) in [
+            ("/", "text/html", "<title>"),
+            ("/system", "text/html", "<title>"),
+            ("/classic", "text/html", "<title>"),
+            ("/client", "text/html", "<title>"),
+            ("/static/app.css", "text/css", ":root"),
+            ("/static/lib.js", "text/javascript", "clientLabels"),
+            ("/static/ui.js", "text/javascript", "playClip"),
+            ("/static/birds.js", "text/javascript", "function"),
+            ("/static/system.js", "text/javascript", "function"),
+            (
+                "/static/detection-samples.js",
+                "text/javascript",
+                "groupSamples",
+            ),
+        ] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let resp = web_router(state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let ct = resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(ct.starts_with(kind), "{path}: {ct}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains(has), "{path}");
+        }
+        // Each page loads only files the server has.
+        for page in [BIRDS_HTML, SYSTEM_HTML] {
+            for src in page.split("\"/static/").skip(1) {
+                let path = format!("/static/{}", src.split('"').next().unwrap());
+                let req = Request::builder().uri(&path).body(Body::empty()).unwrap();
+                let resp = web_router(state.clone()).oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            }
+        }
+    }
+
+    /// Muting a species changes only that, and shows in the settings.
+    #[tokio::test]
+    async fn mutes_and_unmutes_a_species() {
+        let state = test_state();
+        let mute = |muted: bool| json!({ "scientific": " Mellisuga helenae ", "muted": muted });
+        let (status, list) = call(
+            &state,
+            "PUT",
+            "/api/v1/control/species/muted",
+            Some(mute(true)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list, json!(["Mellisuga helenae"]));
+        // Again: no change, and no second entry.
+        let (_, list) = call(
+            &state,
+            "PUT",
+            "/api/v1/control/species/muted",
+            Some(mute(true)),
+        )
+        .await;
+        assert_eq!(list, json!(["Mellisuga helenae"]));
+        let (_, v) = call(&state, "GET", "/api/v1/control/settings", None).await;
+        assert_eq!(v["settings"]["muted_species"], json!(["Mellisuga helenae"]));
+        assert_eq!(v["settings"]["min_confidence_expected"], "medium");
+        // Listing detections without the muted species is accepted.
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/api/v1/control/detections?hide_muted=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, list) = call(
+            &state,
+            "PUT",
+            "/api/v1/control/species/muted",
+            Some(mute(false)),
+        )
+        .await;
+        assert_eq!(list, json!([]));
+        // Several event kinds at once.
+        let (status, evs) = call(
+            &state,
+            "GET",
+            "/api/v1/control/events?kind=species_muted,species_unmuted",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(evs.as_array().unwrap().len(), 2);
+        let (_, evs) = call(
+            &state,
+            "GET",
+            "/api/v1/control/events?exclude_kind=species_muted,species_unmuted",
+            None,
+        )
+        .await;
+        assert!(evs.as_array().unwrap().is_empty(), "{evs}");
+    }
+
     /// The web UI's own unit tests (`web/*.test.js`), when node is installed.
     #[test]
     fn web_ui_js_tests() {
         let web = concat!(env!("CARGO_MANIFEST_DIR"), "/web");
         let out = match std::process::Command::new("node")
-            .args(["--test", "detection-samples.test.js"])
+            .args(["--test", "detection-samples.test.js", "lib.test.js"])
             .current_dir(web)
             .output()
         {

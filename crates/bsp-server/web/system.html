@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System - Bird Positioning System</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-title="Bird Positioning System">
+<!-- The System workspace: running and debugging the devices. What was heard is the Birds workspace (/). -->
+<header class="topbar">
+  <a class="brand" href="/">Bird Positioning System</a>
+  <div class="workspaces" role="navigation" aria-label="Workspaces">
+    <a href="/" title="What was heard">Birds</a>
+    <a class="current" href="/system" aria-current="true">System</a>
+  </div>
+  <nav aria-label="Pages">
+    <a href="#/devices" data-page="devices">Devices</a>
+    <a href="#/firmware" data-page="firmware">Firmware</a>
+    <a href="#/events" data-page="events">Events</a>
+    <a href="#/settings" data-page="settings">Settings</a>
+  </nav>
+  <div class="status" id="status"></div>
+</header>
+<div class="banner bad" id="offline" hidden>The server cannot be reached. This page shows what it last received, and keeps trying.</div>
+<div class="banner bad" id="problem" hidden><span></span></div>
+<div class="banner" id="positioning" hidden>
+  <span><b>Position request:</b> <span id="positioning-text"></span></span>
+  <button type="button" id="positioning-set">Set its position</button>
+  <button type="button" id="positioning-dismiss">Dismiss</button>
+</div>
+
+<main>
+<!-- ---- Devices: every client, and one in full ---- -->
+<section id="page-devices">
+  <div class="split">
+    <div class="list-pane">
+      <div class="panel">
+        <div class="panel-head"><h2>Devices</h2><span class="muted" id="dev-count"></span></div>
+        <ul class="list" id="dev-list" aria-label="Devices"></ul>
+        <div class="panel-body" id="dev-hidden-box" hidden>
+          <span class="muted" id="dev-hidden-text"></span> <button type="button" class="link" id="dev-hidden-toggle"></button>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" id="dev-none"><p class="empty">No device has connected yet. Start a client, or
+        <a href="/client">use this device as a microphone</a>.</p></div>
+      <div id="dev-body" hidden>
+        <div class="page-head" style="margin-bottom: 6px">
+          <h1 id="dev-name"></h1>
+          <span id="dev-state"></span>
+          <span class="spacer"></span>
+          <span class="muted" id="dev-heard"></span>
+        </div>
+        <p class="muted" id="dev-facts" style="margin-bottom: 10px"></p>
+        <ul class="issues" id="dev-issues" hidden></ul>
+        <div class="tabs" id="dev-tabs" role="tablist"></div>
+
+        <!-- Overview: what it is doing, its power and storage, and the controls used day to day -->
+        <div id="tab-overview">
+          <div class="tiles" id="ov-tiles"></div>
+          <div class="section">
+            <h3>Recordings per hour, last 24 hours <span class="muted" id="ov-det-total" style="font-weight: 400"></span></h3>
+            <div class="chart" id="det-chart"></div>
+          </div>
+          <div class="section" id="battery-section">
+            <h3>Battery
+              <select id="battery-range" aria-label="Battery chart range">
+                <option value="24" selected>last 24 hours</option>
+                <option value="72">last 3 days</option>
+                <option value="168">last 7 days</option>
+              </select></h3>
+            <div class="chart" id="battery-chart"></div>
+          </div>
+          <div class="section">
+            <h3>Operation mode <span id="mode-info"></span></h3>
+            <form class="toolbar" id="mode-form">
+              <label>Mode <select id="mode-select">
+                <option value="live">Live: always connected</option>
+                <option value="batch">Batch: radio off between contacts</option>
+              </select></label>
+              <label id="mode-interval-label">contact every <input id="mode-interval" type="number" min="30" max="3600" step="30"> s</label>
+              <button type="submit">Set mode</button>
+              <span class="form-msg" id="mode-msg"></span>
+            </form>
+            <p class="hint" id="mode-hint"></p>
+          </div>
+          <div class="section">
+            <h3>Maintenance <span id="maint-info"></span></h3>
+            <div class="toolbar" style="margin-bottom: 8px">
+              <button type="button" id="reboot-btn">Reboot</button>
+              <span id="reboot-state"></span>
+            </div>
+            <form class="toolbar" id="log-form">
+              <label>Trace logging <select id="log-level">
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select></label>
+              <label id="log-duration-label">for <select id="log-duration">
+                <option value="600">10 minutes</option>
+                <option value="3600" selected>1 hour</option>
+                <option value="21600">6 hours</option>
+                <option value="86400">24 hours</option>
+              </select></label>
+              <button type="submit" id="log-set">Set logging</button>
+              <span id="log-state"></span>
+            </form>
+            <p class="hint" id="maint-hint"></p>
+          </div>
+        </div>
+
+        <!-- Clock: how well its timestamps line up with the server's -->
+        <div id="tab-clock" hidden>
+          <div class="toolbar" style="margin-bottom: 10px">
+            <label>Range <select id="clock-range">
+              <option value="15">last 15 minutes</option>
+              <option value="30" selected>last 30 minutes</option>
+              <option value="60">last hour</option>
+            </select></label>
+            <span class="hint" id="clock-foot" style="margin: 0"></span>
+          </div>
+          <div class="tiles" id="clock-tiles"></div>
+          <div class="chart tall" id="clock-chart"></div>
+        </div>
+
+        <!-- Firmware: what it runs, and what it should run -->
+        <div id="tab-firmware" hidden>
+          <div class="tiles" id="fw-tiles"></div>
+          <div class="section">
+            <h3>Update over the air <span id="fw-info"></span></h3>
+            <form class="toolbar" id="fw-form">
+              <label>Run <select id="fw-policy">
+                <option value="latest_dev">Latest dev fw</option>
+                <option value="latest_stable">Latest stable fw</option>
+                <option value="manual">Manual fw version</option>
+              </select></label>
+              <label id="fw-build-label"><select id="fw-build" aria-label="Firmware build"></select></label>
+              <button type="submit" id="fw-set">Set firmware</button>
+              <span class="form-msg" id="fw-msg"></span>
+            </form>
+            <p class="hint" id="fw-hint"></p>
+          </div>
+        </div>
+
+        <!-- Events: this device's part of the log -->
+        <div id="tab-events" hidden><div id="dev-events"></div></div>
+
+        <!-- Setup: its name, where it is, what it is, and removing it -->
+        <div id="tab-setup" hidden>
+          <div class="columns">
+            <div style="flex: 1 1 320px">
+              <div class="section">
+                <h3>Name and position</h3>
+                <form id="setup-form">
+                  <div class="form">
+                    <label for="cfg-name">Name</label>
+                    <div><input id="cfg-name" size="28" maxlength="80">
+                      <p class="hint" id="cfg-name-hint"></p></div>
+                    <label for="cfg-x">East (m)</label><input id="cfg-x" type="number" step="any" inputmode="decimal">
+                    <label for="cfg-y">North (m)</label><input id="cfg-y" type="number" step="any" inputmode="decimal">
+                    <label for="cfg-z">Up (m)</label><input id="cfg-z" type="number" step="any" inputmode="decimal">
+                  </div>
+                  <p class="hint">Metres from the site origin, a point you choose. Leave all three empty for no position.
+                    Positions are used for locating calls, which is still being built.</p>
+                  <div class="form-actions">
+                    <button type="submit" class="primary">Save</button>
+                    <button type="button" id="setup-revert">Revert</button>
+                    <span class="form-msg" id="cfg-msg"></span>
+                  </div>
+                </form>
+              </div>
+              <div class="section">
+                <h3>About this device</h3>
+                <dl class="facts" id="setup-facts"></dl>
+              </div>
+              <div class="section">
+                <h3>Remove</h3>
+                <p class="hint" style="margin-bottom: 8px">Removes its name, position and battery history; what it recorded is kept.
+                  A device that is still running shows up again, unnamed, the next time it contacts the server.</p>
+                <button type="button" class="danger" id="dev-delete">Delete this device</button>
+              </div>
+            </div>
+            <div style="flex: 1 1 260px; max-width: 420px">
+              <svg class="mic-map" id="setup-map" role="img" aria-label="Map of microphone positions"></svg>
+              <p class="hint">Seen from above. This device is highlighted; a position being typed shows as "unsaved".</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ---- Firmware: the builds the server offers ---- -->
+<section id="page-firmware" hidden>
+  <div class="page-head"><h1>Firmware</h1><span class="muted" id="fw-summary"></span></div>
+  <div class="panel">
+    <div class="panel-head"><h2>Upload a build</h2></div>
+    <div class="panel-body">
+      <form class="toolbar" id="fw-upload-form">
+        <input type="file" id="fw-file" accept=".bin" aria-label="Firmware image">
+        <button type="submit" class="primary" id="fw-upload">Upload</button>
+        <span class="form-msg" id="fw-upload-msg"></span>
+      </form>
+      <p class="hint">An ESP32 build's <span class="mono">firmware.bin</span>, from <span class="mono">firmware/.pio/build/&lt;board&gt;/</span>.
+        Its hardware, version and build time are read from the image, so there is nothing to type; uploading the same image again changes
+        nothing. Which build a device runs is chosen on its Firmware tab under <a href="#/devices">Devices</a>: devices set to a latest
+        build move to a newer upload by themselves.</p>
+    </div>
+  </div>
+  <div id="fw-groups"></div>
+</section>
+
+<!-- ---- Events: the server's log, in words ---- -->
+<section id="page-events" hidden>
+  <div class="page-head"><h1>Events</h1></div>
+  <div id="all-events"></div>
+</section>
+
+<!-- ---- Settings: one section at a time, each saved on its own ---- -->
+<section id="page-settings" hidden>
+  <div class="page-head"><h1>Settings</h1><span class="muted">Each section is saved on its own.</span></div>
+  <div style="max-width: 60em">
+    <div class="panel">
+      <div class="panel-head"><h2>Site location</h2></div>
+      <div class="panel-body">
+        <form data-section="site">
+          <div class="form">
+            <label for="set-lat">Latitude</label><input id="set-lat" size="12" inputmode="decimal" placeholder="e.g. 42.4534">
+            <label for="set-lon">Longitude</label>
+            <div><input id="set-lon" size="12" inputmode="decimal" placeholder="e.g. -76.4735">
+              <button type="button" id="set-detect">Use this device's location</button>
+              <p class="hint" id="set-loc-msg"></p></div>
+          </div>
+          <p id="set-species" style="margin-top: 8px"></p>
+          <p class="hint">Species unlikely to occur here at any time of year are flagged <span class="tag">unexpected</span>.
+            Leave both empty to treat every species as expected.</p>
+          <div class="form-actions"><button type="submit" class="primary">Save location</button><span class="form-msg"></span></div>
+        </form>
+        <details id="species-list" style="margin-top: 10px">
+          <summary>Species expected at this location</summary>
+          <div class="scroll-x" style="max-height: 24em; overflow-y: auto; margin-top: 6px"><table class="data">
+            <thead><tr><th>Species</th><th>Scientific name</th><th class="num">Likelihood over the year</th></tr></thead><tbody></tbody></table></div>
+        </details>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Identification</h2></div>
+      <div class="panel-body">
+        <form data-section="confidence">
+          <div class="form">
+            <span class="label">Keep expected species at</span><div class="choices" id="set-conf-expected"></div>
+            <span class="label">Keep unexpected species at</span><div class="choices" id="set-conf-unexpected"></div>
+          </div>
+          <p class="hint">The identifier's confidence a call must reach to be kept. A higher bar for unexpected species
+            keeps out most mistaken identifications; a species that still gets through can be muted.</p>
+          <div class="form-actions"><button type="submit" class="primary">Save identification</button><span class="form-msg"></span></div>
+        </form>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Recording trigger</h2></div>
+      <div class="panel-body">
+        <form data-section="trigger">
+          <div class="form">
+            <label for="set-trig-type">Type</label>
+            <select id="set-trig-type"><option value="energy">Energy: sound clearly above the noise floor</option></select>
+            <label for="set-trig-thr">Threshold</label>
+            <div><input id="set-trig-thr" type="number" min="0" max="60" step="0.5"> dB above the noise floor
+              <p class="hint">Lower is more sensitive: fainter calls open a recording, and so does more noise.</p></div>
+            <label for="set-trig-lo">Band</label>
+            <div><input id="set-trig-lo" type="number" min="20" max="24000" step="10"> to
+              <input id="set-trig-hi" type="number" min="20" max="24000" step="10"> Hz</div>
+            <label for="set-trig-frame">Frame</label>
+            <div><input id="set-trig-frame" type="number" min="10" max="1000" step="10"> ms
+              <p class="hint">A new frame length applies once a device restarts.</p></div>
+          </div>
+          <p class="hint">Devices apply a change at their next heartbeat.</p>
+          <div class="form-actions"><button type="submit" class="primary">Save trigger</button><span class="form-msg"></span></div>
+        </form>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Recording validation</h2></div>
+      <div class="panel-body">
+        <form data-section="validation">
+          <div class="form">
+            <label for="set-validation">Check</label>
+            <select id="set-validation">
+              <option value="none">None: upload every triggered recording</option>
+              <option value="model">Model: upload only if a model on the device's card hears a bird</option>
+            </select>
+            <label for="set-val-model" class="val-model">Model</label>
+            <input id="set-val-model" class="val-model" size="24" placeholder="e.g. drongonet-micro">
+            <label for="set-val-thr" class="val-model">Threshold</label>
+            <div class="val-model"><input id="set-val-thr" type="number" min="0" max="1" step="0.01" placeholder="model's">
+              <p class="hint">Leave empty for the model's own.</p></div>
+          </div>
+          <p class="hint">Checks a triggered recording on the device before it is uploaded. A model is a folder in the card's
+            <span class="mono">/models/</span> (see <span class="mono">trigger-models/</span>). A device without the model, or that
+            cannot run it, uploads everything and says why on its page. Each decision is logged as a
+            <span class="mono">validation</span> event.</p>
+          <div class="form-actions"><button type="submit" class="primary">Save validation</button><span class="form-msg"></span></div>
+        </form>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Muted species</h2></div>
+      <div class="panel-body" id="set-muted"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>This server</h2></div>
+      <div class="panel-body"><dl class="facts" id="set-server"></dl></div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="foot">
+  <span id="foot-server"></span>
+  <label>Theme <select id="theme"><option value="">system</option><option value="light">light</option><option value="dark">dark</option></select></label>
+  <a href="/client">Use this device as a microphone</a>
+  <a href="/classic">Classic interface</a>
+</footer>
+
+<script src="/static/echarts-6.1.0.min.js"></script>
+<script src="/static/lib.js"></script>
+<script src="/static/ui.js"></script>
+<script src="/static/system.js"></script>
+</body>
+</html>

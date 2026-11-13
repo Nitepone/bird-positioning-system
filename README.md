@@ -14,9 +14,18 @@ sudo setcap cap_net_bind_service=+ep target/release/bsp-server   # allow ports 8
 ./target/release/bsp-server -c bsp-server.toml
 ```
 
-Open the web UI at `https://SERVER/` (plain `http://` redirects there). Its pages are
-**Dashboard** and **Detections** (what was heard), **Config** (settings, in a **Server** and a **Clients** section), **Clients**
-(each client's clock synchronisation, battery, SD card and software version) and **Logs** (raw events).
+Open the web UI at `https://SERVER/` (plain `http://` redirects there). It has two workspaces, chosen
+at the top of every page:
+
+- **Birds** (`/`), for what was heard: **Today** (one day at a glance), **Recordings** (every
+  identified call, with its sound), **Species** (everything heard here, and muting a species the
+  identifier keeps getting wrong) and **Map** (where the microphones are; positioning is still
+  being built).
+- **System** (`/system`), for running the devices: **Devices** (every client; select one for its
+  **Overview**, **Clock**, **Firmware**, **Events** and **Setup** tabs), **Firmware** (the builds on
+  offer), **Events** (the server's log) and **Settings**.
+
+The single-page UI these replace is still at `/classic`.
 
 On first start the server creates a self-signed certificate in `tls/`, so your browser warns
 once; accept it to continue. To use a real certificate, put it at `tls/cert.pem` and its key at
@@ -37,7 +46,7 @@ model has been downloaded.
 
 ### 2. Set the site location and confidence levels
 
-On the **Config** page, in the **Server** section:
+On the **Settings** page of the **System** workspace (each section has its own Save button):
 
 - **Site location:** enter latitude and longitude, or click **Detect location** (your browser
   will ask for permission).
@@ -58,8 +67,8 @@ Click **Save settings**. Settings are stored in the server's database.
 ./target/release/bsp-client -s http://SERVER:2473 -n "North fence" # suggest a name (optional)
 ```
 
-The client shows up in the **Clients** section of the **Config** page. Its ID is stored in `./state/client_id`,
-so it stays the same across restarts. **Delete** next to a client removes it (its name, position and
+The client shows up on the **Devices** page (System). Its ID is stored in `./state/client_id`,
+so it stays the same across restarts. **Delete this device** on its **Setup** tab removes it (its name, position and
 battery history; detections it heard are kept). A device that is still running shows up again, unnamed,
 the next time it contacts the server.
 
@@ -95,8 +104,9 @@ I2S microphone such as the Adafruit ICS-43434, or the bps XIAO board, makes a ch
 
 ### 4. Set each client's name and position
 
-1. Press **Enter** in the client's terminal. A banner appears on every page; click
-   **Configure** to open that client in the form in the **Config** page's **Clients** section.
+1. Press **Enter** in the client's terminal. A banner appears on the System pages; click
+   **Set its position** to open that device's **Setup** tab. (Or open the tab yourself: **Devices**,
+   the device, **Setup**.)
 2. Enter a name and its position in metres from a reference point you choose:
    **East (x), North (y), Up (z)**. A client started with `-n` (or given a name on the browser
    client) is already shown by that suggested name. A name entered here takes precedence, and
@@ -111,32 +121,39 @@ position you type appears as "unsaved" before you save it, which makes typos eas
 
 ### 5. Watch the birds
 
-The **Dashboard** shows one day at a time (today by default; use the arrows or date picker):
+The **Today** page shows one day at a time (today by default; use **Previous**, **Next** or the date
+picker; the day is part of the address). While it shows today, the latest recording is at the top,
+ready to play:
 
 - totals for the day: species heard, detections, the most active species and the last one heard;
 - a **timeline** with one row per species and a mark for each detection, from midnight to
   midnight. Hover a mark for details; click a mark or a species name to open that species'
-  detections for the day. Scroll over the chart or drag the bar under it to zoom in;
-- tables of the day's species and, beside it, the day's **unexpected** species, with first and
-  last times heard.
+  recordings for the day. **Fit to recordings** zooms in on the part of the day with any; so does
+  dragging the bar under the chart, or scrolling with Ctrl held;
+- a table of the day's species, with first and last times heard, the best confidence, and a
+  **Mute** button.
 
-By default the dashboard shows only **expected** species: those the geo model expects at the
+By default the page shows only **expected** species: those the geo model expects at the
 site. **Show** can add unexpected species (orange), or everything, including sounds the range
 data doesn't cover (non-bird classes, "Unknown bird" from the mock identifier). A note under
 the timeline says what is hidden. Without a site location nothing can be classified, so
 everything is shown.
 
-The **Detections** page lists individual detections, newest first, with a picture of the
-recording, the species, confidence and which monitors heard it. The picture is a spectrogram
+**Muting** a species leaves it out of Today and Recordings: for a species the identifier keeps
+mistaking something else for. It is still recorded and identified, and listed (with **Unmute**) on
+the **Species** page and in System's Settings.
+
+The **Recordings** page lists recordings newest first, one line each; the one selected is shown in
+full beside the list, with the species, confidence and which microphones heard it. **Up** and
+**Down** step through the list and **Space** plays. The picture is a spectrogram
 (0–12 kHz, low to high, with steady background noise flattened so calls stand out; an orange bar
-marks the identified call) or, if you choose **Show recordings as: waveform**, the waveform with
-the call shaded. Click it to play the clearest recording, or a monitor's button to hear and show
-that monitor's; a red line follows playback. **Normalize volume** (on by default) plays every
+marks the identified call) or, with **Waveform**, the waveform. Click it to play the recording, or a
+microphone's button to hear the call as that microphone heard it; a red line follows playback.
+**Even out volume** (on by default) plays every
 recording at the same peak level, up to +30 dB, so quiet calls are audible; a loud non-bird sound
 in the same clip limits how much a quiet call is raised.
-Click a scientific name (dashboard tables, Detections, Config's expected-species list) to open the
-species on Wikipedia in a new tab. Filter by species name, monitor, date range, expected or unexpected species, minimum confidence,
-or detections with a direction. The filters are part of the page address, so a filtered view can
+Click a scientific name to open the species on Wikipedia in a new tab. Filter by species name,
+microphone, date range, expected or unexpected species and minimum confidence. The filters are part of the page address, so a filtered view can
 be bookmarked or shared.
 
 A detection shows a direction (e.g. `NE (47°)`) only when **at least 3** clients heard the call
@@ -147,7 +164,10 @@ and each of them:
   two minutes), and
 - is **synced** (its audio timestamps are within 2 ms of the server's clock, worst case).
 
-The **Logs** page shows the raw activity log, which is useful when something isn't working.
+The **Events** page (System) shows the server's log in words, which is useful when something isn't
+working: tick the kinds of event to list, filter by device or text, and click an event for
+everything recorded about it. Audio uploads, trace-log lines and heartbeats are left out until
+ticked. Each device's **Events** tab shows the same for that device.
 
 ### Keep client clocks accurate
 
@@ -184,14 +204,14 @@ that another client follows too, and positioning then uses either the clients sy
 clock or those of one AP, whichever are more. APs on different channels have unrelated clocks, so
 this works per AP; a Pico W cannot timestamp beacons.
 
-The **Clients** page lists every client with its sync status, timestamp error, best round trip,
-battery, SD card, uptime and when it was last heard. Select one for its details: its health (battery
-charge, voltage and trend; the SD card's free space and the recordings saved; chunks sent and
-gated; its I2C and SPI devices and whether each answers), then its clock offset, drift, round trips
-and answered measurements, with charts of the last 15 minutes to an hour (kept in the server's
+The **Devices** page (System) lists every client with its state, anything wrong with it and its
+battery; devices offline for more than a day are folded away. Select one for its details. Its
+**Overview** tab has its health (battery charge, voltage and trend; the SD card's free space and
+the recordings saved; chunks sent and gated; its I2C and SPI parts and whether each answers); its
+**Clock** tab its clock offset, drift, round trips and answered measurements, with charts of the last 15 minutes to an hour (kept in the server's
 memory, so they start afresh when it restarts). Health comes from the latest heartbeat and is kept
 in the database, so a client that went quiet still shows how it was, e.g. a flat battery. Use the
-page to compare networks or placements, or to screenshot a client for a bug report. The **Logs**
+page to compare networks or placements, or to screenshot a client for a bug report. The **Events**
 page also gets `battery_low` (under 20%), `storage_inserted`, `storage_removed` and `storage_low`
 (under 1 GB free) events.
 
@@ -199,8 +219,8 @@ page also gets `battery_low` (under 20%), `storage_inserted`, `storage_removed` 
 
 The firmware in `firmware/` turns a Raspberry Pi Pico W, Pico 2 W, classic ESP32 (e.g.
 ESP32-DevKitC) or Seeed XIAO ESP32S3 (or XIAO ESP32S3 Plus) with an I2S microphone into a client. It uses the same client API as `bsp-client`,
-so to the server it is just another client: it appears in the **Clients** table, is measured on the
-**Clients** page and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
+so to the server it is just another client: it appears on the **Devices** page, is measured on its
+**Clock** tab and takes part in positioning. It is written for the Adafruit ICS-43434 breakout
 (any I2S microphone with 24-bit samples in 32-bit slots should work).
 
 **Wiring** (defaults; `./configure.sh` lets you choose other pins):
@@ -254,9 +274,9 @@ server has it, and turns the radio off again. A contact takes about 6-10 s, so t
 for 2-3% of the time at 5 minutes. Audio recorded with the radio off is timestamped by
 interpolating between the clock measurements either side of it, which takes out the drift
 over the gap. What is left is how far the drift *changed* (microseconds over minutes), so it can
-still be located. The heartbeat reports that change (`gap`), and the Clients page shows it.
+still be located. The heartbeat reports that change (`gap`), and the device's Clock tab shows it.
 
-Set a client's mode on the **Clients** page (select it; *Operation mode*), or with `PUT
+Set a client's mode on the **Devices** page (select it; *Operation mode* on its Overview tab), or with `PUT
 /api/v1/control/clients/{id}/mode`. The client hears of it in the reply to its next heartbeat:
 a client already in batch mode, at its next contact. Detections involving a batch client wait
 for its upload: the server holds other clients' calls until every batch client has delivered its
@@ -269,14 +289,14 @@ without the access point's clock. In batch mode chunks are not also copied to `r
 Batch mode needs an ESP32 board (a Pico board has no card slot yet). A board starts in live mode
 and switches at its first heartbeat.
 
-**Maintenance: reboot and trace logging.** On the **Clients** page (select a client; *Maintenance*):
+**Maintenance: reboot and trace logging.** On the **Devices** page (select a client; *Maintenance* on its Overview tab):
 
 - **Reboot** restarts the board cleanly: it lets the upload in progress finish (or gives it up after
   15 s), closes its SD card, restarts, and is back within seconds. The request reaches it in the
   reply to its next heartbeat (a batch client's: at its next contact), and the board acknowledges it
   in its first heartbeat after the restart. It runs each request once, even if a reply comes again.
 - **Trace logging** sends every line the board logs (what `./build.sh -m` shows) to the server with
-  its heartbeats, for 10 minutes to 24 hours. The lines are on the **Logs** page (kind
+  its heartbeats, for 10 minutes to 24 hours. The lines are on the device's **Events** tab, with **Trace log** ticked (kind
   `client_log`, filtered by client), at the time the board logged them. The board turns it off by
   itself when the time is up, even if it cannot reach the server. It keeps the lines in RAM (8 KB,
   4 KB on a Pico) until a heartbeat delivers them; in batch mode they wait for the next contact, and
@@ -285,7 +305,7 @@ and switches at its first heartbeat.
   events out sooner.
 
 Every board reports why it last started (power on, reboot from here, watchdog, brownout, crash or
-other), shown on the **Clients** page and logged as a `client_rebooted` event. Both commands need
+other), shown on the device's Overview tab and logged as a `client_rebooted` event. Both commands need
 firmware with API 1.1.0 or later; for older firmware they show as not supported. `bsp-client` and the
 browser client answer them as not supported. The same through the API:
 `POST /api/v1/control/clients/{id}/reboot` and `PUT /api/v1/control/clients/{id}/logging`.
@@ -305,7 +325,7 @@ updated from the server instead of by USB:
    and refuses anything that is not an ESP32 app image with that build information. Uploading the
    same image again changes nothing. The page lists the builds by hardware id, newest first, with the
    clients running each.
-2. On the **Clients** page (select a client; *Firmware*), choose what it runs: **Latest dev fw** (the
+2. On the **Devices** page (select a client; its **Firmware** tab), choose what it runs: **Latest dev fw** (the
    newest build for its hardware), **Latest stable fw** (the newest tagged release, built from a
    clean tree) or **Manual fw version** (one build). Until you choose, a client stays on the build it
    runs. Clients on "latest" move to a newer upload by themselves.
@@ -313,7 +333,7 @@ updated from the server instead of by USB:
    and installs it and restarts, unless its battery is low (it then tries again later). If it fails,
    or the new build does not start properly and the board rolls back, that build is not offered to
    the client again until you set its choice again. The page shows the build it runs, the one it is
-   to run, and how its last update went; the **Logs** page has `firmware_offered`,
+   to run, and how its last update went; the **Events** page has `firmware_offered`,
    `firmware_update_deferred`, `firmware_update_failed` and `firmware_updated` events.
 
 Images are kept in `firmware_dir` (default `firmware-builds/`, relative to where the server runs, as the database). A build a
@@ -349,7 +369,7 @@ the wrong one). The firmware is written to `firmware/.pio/build/<board>/`.
 `git describe --tags --always --dirty` when it is built: the tag if the commit is tagged,
 otherwise the short commit hash (or `<tag>-<commits since>-g<hash>` once an older commit has a
 tag), and `-dirty` if the tree had uncommitted changes. It is in the board's log at startup, in the
-client's registration and in the **Version** column of the **Clients** page. `./build.sh --docker`
+client's registration and at the top of the device's page under **Devices**. `./build.sh --docker`
 works it out on your computer, because the container cannot see `.git`, and passes it in
 as `BPS_GIT_DESCRIBE`; set that variable yourself to build without git. Without either, the version
 is `unknown`. The firmware is rebuilt whenever the version changes. `bsp-client`,
@@ -364,7 +384,7 @@ alongside `BPS_GIT_DESCRIBE`.
 no need to flash it by USB again. Upload a build's `firmware/.pio/build/<board>/firmware.bin` on
 the **Firmware** page, or with
 `curl --data-binary @firmware.bin -H 'content-type: application/octet-stream' http://<server>/api/v1/control/firmware`.
-Then choose the client's firmware in its **Firmware** section on the **Clients** page:
+Then choose the client's firmware on its **Firmware** tab under **Devices**:
 **Latest dev fw** (the newest build for its hardware), **Latest stable fw** (the newest build made
 at a tag from a clean tree), or a **Manual fw version**. The board downloads it at its next
 heartbeat (in batch mode, at its next contact) and restarts into it. Running off a battery, it
@@ -438,7 +458,7 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Symptom | Check |
 |---|---|
 | Client never appears | Client's `-s` URL uses port 2473 (not the web port); TCP 2473 reachable |
-| Client never becomes synced | UDP 2473 reachable; **Clients** page: low *Replies* means lost packets, a large *Best RTT* a slow or busy network |
+| Client never becomes synced | UDP 2473 reachable; the device's **Clock** tab: low *Replies* means lost packets, a large *Best RTT* a slow or busy network |
 | Server exits with "Permission denied" on port 443 or 80 | Run the `setcap` command above, or change the ports under `[web]` |
 | No detections | Events log: are `audio` events arriving? If not, the noise filter is dropping everything; try `--no-gate` to test |
 | Detections but no direction | Fewer than 3 positioned, active, synced clients heard the call |
@@ -655,8 +675,11 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     last `minutes` (default 30, at most 60)
   - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
     `client`, `from` / `to` (ns), `unexpected`, `located`, `min_confidence`, `before`, `limit`
-  - `GET /timeline?from=&to=`: compact detections for the dashboard
-  - `GET /species`: every species detected so far
+    `hide_muted=true` leaves out the muted species
+  - `GET /timeline?from=&to=`: compact detections for the Today page, each with `muted`
+  - `GET /species`: every species detected so far, with `occurrence` and `muted`
+  - `PUT /species/muted` `{"scientific": "...", "muted": true}`: mutes or unmutes a species
+    (kept in the settings as `muted_species`); the UI leaves muted species out
   - `GET /detections/{id}/audio/{client_id}`: that client's clip as 16-bit FLAC (clips stored
     before FLAC are converted when the server starts), with an `x-call-range: start,end` header
     giving the identified call in seconds from the clip's start. `?format=wav` gives the same
@@ -665,7 +688,8 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /samples/{client_id}/audio?from=&to=[&format=wav]`: what that client recorded over
     `from..to` (ns, at most 120 s), pieced together from its stored clips; FLAC, or WAV as above
   - `GET /samples/{client_id}/waveform?from=&to=`: the same as an SVG waveform
-  - `GET /events?client_id=&kind=&exclude_kind=&after_id=&limit=`: among others `client_log`
+  - `GET /events?client_id=&kind=&exclude_kind=&after_id=&before_id=&limit=` (`kind` and
+    `exclude_kind` take several kinds separated by commas): among others `client_log`
     (`text`, `ms`: a line of a client's trace log, at the time it was logged),
     `client_log_dropped`, `client_rebooted` (`reason`, `at`), `reboot_requested`,
     `logging_requested`, `command_acked` (`command_id`, `command`, `result`), `firmware_offered`,
@@ -688,9 +712,9 @@ with the one it implements, in the register reply and in `GET /api/v1/control/st
 - **Patch:** a fix with no change on the wire.
 
 The server registers a client whose major version equals its own. A newer minor version is accepted
-too, but flagged on the **Clients** page (the client may send what the server ignores). A client that
+too, but flagged on the **Devices** page (the client may send what the server ignores). A client that
 sends no `api_version` is old firmware: it is accepted as compatible, and flagged as unknown. Any
-other major version is refused with an error that names both versions, and the **Clients** page
+other major version is refused with an error that names both versions, and the **Devices** page
 lists the client as incompatible. Servers and clients must keep to the rules above for this to
 work: new fields stay optional, and a reader ignores fields it does not know.
 

@@ -45,6 +45,7 @@ pub fn router() -> Router<SharedState> {
         .route("/detections", get(list_detections))
         .route("/timeline", get(timeline))
         .route("/species", get(species_seen))
+        .route("/species/muted", put(set_species_muted))
         .route("/detections/{id}/audio/{client_id}", get(detection_audio))
         .route("/detections/{id}/waveform", get(detection_waveform))
         .route("/samples/{client_id}/audio", get(sample_audio))
@@ -483,9 +484,12 @@ fn clip_order(d: &Detection, mut available: Vec<ClientId>) -> Vec<ClientId> {
 
 async fn list_detections(
     State(state): State<SharedState>,
-    Query(filter): Query<DetectionFilter>,
+    Query(mut filter): Query<DetectionFilter>,
     Query(q): Query<Limit>,
 ) -> ApiResult<Json<Vec<DetectionView>>> {
+    if filter.hide_muted == Some(true) {
+        filter.exclude_species = state.settings.lock().await.muted_species.clone();
+    }
     let detections = state
         .db
         .list_detections(&filter, q.limit.unwrap_or(100).min(1000))?;
@@ -526,6 +530,8 @@ struct TimelineEntry {
     occurrence: Occurrence,
     clients: Vec<ClientId>,
     cardinal: Option<bsp_core::locator::Cardinal>,
+    /// The operator muted this species (see `Settings::muted_species`).
+    muted: bool,
 }
 
 /// Whether a species is expected at the site.
@@ -562,6 +568,7 @@ async fn timeline(
     };
     let found = state.db.list_detections(&filter, TIMELINE_LIMIT + 1)?;
     let truncated = found.len() > TIMELINE_LIMIT as usize;
+    let settings = state.settings.lock().await.clone();
     let detections = found
         .into_iter()
         .take(TIMELINE_LIMIT as usize)
@@ -571,6 +578,7 @@ async fn timeline(
                 Some(false) => Occurrence::Unexpected,
                 None => Occurrence::Unknown,
             },
+            muted: settings.is_muted(&d.species.scientific),
             id: d.id,
             time: d.time,
             end: d.calls.iter().map(|c| c.end).max().unwrap_or(d.time),
@@ -582,7 +590,7 @@ async fn timeline(
             unexpected: d.unexpected,
         })
         .collect();
-    let site_set = state.settings.lock().await.site.is_some();
+    let site_set = settings.site.is_some();
     Ok(Json(Timeline {
         site_set,
         detections,
@@ -590,8 +598,71 @@ async fn timeline(
     }))
 }
 
-async fn species_seen(State(state): State<SharedState>) -> ApiResult<Json<Vec<SpeciesSeen>>> {
-    Ok(Json(state.db.species_seen()?))
+/// A species heard at least once, and what the server knows about it now.
+#[derive(Serialize)]
+struct SpeciesView {
+    #[serde(flatten)]
+    seen: SpeciesSeen,
+    /// Classification against the current site's range data.
+    occurrence: Occurrence,
+    muted: bool,
+}
+
+async fn species_seen(State(state): State<SharedState>) -> ApiResult<Json<Vec<SpeciesView>>> {
+    let settings = state.settings.lock().await.clone();
+    let seen = state.db.species_seen()?;
+    Ok(Json(
+        seen.into_iter()
+            .map(|seen| {
+                let species = bsp_core::identifier::Species {
+                    scientific: seen.scientific.clone(),
+                    common: seen.common.clone(),
+                };
+                SpeciesView {
+                    occurrence: match state.species_filter.is_expected(&species) {
+                        Some(true) => Occurrence::Expected,
+                        Some(false) => Occurrence::Unexpected,
+                        None => Occurrence::Unknown,
+                    },
+                    muted: settings.is_muted(&seen.scientific),
+                    seen,
+                }
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct MuteRequest {
+    scientific: String,
+    muted: bool,
+}
+
+/// `PUT /species/muted`: mutes or unmutes one species, leaving the other
+/// settings as they are. Answers with the muted species.
+async fn set_species_muted(
+    State(state): State<SharedState>,
+    Json(req): Json<MuteRequest>,
+) -> ApiResult<Json<Vec<String>>> {
+    let mut current = state.settings.lock().await;
+    let mut new = current.clone();
+    if new.set_muted(&req.scientific, req.muted) {
+        new.validate().map_err(ApiError::bad_request)?;
+        state
+            .db
+            .set_setting(settings::DB_KEY, &serde_json::to_string(&new)?)?;
+        *current = new.clone();
+        state.event(
+            None,
+            if req.muted {
+                "species_muted"
+            } else {
+                "species_unmuted"
+            },
+            json!({ "scientific": req.scientific.trim() }),
+        );
+    }
+    Ok(Json(new.muted_species))
 }
 
 /// Stored clips never change, so browsers may cache them indefinitely.
@@ -794,8 +865,12 @@ async fn sample_waveform(
 #[derive(Deserialize)]
 struct EventQuery {
     after_id: Option<i64>,
+    /// Only events older than this one (for paging back).
+    before_id: Option<i64>,
     client_id: Option<ClientId>,
+    /// One kind, or several separated by commas.
     kind: Option<String>,
+    /// Kinds to leave out, separated by commas.
     exclude_kind: Option<String>,
     limit: Option<u32>,
 }
@@ -804,15 +879,26 @@ async fn list_events(
     State(state): State<SharedState>,
     Query(q): Query<EventQuery>,
 ) -> ApiResult<Json<Vec<Event>>> {
-    let empty = |s: Option<String>| s.filter(|s| !s.is_empty());
-    let (kind, exclude) = (empty(q.kind), empty(q.exclude_kind));
-    Ok(Json(state.db.list_events(
-        q.after_id,
-        q.client_id,
-        kind.as_deref(),
-        exclude.as_deref(),
-        q.limit.unwrap_or(200).min(2000),
-    )?))
+    let kinds = |s: Option<String>| -> Vec<String> {
+        s.unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let filter = db::EventFilter {
+        after_id: q.after_id,
+        before_id: q.before_id,
+        client_id: q.client_id,
+        kinds: kinds(q.kind),
+        exclude_kinds: kinds(q.exclude_kind),
+    };
+    Ok(Json(
+        state
+            .db
+            .list_events(&filter, q.limit.unwrap_or(200).min(2000))?,
+    ))
 }
 
 async fn get_positioning(State(state): State<SharedState>) -> Json<Option<PositioningRequest>> {
