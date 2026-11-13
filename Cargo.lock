@@ -362,6 +362,7 @@ dependencies = [
  "claxon",
  "flacenc",
  "hound",
+ "md-5",
  "rcgen",
  "rusqlite",
  "serde",

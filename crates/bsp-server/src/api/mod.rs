@@ -5,6 +5,7 @@ use bsp_proto::ErrorBody;
 
 pub mod client;
 pub mod control;
+pub mod firmware;
 
 /// An HTTP error with a JSON `{"error": ...}` body.
 #[derive(Debug)]

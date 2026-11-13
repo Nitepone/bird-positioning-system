@@ -74,6 +74,9 @@ impl Session {
             api_version: Some(API_VERSION.into()),
             capabilities: self.caps.clone(),
             name: self.name.clone(),
+            // Updated by its user, not over the air.
+            build: None,
+            ota: false,
         };
         let resp = self
             .http
@@ -197,6 +200,7 @@ pub async fn heartbeat_loop(
             acks: acks.clone(),
             reboot_reason: None,
             log: None,
+            firmware_status: None,
         };
         match session.heartbeat(&hb).await {
             Ok(reply) => {

@@ -6,18 +6,21 @@ use crate::clip_audio;
 use crate::clock_history::ClockReport;
 use crate::compat::{self, ApiCompat};
 use crate::db::{ClientHealth, ClientRecord, RebootInfo};
+use crate::firmware::{self, LastUpdate, UpdateResult};
 use crate::state::{PositioningRequest, SharedState};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bsp_core::audio::AudioSample;
 use bsp_proto::{
-    API_VERSION, AudioAccepted, ClientId, HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat,
-    HeartbeatResponse, LogBatch, NANOS_PER_MS, NANOS_PER_SEC, RebootReason, RegisterRequest,
-    RegisterResponse, Timestamp, TriggerConfig, ValidationConfig, ValidationReport, now_ns,
+    API_VERSION, AudioAccepted, ClientId, FirmwareOffer, FirmwareStatus, FirmwareUpdateState,
+    HEADER_END_NS, HEADER_START_NS, HEADER_TSF, Heartbeat, HeartbeatResponse, LogBatch,
+    NANOS_PER_MS, NANOS_PER_SEC, RebootReason, RegisterRequest, RegisterResponse, Timestamp,
+    TriggerConfig, ValidationConfig, ValidationReport, now_ns,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -30,6 +33,7 @@ pub fn router() -> Router<SharedState> {
         .route("/{id}/audio", post(upload_audio))
         .route("/{id}/position-request", post(position_request))
         .route("/{id}/validation", post(validation_report))
+        .route("/firmware/{file}", get(download_firmware))
 }
 
 async fn register(
@@ -40,10 +44,10 @@ async fn register(
     let compat = compat::check(req.api_version.as_deref())
         .map_err(|e| ApiError::bad_request(format!("invalid api_version: {e}")))?;
     let name = clean_name(req.name.as_deref().unwrap_or(""));
+    let before = state.db.get_client(req.client_id)?;
     // A client already refused for its version is not logged at each retry.
-    let was_refused = state
-        .db
-        .get_client(req.client_id)?
+    let was_refused = before
+        .as_ref()
         .is_some_and(|c| compat::check(c.api_version.as_deref()) == Ok(ApiCompat::Incompatible));
     // A refused client is kept too, so that the Clients page shows it.
     let is_new = state
@@ -51,7 +55,8 @@ async fn register(
         .register_client(&req, &name, &addr.to_string(), now_ns())?;
     let detail = json!({ "new": is_new, "addr": addr.to_string(), "hostname": req.hostname,
                          "version": req.version, "api_version": req.api_version,
-                         "api_compat": compat, "capabilities": req.capabilities, "name": name });
+                         "api_compat": compat, "capabilities": req.capabilities, "name": name,
+                         "build": req.build, "ota": req.ota });
     if compat == ApiCompat::Incompatible {
         let msg = compat::refusal(req.api_version.as_deref().unwrap_or_default());
         if !was_refused {
@@ -68,6 +73,9 @@ async fn register(
         );
     }
     state.event(Some(req.client_id), "register", detail);
+    if let Some(before) = &before {
+        note_firmware_update(&state, before, &req)?;
+    }
     let d = &state.cfg.clients;
     let (trigger, validation) = capture_settings(&state).await;
     Ok(Json(RegisterResponse {
@@ -80,6 +88,169 @@ async fn register(
         trigger: Some(trigger),
         validation: Some(validation),
     }))
+}
+
+/// A registration with another build than before: logged as an update when
+/// it is the build chosen for the client.
+fn note_firmware_update(
+    state: &SharedState,
+    before: &ClientRecord,
+    req: &RegisterRequest,
+) -> ApiResult<()> {
+    let Some(new) = &req.build else {
+        return Ok(());
+    };
+    if before.build.as_ref().is_some_and(|b| b.same_build(new)) || before.firmware_policy.is_none()
+    {
+        return Ok(());
+    }
+    let builds = state.db.list_firmware_builds()?;
+    let Some(t) = firmware::target(before.firmware_policy, Some(new), &builds) else {
+        return Ok(());
+    };
+    if !t.is(new) {
+        return Ok(());
+    }
+    let mut fw = before.firmware.clone();
+    fw.last = Some(LastUpdate {
+        at: now_ns(),
+        result: UpdateResult::Updated,
+        build_id: t.id,
+        detail: None,
+    });
+    state.db.set_firmware_state(before.id, &fw)?;
+    tracing::info!(client = %before.id, build = t.id, describe = %t.describe, "client updated");
+    state.event(
+        Some(before.id),
+        "firmware_updated",
+        json!({ "build_id": t.id, "describe": t.describe,
+                "from": before.build.as_ref().map(|b| &b.describe) }),
+    );
+    Ok(())
+}
+
+/// Longest firmware status detail kept, in characters.
+const MAX_FIRMWARE_DETAIL_CHARS: usize = 200;
+
+/// A heartbeat's report on an update it was offered: kept for the Clients
+/// page, and logged once. A failed build is not offered again until the
+/// client's selection is set again.
+fn note_firmware_status(
+    state: &SharedState,
+    c: &mut ClientRecord,
+    st: &FirmwareStatus,
+    now: Timestamp,
+) {
+    let result = match st.state {
+        FirmwareUpdateState::Deferred => UpdateResult::Deferred,
+        FirmwareUpdateState::Failed => UpdateResult::Failed,
+        FirmwareUpdateState::RolledBack => UpdateResult::RolledBack,
+        FirmwareUpdateState::Unknown => {
+            tracing::warn!(client = %c.id, build = st.build_id, "unknown firmware status, ignored");
+            return;
+        }
+    };
+    let detail = st.detail.as_deref().map(|d| {
+        clean_name(d)
+            .chars()
+            .take(MAX_FIRMWARE_DETAIL_CHARS)
+            .collect::<String>()
+    });
+    // The same report again (the reply to the first was lost) is not news.
+    let repeated = c
+        .firmware
+        .last
+        .as_ref()
+        .is_some_and(|l| l.result == result && l.build_id == st.build_id);
+    c.firmware.last = Some(LastUpdate {
+        at: now,
+        result,
+        build_id: st.build_id,
+        detail: detail.clone(),
+    });
+    if result != UpdateResult::Deferred && !c.firmware.blocked.contains(&st.build_id) {
+        c.firmware.blocked.push(st.build_id);
+    }
+    if repeated {
+        return;
+    }
+    let (kind, detail) = match result {
+        UpdateResult::Deferred => ("firmware_update_deferred", detail),
+        UpdateResult::RolledBack => (
+            "firmware_update_failed",
+            Some(match detail {
+                Some(d) => format!("rolled back: {d}"),
+                None => "rolled back".into(),
+            }),
+        ),
+        _ => ("firmware_update_failed", detail),
+    };
+    state.event(
+        Some(c.id),
+        kind,
+        json!({ "build_id": st.build_id, "state": st.state, "detail": detail }),
+    );
+}
+
+/// The firmware offer for a heartbeat reply (see [`firmware::offer`]), after
+/// taking in the heartbeat's report on an earlier one. Each new offer is
+/// logged once.
+fn firmware_reply(
+    state: &SharedState,
+    mut c: ClientRecord,
+    status: Option<&FirmwareStatus>,
+    now: Timestamp,
+) -> ApiResult<Option<FirmwareOffer>> {
+    let before = c.firmware.clone();
+    if let Some(st) = status {
+        note_firmware_status(state, &mut c, st, now);
+    }
+    let builds = state.db.list_firmware_builds()?;
+    let offer = firmware::offer(&c, &builds);
+    if let Some(b) = offer
+        && c.firmware.offered != Some(b.id)
+    {
+        c.firmware.offered = Some(b.id);
+        state.event(
+            Some(c.id),
+            "firmware_offered",
+            json!({ "build_id": b.id, "describe": b.describe,
+                    "from": c.build.as_ref().map(|r| &r.describe) }),
+        );
+    }
+    if c.firmware != before {
+        state.db.set_firmware_state(c.id, &c.firmware)?;
+    }
+    Ok(offer.map(|b| b.offer()))
+}
+
+/// `GET /firmware/{id}.bin`: a firmware image, for clients updating
+/// themselves (the URL in a `firmware_offer`), with its MD5 in `x-MD5`.
+async fn download_firmware(
+    State(state): State<SharedState>,
+    Path(file): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let b = file
+        .strip_suffix(".bin")
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|&id| id > 0)
+        .map(|id| state.db.get_firmware_build(id))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("firmware build"))?;
+    let path = state.cfg.firmware_dir.join(b.file_name());
+    let image = tokio::fs::read(&path).await.map_err(|e| {
+        tracing::error!(path = %path.display(), "firmware image missing: {e}");
+        ApiError::not_found("firmware image")
+    })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, image.len().to_string()),
+            (header::HeaderName::from_static("x-md5"), b.md5),
+        ],
+        image,
+    ))
 }
 
 /// The trigger and validation the operator wants clients to run.
@@ -319,11 +490,14 @@ async fn heartbeat(
         let ids: Vec<i64> = pending.iter().map(|c| c.id).collect();
         state.db.mark_delivered(&ids, now)?;
     }
+    let mode = after.mode;
+    let firmware_offer = firmware_reply(&state, after, hb.firmware_status.as_ref(), now)?;
     Ok(Json(HeartbeatResponse {
-        mode: after.mode,
+        mode,
         trigger: Some(trigger),
         validation: Some(validation),
         commands,
+        firmware_offer,
     }))
 }
 

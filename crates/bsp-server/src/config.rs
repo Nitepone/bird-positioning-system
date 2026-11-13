@@ -16,6 +16,8 @@ pub struct ServerConfig {
     /// Web UI and control API.
     pub web: WebConfig,
     pub db_path: PathBuf,
+    /// Firmware images uploaded for updating clients over the air.
+    pub firmware_dir: PathBuf,
     pub identifier: IdentifierConfig,
     pub clients: ClientDefaults,
     /// A client with no heartbeat for this long is shown as inactive.
@@ -41,6 +43,7 @@ impl Default for ServerConfig {
             udp_listen: format!("0.0.0.0:{DEFAULT_CLIENT_PORT}"),
             web: WebConfig::default(),
             db_path: "bsp.db".into(),
+            firmware_dir: "firmware-builds".into(),
             identifier: IdentifierConfig::default(),
             clients: ClientDefaults::default(),
             active_timeout_s: 15,

@@ -14,7 +14,7 @@
  * field or endpoint), the patch with a fix that changes nothing on the wire.
  * The same string as API_VERSION in crates/bsp-proto/src/lib.rs; a test there
  * keeps them equal. */
-#define BPS_API_VERSION "1.1.0"
+#define BPS_API_VERSION "1.2.0"
 #define BPS_HEADER_START_NS "x-bsp-start-ns"
 /* When the sample after the chunk's last was captured: with the start, the
  * chunk's actual duration (its sample clock is never exactly nominal). */

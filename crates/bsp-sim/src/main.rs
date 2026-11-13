@@ -148,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
                 device_name: "simulator".into(),
             },
             name: Some(format!("sim-{k}")),
+            // Simulated clients have no firmware to update.
+            build: None,
+            ota: false,
         };
         http.post(format!("{base}{CLIENT_API_PREFIX}/register"))
             .json(&req)
@@ -194,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                 acks: Vec::new(),
                 reboot_reason: None,
                 log: None,
+                firmware_status: None,
             };
             http.post(format!("{base}{CLIENT_API_PREFIX}/{id}/heartbeat"))
                 .json(&hb)

@@ -251,6 +251,10 @@
   .charging { color: var(--ok); border: 1px solid currentColor; border-radius: 1em; padding: 0 6px;
               font-size: 12px; font-weight: 600; white-space: nowrap; vertical-align: 2px; }
   td .charging { padding: 0 4px; margin-left: 4px; vertical-align: 0; }
+  /* Firmware page */
+  .fw-group h3 { font-size: 15px; margin: 1em 0 0.4em; }
+  .fw-tag { font-weight: 600; }
+  .fw-tag.dev { color: var(--ink-2); font-weight: normal; }
 </style>
 </head>
 <body>
@@ -260,6 +264,7 @@
   <a href="#/detections" data-page="detections">Detections</a>
   <a href="#/config" data-page="config">Config</a>
   <a href="#/clients" data-page="clients">Clients</a>
+  <a href="#/firmware" data-page="firmware">Firmware</a>
   <a href="#/logs" data-page="logs">Logs</a>
   <span id="status" class="mono"></span>
   <a href="/client">[Web client]</a>
@@ -558,6 +563,25 @@
         </div>
       </details>
 
+      <details class="client-section" id="sec-firmware" open>
+        <summary>Firmware <span class="summary-note" id="sum-firmware"></span></summary>
+        <div class="section-body">
+          <div class="tiles" id="firmware-tiles"></div>
+          <h4>Update over the air <span class="info" id="fw-info" tabindex="0"></span></h4>
+          <form class="filters" id="fw-form" onsubmit="saveFirmwarePolicy(event)">
+            <label>Run <select id="fw-policy" onchange="fwFormChanged()">
+              <option value="latest_dev">Latest dev fw</option>
+              <option value="latest_stable">Latest stable fw</option>
+              <option value="manual">Manual fw version</option>
+            </select></label>
+            <label id="fw-build-label"><select id="fw-build" onchange="fwFormChanged()" aria-label="Firmware build"></select></label>
+            <button type="submit" id="fw-set">Set</button>
+            <span id="fw-msg"></span>
+          </form>
+          <p class="hint" id="fw-hint"></p>
+        </div>
+      </details>
+
       <details class="client-section" id="sec-clocks" open>
         <summary>Clocks <span class="summary-note" id="sum-clocks"></span></summary>
         <div class="section-body">
@@ -575,6 +599,21 @@
       </details>
     </div>
   </div>
+</section>
+
+<section id="page-firmware">
+  <h2>Firmware</h2>
+  <form class="filters" onsubmit="uploadFirmware(event)">
+    <label>Upload a build <input type="file" id="fw-file" accept=".bin"></label>
+    <button type="submit" id="fw-upload">Upload</button>
+    <span id="fw-upload-msg"></span>
+  </form>
+  <p class="hint">An ESP32 build's <span class="mono">firmware.bin</span> (in <span class="mono">firmware/.pio/build/&lt;board&gt;/</span>).
+    Its hardware, version and build time are read from the image; uploading the same image again changes nothing.
+    Which build each client runs is chosen on the <a href="#/clients">Clients</a> page: clients set to the latest
+    build move to a newer upload by themselves.</p>
+  <div id="fw-groups"></div>
+  <p class="empty" id="fw-none" hidden>No firmware builds yet.</p>
 </section>
 
 <section id="page-logs">
@@ -595,7 +634,7 @@
 <script src="/static/detection-samples.js"></script>
 <script>
 const API = "/api/v1/control";
-const PAGES = ["home", "detections", "config", "clients", "logs"];
+const PAGES = ["home", "detections", "config", "clients", "firmware", "logs"];
 let clients = [];
 let positioning = null;
 let configDirty = false;
@@ -2183,7 +2222,8 @@ function renderClientDetail() {
   const item = (label, html, title) =>
     `<span${title ? ` title="${esc(title)}"` : ""}><span class="label">${label}</span>${html}</span>`;
   document.getElementById("client-top").innerHTML = [
-    item("Hardware ID", `<span class="mono">${esc(c.id)}</span>`),
+    item("Client ID", `<span class="mono">${esc(c.id)}</span>`),
+    c.build ? item("Hardware", esc(c.build.hardware_id), "The hardware its firmware was built for: builds are offered only to clients with the same.") : "",
     item("IP", esc(addrHost(c.last_addr) || "-"), c.last_addr),
     item("Up for", h ? fmtDuration(h.uptime_s) + asOf : "-", h ? `since ${fmtTime(h.at - h.uptime_s * 1e9)}` +
       (c.last_reboot ? `; started by: ${REBOOT_REASONS[c.last_reboot.reason] || c.last_reboot.reason}` : "") : ""),
@@ -2225,6 +2265,7 @@ function renderClientDetail() {
   ].join("");
   fillModeForm(c);
   renderMaintenance(c);
+  renderClientFirmware(c);
 
   const charts = typeof echarts !== "undefined";
   const bh = historyData?.key === historyKey(c.id) ? historyData.battery : null;
@@ -2494,6 +2535,196 @@ async function saveLogging(ev) {
   }
 }
 
+// ---- firmware: builds kept by the server, and updating clients over the air (API 1.2.0) ----
+
+let firmwareBuilds = [];
+async function refreshFirmware() {
+  firmwareBuilds = await api("/firmware");
+  if (currentPage() === "firmware") renderFirmwarePage();
+}
+
+/// "v1.3.0", or "dev" for a build that is not a release.
+function fwTag(b) {
+  const stable = b.tag && !b.dirty;
+  return `<span class="fw-tag ${stable ? "" : "dev"}">${esc(stable ? b.tag : "dev")}</span>`;
+}
+/// The build time (UTC, "YYYY-MM-DDTHH:MM:SSZ") in local time.
+function fwBuilt(b) { const ms = Date.parse(b.built_at); return isNaN(ms) ? esc(b.built_at) : fmtTime(ms * 1e6); }
+/// One line about a build: tag or dev, describe, commit, build time.
+function fwLine(b) {
+  return `${fwTag(b)} ${esc(b.describe)} · <span class="mono">${esc(b.commit)}${b.dirty ? " (dirty)" : ""}</span> · built ${fwBuilt(b)}`;
+}
+function clientLinks(ids) {
+  return ids.map(id => `<a href="#/clients?client=${id}">${esc(clientName(id))}</a>`).join(", ");
+}
+
+function renderFirmwarePage() {
+  document.getElementById("fw-none").hidden = firmwareBuilds.length > 0;
+  const groups = new Map();
+  for (const b of firmwareBuilds) {  // newest build first, as listed
+    if (!groups.has(b.hardware_id)) groups.set(b.hardware_id, []);
+    groups.get(b.hardware_id).push(b);
+  }
+  document.getElementById("fw-groups").innerHTML = [...groups.keys()].sort().map(hw => `
+    <div class="fw-group">
+      <h3>${esc(hw)}</h3>
+      <div class="scroll-x"><table>
+        <thead><tr><th>Version</th><th>Commit</th><th>Built</th><th>Size</th><th>Running it</th>
+          <th title="Clients set to this build that run another: offered it at each heartbeat.">Updating to it</th>
+          <th>Uploaded</th><th></th></tr></thead>
+        <tbody>${groups.get(hw).map(b => `<tr>
+          <td>${fwTag(b)} <span class="muted">${esc(b.describe)}</span></td>
+          <td class="mono">${esc(b.commit)}${b.dirty ? " (dirty)" : ""}</td>
+          <td>${fwBuilt(b)}</td>
+          <td class="num" title="MD5 ${esc(b.md5)}">${fmtBytes(b.size)}</td>
+          <td>${clientLinks(b.clients_running) || "-"}</td>
+          <td>${clientLinks(b.clients_targeting) || "-"}</td>
+          <td>${fmtAgo(b.uploaded_at)}</td>
+          <td class="actions"><button class="danger" onclick="deleteFirmware(${b.id}, this)"
+            ${b.clients_pinned.length ? `disabled title="${esc("Chosen manually for " +
+              b.clients_pinned.map(clientName).join(", ") + ": choose another build for them first.")}"` : ""}>Delete</button></td>
+        </tr>`).join("")}</tbody>
+      </table></div>
+    </div>`).join("");
+}
+
+async function uploadFirmware(ev) {
+  ev.preventDefault();
+  const input = document.getElementById("fw-file"), msg = document.getElementById("fw-upload-msg");
+  const file = input.files[0];
+  if (!file) { msg.textContent = "Choose a firmware.bin first."; msg.className = "bad"; return; }
+  const button = document.getElementById("fw-upload");
+  button.disabled = true;
+  msg.textContent = "Uploading…";
+  msg.className = "muted";
+  try {
+    const r = await fetch(API + "/firmware", {
+      method: "POST", headers: { "content-type": "application/octet-stream" }, body: file,
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `${r.status} ${r.statusText}`);
+    msg.innerHTML = (r.status === 201 ? "Uploaded " : "Already there: ") +
+      `${esc(body.hardware_id)}, ${fwTag(body)} ${esc(body.describe)}.`;
+    msg.className = "ok";
+    input.value = "";
+    await refreshFirmware();
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = "bad";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteFirmware(id, button) {
+  const b = firmwareBuilds.find(b => b.id === id);
+  if (!b || !confirm(`Delete build ${b.describe} (${b.hardware_id}, built ${fwBuilt(b)})?\n\n` +
+      "Clients set to the latest build move to the newest one left.")) return;
+  const msg = document.getElementById("fw-upload-msg");
+  button.disabled = true;
+  try {
+    await api(`/firmware/${id}`, { method: "DELETE" });
+    msg.textContent = `Deleted ${b.describe}.`;
+    msg.className = "ok";
+    await refreshFirmware();
+  } catch (e) {
+    button.disabled = false;
+    msg.textContent = apiReason(e);
+    msg.className = "bad";
+  }
+}
+
+const FW_RESULTS = { updated: "updated", deferred: "deferred by the client", failed: "failed", rolled_back: "rolled back" };
+
+/// The latest update as { text, sub, cls }, or null.
+function fwLastView(fw) {
+  const l = fw.last;
+  if (!l) return null;
+  const b = firmwareBuilds.find(b => b.id === l.build_id);
+  return {
+    text: FW_RESULTS[l.result] || l.result,
+    cls: { updated: "ok", deferred: "warn", failed: "bad", rolled_back: "bad" }[l.result] || "",
+    sub: [b ? esc(b.describe) : `build ${l.build_id}`, l.detail ? esc(l.detail) : "", fmtAgo(l.at)].filter(Boolean).join(" · "),
+  };
+}
+
+let fwFormFor = null, fwDirty = false;
+
+function renderClientFirmware(c) {
+  const fw = c.firmware, b = c.build, run = fw.running, t = fw.target, last = fwLastView(fw);
+  const runningOk = t && run && t.id === run.id;
+  document.getElementById("sum-firmware").innerHTML = b
+    ? `${fwTag(b)} ${esc(b.describe)}${fw.offering ? " · <span class=\"warn\">update offered</span>" : ""}` : esc(c.version || "");
+  let target;
+  if (!fw.supported) target = null;
+  else if (!t) target = tile("To run", "-", fw.policy ? "no build for this choice yet: upload one on the Firmware page" :
+    "stays on what it runs (no build chosen)");
+  else if (runningOk) target = tile("To run", fwTag(t), "up to date: it runs this build", "ok");
+  else if (fw.blocked.includes(t.id)) target = tile("To run", `${fwTag(t)} ${esc(t.describe)}`,
+    "failed on this client: not offered again until the choice is set again", "bad");
+  else target = tile("To run", `${fwTag(t)} ${esc(t.describe)}`,
+    `${fwLine(t)}<br>offered at ${esc(nextContact(c))}`, "warn");
+  document.getElementById("firmware-tiles").innerHTML = [
+    tile("Running", b ? `${fwTag(b)} ${esc(b.describe)}` : esc(c.version || "-"),
+      b ? `<span class="mono">${esc(b.commit)}${b.dirty ? " (dirty)" : ""}</span> · built ${fwBuilt(b)}<br>${esc(b.hardware_id)}` +
+        (run ? "" : "<br><span class=\"muted\">not among the uploaded builds</span>")
+        : "does not report its build"),
+    target || "",
+    last ? tile("Last update", esc(last.text), last.sub, last.cls) : "",
+  ].join("");
+
+  document.getElementById("fw-info").innerHTML = info(
+    "Latest dev fw: the newest build for this client's hardware, by build time. Latest stable fw: the newest " +
+    "tagged release. Manual: the build chosen below. Until one is chosen, the client stays on the build it runs.\n" +
+    "The client is offered the build in its heartbeat replies while it runs another, and installs it unless its " +
+    "battery is low (it then tries again later). A build that fails or is rolled back is not offered again until " +
+    "the choice is set again.");
+  const sel = document.getElementById("fw-policy"), bsel = document.getElementById("fw-build");
+  const options = b ? firmwareBuilds.filter(x => x.hardware_id === b.hardware_id) : [];
+  if (fwFormFor !== c.id || !fwDirty) {
+    if (fwFormFor !== c.id) document.getElementById("fw-msg").textContent = "";
+    fwFormFor = c.id;
+    fwDirty = false;
+    sel.value = fw.policy?.policy || "manual";
+    const html = options.map(x => `<option value="${x.id}">${x.tag && !x.dirty ? esc(x.tag) : "dev"} · ` +
+      `${esc(x.describe)} · built ${fwBuilt(x)}${run && x.id === run.id ? " (running)" : ""}</option>`).join("");
+    if (bsel.dataset.html !== html) { bsel.innerHTML = html; bsel.dataset.html = html; }
+    const chosen = fw.policy?.build_id ?? run?.id;
+    if (chosen != null && options.some(x => x.id === chosen)) bsel.value = String(chosen);
+  }
+  document.getElementById("fw-build-label").hidden = sel.value !== "manual";
+  for (const id of ["fw-policy", "fw-build", "fw-set"]) document.getElementById(id).disabled = !fw.supported;
+  if (fw.supported && sel.value === "manual" && !options.length) document.getElementById("fw-set").disabled = true;
+  document.getElementById("fw-hint").textContent = !fw.supported ? `Not available for this client: ${fw.unsupported}.`
+    : !options.length ? "No builds for this hardware yet: upload one on the Firmware page." : "";
+}
+
+function fwFormChanged() {
+  fwDirty = true;
+  const c = clients.find(c => c.id === fwFormFor);
+  if (c) renderClientFirmware(c);
+}
+
+async function saveFirmwarePolicy(ev) {
+  ev.preventDefault();
+  const id = fwFormFor, msg = document.getElementById("fw-msg");
+  const policy = document.getElementById("fw-policy").value;
+  const body = policy === "manual" ? { policy, build_id: Number(document.getElementById("fw-build").value) } : { policy };
+  try {
+    await api(`/clients/${id}/firmware`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    fwDirty = false;
+    msg.textContent = "Set.";
+    msg.className = "ok";
+    await Promise.all([refreshClients(), refreshFirmware()]);
+    refreshClientsPage();
+  } catch (e) {
+    msg.textContent = apiReason(e);
+    msg.className = "bad";
+  }
+}
+
 /// The reports as chart rows, with a gap row wherever heartbeats stopped.
 function clockRows(data) {
   const gapNs = 3 * data.heartbeat_interval_s * 1e9;
@@ -2652,6 +2883,7 @@ async function refresh() {
       page === "detections" ? refreshDetections() : null,
       page === "logs" ? refreshEvents() : null,
       page === "clients" ? refreshClientsPage() : null,
+      page === "firmware" || page === "clients" ? refreshFirmware() : null,
     ]);
     document.getElementById("error").textContent = "";
   } catch (e) {

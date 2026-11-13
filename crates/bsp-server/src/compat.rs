@@ -87,22 +87,37 @@ pub const COMMANDS_SINCE: ApiVersion = ApiVersion {
     patch: 0,
 };
 
-/// Whether a client that reports `client` takes maintenance commands: one of
-/// the server's major version from [`COMMANDS_SINCE`] on. Old firmware (no
-/// version) does not, and is never sent any.
-pub fn takes_commands(client: Option<&str>) -> bool {
+/// The first API version with firmware updates over the air (`build` and
+/// `ota` in registrations, `firmware_offer` and `firmware_status`).
+pub const FIRMWARE_SINCE: ApiVersion = ApiVersion {
+    major: 1,
+    minor: 2,
+    patch: 0,
+};
+
+/// Whether `client` is a version of the server's major version, `since` or later.
+fn speaks_since(client: Option<&str>, since: ApiVersion) -> bool {
     let server: ApiVersion = API_VERSION.parse().expect("API_VERSION is a version");
     client
         .and_then(|c| c.parse::<ApiVersion>().ok())
         .is_some_and(|c| {
             c.major == server.major
-                && (c.major, c.minor, c.patch)
-                    >= (
-                        COMMANDS_SINCE.major,
-                        COMMANDS_SINCE.minor,
-                        COMMANDS_SINCE.patch,
-                    )
+                && (c.major, c.minor, c.patch) >= (since.major, since.minor, since.patch)
         })
+}
+
+/// Whether a client that reports `client` takes maintenance commands: one of
+/// the server's major version from [`COMMANDS_SINCE`] on. Old firmware (no
+/// version) does not, and is never sent any.
+pub fn takes_commands(client: Option<&str>) -> bool {
+    speaks_since(client, COMMANDS_SINCE)
+}
+
+/// Whether a client that reports `client` speaks an API version with
+/// firmware updates ([`FIRMWARE_SINCE`] on, same major). It also has to say
+/// it takes them (`ota`) to be offered any.
+pub fn speaks_firmware_updates(client: Option<&str>) -> bool {
+    speaks_since(client, FIRMWARE_SINCE)
 }
 
 /// The error for a client refused as [`ApiCompat::Incompatible`], naming both versions.
@@ -199,6 +214,16 @@ mod tests {
         assert!(!takes_commands(Some("2.1.0")));
         assert!(takes_commands(Some("1.1.0")));
         assert!(takes_commands(Some("1.4.2")));
+    }
+
+    #[test]
+    fn only_clients_from_1_2_take_firmware_updates() {
+        assert!(!speaks_firmware_updates(None));
+        assert!(!speaks_firmware_updates(Some("1.1.0")));
+        assert!(!speaks_firmware_updates(Some("1.1.9")));
+        assert!(!speaks_firmware_updates(Some("2.2.0")));
+        assert!(speaks_firmware_updates(Some("1.2.0")));
+        assert!(speaks_firmware_updates(Some("1.3.1")));
     }
 
     #[test]

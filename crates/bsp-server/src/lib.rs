@@ -9,6 +9,7 @@ pub mod clock_history;
 pub mod compat;
 pub mod config;
 pub mod db;
+pub mod firmware;
 pub mod pipeline;
 pub mod settings;
 pub mod state;
@@ -306,7 +307,10 @@ mod tests {
         ));
         let beacon_clocks = Arc::new(beacon_clock::BeaconClocks::default());
         let (calls_tx, _calls_rx) = mpsc::unbounded_channel();
-        let cfg = ServerConfig::default();
+        let cfg = ServerConfig {
+            firmware_dir: std::env::temp_dir().join(format!("bsp-firmware-{}", Uuid::new_v4())),
+            ..ServerConfig::default()
+        };
         Arc::new(AppState {
             audio: audio_buffer::AudioBuffers::new(cfg.audio_retention_s, beacon_clocks.clone()),
             beacon_clocks,
@@ -735,6 +739,437 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0]["detail"]["reason"], "watchdog");
         assert_eq!(listed(&state, 1).await["last_reboot"]["reason"], "watchdog");
+    }
+
+    /// A request with a raw body; the status, headers and body.
+    async fn call_raw(
+        state: &SharedState,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("10.0.0.9:5000".parse::<SocketAddr>().unwrap()));
+        let resp = web_router(state.clone()).oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    /// Uploads a synthetic image of this build; the status and the build as listed.
+    async fn upload(
+        state: &SharedState,
+        hw: &str,
+        tag: Option<&str>,
+        commit: &str,
+        built: &str,
+    ) -> (StatusCode, Value, Vec<u8>) {
+        let img =
+            firmware::tests::image(&firmware::tests::info_json(hw, tag, commit, false, built));
+        let (status, _, body) = call_raw(
+            state,
+            "POST",
+            "/api/v1/control/firmware",
+            "application/octet-stream",
+            img.clone(),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            img,
+        )
+    }
+
+    /// The registration's `build` for this build (see [`upload`]).
+    fn build_json(hw: &str, tag: Option<&str>, commit: &str, built: &str) -> Value {
+        json!({ "hardware_id": hw, "tag": tag, "commit": commit, "dirty": false,
+                "describe": format!("v1.0.0-{commit}"), "built_at": built })
+    }
+
+    async fn register_ota(
+        state: &SharedState,
+        id: u128,
+        api_version: &str,
+        build: Value,
+        ota: bool,
+    ) {
+        let mut body = registration(id, "bps-mcu x", Some(api_version));
+        body["build"] = build;
+        if ota {
+            body["ota"] = true.into();
+        }
+        let (status, reply) = call(state, "POST", "/api/v1/client/register", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+
+    const T0: &str = "2026-01-01T00:00:00Z";
+    const T1: &str = "2026-03-01T00:00:00Z";
+    const T2: &str = "2026-02-01T00:00:00Z";
+    const HW: &str = "esp32-s3 on xiao-proto-rev0.1";
+
+    #[tokio::test]
+    async fn firmware_builds_are_uploaded_listed_downloaded_and_deleted() {
+        let state = test_state();
+        let (status, b0, img) = upload(&state, HW, None, "aaa1111", T0).await;
+        assert_eq!(status, StatusCode::CREATED, "{b0}");
+        let id = b0["id"].as_i64().unwrap();
+        assert_eq!(b0["hardware_id"], HW);
+        assert_eq!(b0["commit"], "aaa1111");
+        assert_eq!(b0["built_at"], T0);
+        assert_eq!(b0["stable"], false);
+        assert_eq!(b0["size"], img.len());
+        assert_eq!(b0["md5"], firmware::md5_hex(&img));
+        assert_eq!(b0["url"], format!("/api/v1/client/firmware/{id}.bin"));
+        // The same image again changes nothing.
+        let (status, again, _) = upload(&state, HW, None, "aaa1111", T0).await;
+        assert_eq!((status, &again["id"]), (StatusCode::OK, &b0["id"]));
+        // Newest build time first.
+        let (status, b1, _) = upload(&state, HW, Some("v1.1.0"), "bbb2222", T1).await;
+        assert_eq!((status, &b1["stable"]), (StatusCode::CREATED, &json!(true)));
+        let (_, list) = call(&state, "GET", "/api/v1/control/firmware", None).await;
+        let ids: Vec<_> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].clone())
+            .collect();
+        assert_eq!(ids, [b1["id"].clone(), b0["id"].clone()]);
+
+        // Refused: not an image, no build information, a form upload.
+        let (status, _, body) = call_raw(
+            &state,
+            "POST",
+            "/api/v1/control/firmware",
+            "application/octet-stream",
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body).contains("not an ESP32"));
+        let mut bare = img.clone();
+        let at = bare
+            .windows(15)
+            .position(|w| w == bsp_proto::BUILD_INFO_MARKER)
+            .unwrap();
+        bare[at] = b'x';
+        let (status, _, body) = call_raw(
+            &state,
+            "POST",
+            "/api/v1/control/firmware",
+            "application/octet-stream",
+            bare,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body).contains("no build information"));
+        let (status, _, _) = call_raw(
+            &state,
+            "POST",
+            "/api/v1/control/firmware",
+            "multipart/form-data; boundary=x",
+            img.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Downloaded from the client port.
+        let req = Request::get(format!("/api/v1/client/firmware/{id}.bin"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = client_router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers().clone();
+        assert_eq!(h["content-type"], "application/octet-stream");
+        assert_eq!(h["content-length"], img.len().to_string().as_str());
+        assert_eq!(h["x-md5"], firmware::md5_hex(&img).as_str());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &img[..]);
+        for missing in ["999.bin", "0.bin", "abc.bin", &format!("{id}")] {
+            let (status, _, _) = call_raw(
+                &state,
+                "GET",
+                &format!("/api/v1/client/firmware/{missing}"),
+                "",
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        }
+
+        // A build a client is pinned to stays.
+        register_ota(
+            &state,
+            1,
+            API_VERSION,
+            build_json(HW, None, "aaa1111", T0),
+            true,
+        )
+        .await;
+        let pin = json!({ "policy": "manual", "build_id": id });
+        let (status, _) = control(&state, "PUT", 1, "firmware", Some(pin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let path = format!("/api/v1/control/firmware/{id}");
+        let (status, body) = call(&state, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().unwrap().contains("manual choice"));
+        let dev = json!({ "policy": "latest_dev" });
+        control(&state, "PUT", 1, "firmware", Some(dev)).await;
+        let (status, _) = call(&state, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&state, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = call_raw(
+            &state,
+            "GET",
+            &format!("/api/v1/client/firmware/{id}.bin"),
+            "",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(events_of(&state, "firmware_uploaded").await.len(), 2);
+        assert_eq!(events_of(&state, "firmware_deleted").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clients_are_offered_the_build_chosen_for_them() {
+        let state = test_state();
+        let running = build_json(HW, None, "aaa1111", T0);
+        register_ota(&state, 1, API_VERSION, running.clone(), true).await;
+        let (_, b0, _) = upload(&state, HW, None, "aaa1111", T0).await;
+        let (_, b1, img1) = upload(&state, HW, None, "bbb2222", T1).await;
+        let (_, b2, _) = upload(&state, HW, Some("v1.2.0"), "ccc3333", T2).await;
+        let (_, other_hw, _) = upload(&state, "esp32 on devkit", None, "ddd4444", T1).await;
+
+        // Until a build is chosen, the client stays on its own.
+        let c = listed(&state, 1).await;
+        assert_eq!(c["build"], running);
+        assert_eq!(c["ota"], true);
+        let fw = &c["firmware"];
+        assert_eq!(fw["supported"], true);
+        assert_eq!(fw["policy"], Value::Null);
+        assert_eq!(fw["running"]["id"], b0["id"]);
+        assert_eq!(fw["target"]["id"], b0["id"]);
+        assert!(
+            beat(&state, 1, json!({}))
+                .await
+                .get("firmware_offer")
+                .is_none()
+        );
+
+        // Latest dev: the newest build.
+        let set = |p: Value| control(&state, "PUT", 1, "firmware", Some(p));
+        assert_eq!(
+            set(json!({ "policy": "latest_dev" })).await.0,
+            StatusCode::OK
+        );
+        for _ in 0..2 {
+            let reply = beat(&state, 1, json!({})).await;
+            let id = b1["id"].as_i64().unwrap();
+            assert_eq!(
+                reply["firmware_offer"],
+                json!({ "firmware_build_id": id,
+                        "firmware_url": format!("/api/v1/client/firmware/{id}.bin"),
+                        "firmware_size": img1.len(), "firmware_md5": firmware::md5_hex(&img1),
+                        "firmware_describe": "v1.0.0-bbb2222" })
+            );
+        }
+        assert_eq!(events_of(&state, "firmware_offered").await.len(), 1);
+        assert_eq!(listed(&state, 1).await["firmware"]["offering"], b1["id"]);
+        // Latest stable; and a newer stable upload moves it along.
+        set(json!({ "policy": "latest_stable" })).await;
+        assert_eq!(
+            beat(&state, 1, json!({})).await["firmware_offer"]["firmware_build_id"],
+            b2["id"]
+        );
+        let (_, b3, _) = upload(
+            &state,
+            HW,
+            Some("v1.3.0"),
+            "eee5555",
+            "2026-04-01T00:00:00Z",
+        )
+        .await;
+        assert_eq!(
+            beat(&state, 1, json!({})).await["firmware_offer"]["firmware_build_id"],
+            b3["id"]
+        );
+        // Manual: only builds for its hardware.
+        let (status, _) = set(json!({ "policy": "manual", "build_id": other_hw["id"] })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = set(json!({ "policy": "manual", "build_id": 999 })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        set(json!({ "policy": "manual", "build_id": b2["id"] })).await;
+        assert_eq!(
+            beat(&state, 1, json!({})).await["firmware_offer"]["firmware_build_id"],
+            b2["id"]
+        );
+
+        // Deferred: offered still.
+        let st = |state: &str| {
+            json!({ "firmware_status": { "build_id": b2["id"], "state": state,
+                                                            "detail": "battery 34%" } })
+        };
+        for _ in 0..2 {
+            let reply = beat(&state, 1, st("deferred")).await;
+            assert_eq!(reply["firmware_offer"]["firmware_build_id"], b2["id"]);
+        }
+        assert_eq!(events_of(&state, "firmware_update_deferred").await.len(), 1);
+        assert_eq!(
+            listed(&state, 1).await["firmware"]["last"]["result"],
+            "deferred"
+        );
+        // Failed: not offered again, until the choice is set again.
+        assert!(
+            beat(&state, 1, st("failed"))
+                .await
+                .get("firmware_offer")
+                .is_none()
+        );
+        assert!(
+            beat(&state, 1, st("failed"))
+                .await
+                .get("firmware_offer")
+                .is_none()
+        );
+        assert!(
+            beat(&state, 1, json!({}))
+                .await
+                .get("firmware_offer")
+                .is_none()
+        );
+        let failed = events_of(&state, "firmware_update_failed").await;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["detail"]["detail"], "battery 34%");
+        let fw = listed(&state, 1).await["firmware"].clone();
+        assert_eq!(
+            (&fw["last"]["result"], &fw["blocked"]),
+            (&json!("failed"), &json!([b2["id"]]))
+        );
+        assert_eq!(fw["offering"], Value::Null);
+        // Latest dev targets another build, so it is offered.
+        set(json!({ "policy": "latest_dev" })).await;
+        assert_eq!(
+            beat(&state, 1, json!({})).await["firmware_offer"]["firmware_build_id"],
+            b3["id"]
+        );
+        // A rollback is a failure too.
+        let rb = json!({ "firmware_status": { "build_id": b3["id"], "state": "rolled_back" } });
+        assert!(beat(&state, 1, rb).await.get("firmware_offer").is_none());
+        let failed = events_of(&state, "firmware_update_failed").await;
+        assert_eq!(failed[0]["detail"]["detail"], "rolled back");
+        // Unknown states are ignored.
+        let odd = json!({ "firmware_status": { "build_id": 1, "state": "on_fire" } });
+        assert!(beat(&state, 1, odd).await.get("firmware_offer").is_none());
+        // Back to the failed build by choosing it again; it installs.
+        set(json!({ "policy": "manual", "build_id": b2["id"] })).await;
+        assert_eq!(
+            beat(&state, 1, json!({})).await["firmware_offer"]["firmware_build_id"],
+            b2["id"]
+        );
+        register_ota(
+            &state,
+            1,
+            API_VERSION,
+            build_json(HW, Some("v1.2.0"), "ccc3333", T2),
+            true,
+        )
+        .await;
+        let updated = events_of(&state, "firmware_updated").await;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["detail"]["build_id"], b2["id"]);
+        assert!(
+            beat(&state, 1, json!({}))
+                .await
+                .get("firmware_offer")
+                .is_none()
+        );
+        let fw = listed(&state, 1).await["firmware"].clone();
+        assert_eq!(
+            (&fw["running"]["id"], &fw["last"]["result"]),
+            (&b2["id"], &json!("updated"))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_clients_that_take_updates_are_offered_them() {
+        let state = test_state();
+        let (_, b0, _) = upload(&state, HW, None, "aaa1111", T0).await;
+        let (_, b1, _) = upload(&state, HW, None, "bbb2222", T1).await;
+        let running = build_json(HW, None, "aaa1111", T0);
+        register_ota(&state, 1, "1.1.0", running.clone(), true).await; // too old an API
+        register_ota(&state, 2, API_VERSION, running.clone(), false).await; // no ota
+        register_ota(
+            &state,
+            3,
+            API_VERSION,
+            build_json("other", None, "x", T0),
+            true,
+        )
+        .await;
+        register_ota(
+            &state,
+            4,
+            API_VERSION,
+            build_json(HW, None, "bbb2222", T1),
+            true,
+        )
+        .await;
+        register(&state, 5, Some(API_VERSION)).await; // no build
+        for id in [1, 2, 5] {
+            let fw = listed(&state, id).await["firmware"].clone();
+            assert_eq!(fw["supported"], false);
+            assert!(fw["unsupported"].is_string());
+            let (status, _) = control(
+                &state,
+                "PUT",
+                id,
+                "firmware",
+                Some(json!({ "policy": "latest_dev" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+        // Even with a build chosen somehow, none is offered to them.
+        let pin = firmware::FirmwarePolicy::Manual {
+            build_id: b1["id"].as_i64().unwrap(),
+        };
+        for id in [1, 2, 3, 4, 5] {
+            let fs = firmware::FirmwareState::default();
+            state
+                .db
+                .set_firmware_policy(Uuid::from_u128(id), Some(&pin), &fs)
+                .unwrap();
+            let reply = beat(&state, id, json!({})).await;
+            assert!(reply.get("firmware_offer").is_none(), "{id}: {reply}");
+        }
+        // Client 4 runs it already; the list says so.
+        let (_, list) = call(&state, "GET", "/api/v1/control/firmware", None).await;
+        let b1v = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == b1["id"])
+            .unwrap();
+        assert_eq!(b1v["clients_running"], json!([Uuid::from_u128(4)]));
+        assert_eq!(b1v["clients_pinned"].as_array().unwrap().len(), 5);
+        let b0v = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == b0["id"])
+            .unwrap();
+        assert_eq!(b0v["clients_running"].as_array().unwrap().len(), 2);
     }
 
     /// The browser client's copy of the API version is the same.

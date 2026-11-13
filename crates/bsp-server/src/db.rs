@@ -2,12 +2,13 @@
 //!
 //! All queries are small; they run directly on the caller's thread behind a mutex.
 
+use crate::firmware::{FirmwareBuild, FirmwarePolicy, FirmwareState};
 use bsp_core::detection::Detection;
 use bsp_core::locator::Vec3;
 use bsp_proto::{
-    BatteryStatus, Capabilities, ClientId, ClockStatus, CommandResult, DeviceStatus, Heartbeat,
-    LogLevel, ModeSetting, ModeStatus, NANOS_PER_SEC, RebootReason, RegisterRequest, StorageStatus,
-    Timestamp, TriggerConfig, Uuid, ValidationConfig,
+    BatteryStatus, BuildInfo, Capabilities, ClientId, ClockStatus, CommandResult, DeviceStatus,
+    Heartbeat, LogLevel, ModeSetting, ModeStatus, NANOS_PER_SEC, RebootReason, RegisterRequest,
+    StorageStatus, Timestamp, TriggerConfig, Uuid, ValidationConfig,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,16 @@ pub struct ClientRecord {
     /// When the client last started, and why, as it reported (clients that
     /// can tell, from API 1.1.0).
     pub last_reboot: Option<RebootInfo>,
+    /// The build it runs, from its latest registration (API 1.2.0).
+    pub build: Option<BuildInfo>,
+    /// Its firmware takes updates over the air (API 1.2.0, ESP32 boards).
+    pub ota: bool,
+    /// The build the operator chose for it; None until one is chosen (it then
+    /// stays on what it runs). Shown through the client's `firmware` view.
+    #[serde(skip)]
+    pub firmware_policy: Option<FirmwarePolicy>,
+    #[serde(skip)]
+    pub firmware: FirmwareState,
 }
 
 /// A client's latest start, as it reported in its first heartbeat after it.
@@ -237,7 +248,11 @@ CREATE TABLE IF NOT EXISTS clients (
     clock TEXT,
     health TEXT,
     mode TEXT,
-    last_reboot TEXT
+    last_reboot TEXT,
+    build TEXT,
+    ota INTEGER NOT NULL DEFAULT 0,
+    firmware_policy TEXT,
+    firmware_state TEXT
 );
 CREATE TABLE IF NOT EXISTS detections (
     id TEXT PRIMARY KEY,
@@ -276,6 +291,18 @@ CREATE TABLE IF NOT EXISTS client_commands (
     result TEXT
 );
 CREATE INDEX IF NOT EXISTS client_commands_client ON client_commands(client_id, id);
+CREATE TABLE IF NOT EXISTS firmware_builds (
+    id INTEGER PRIMARY KEY,
+    hardware_id TEXT NOT NULL,
+    tag TEXT,
+    \"commit\" TEXT NOT NULL,
+    dirty INTEGER NOT NULL,
+    describe TEXT NOT NULL,
+    built_at TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    md5 TEXT NOT NULL UNIQUE,
+    uploaded_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -355,6 +382,9 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
     let health: Option<String> = r.get("health")?;
     let mode: Option<String> = r.get("mode")?;
     let last_reboot: Option<String> = r.get("last_reboot")?;
+    let build: Option<String> = r.get("build")?;
+    let policy: Option<String> = r.get("firmware_policy")?;
+    let firmware: Option<String> = r.get("firmware_state")?;
     Ok(ClientRecord {
         id: id.parse().unwrap_or_default(),
         name: r.get("name")?,
@@ -376,6 +406,27 @@ fn row_to_client(r: &rusqlite::Row) -> rusqlite::Result<ClientRecord> {
             .and_then(|m| serde_json::from_str(&m).ok())
             .unwrap_or_default(),
         last_reboot: last_reboot.and_then(|b| serde_json::from_str(&b).ok()),
+        build: build.and_then(|b| serde_json::from_str(&b).ok()),
+        ota: r.get("ota")?,
+        firmware_policy: policy.and_then(|p| serde_json::from_str(&p).ok()),
+        firmware: firmware
+            .and_then(|f| serde_json::from_str(&f).ok())
+            .unwrap_or_default(),
+    })
+}
+
+fn row_to_firmware(r: &rusqlite::Row) -> rusqlite::Result<FirmwareBuild> {
+    Ok(FirmwareBuild {
+        id: r.get("id")?,
+        hardware_id: r.get("hardware_id")?,
+        tag: r.get("tag")?,
+        commit: r.get("commit")?,
+        dirty: r.get("dirty")?,
+        describe: r.get("describe")?,
+        built_at: r.get("built_at")?,
+        size: r.get::<_, i64>("size")? as u64,
+        md5: r.get("md5")?,
+        uploaded_at: r.get("uploaded_at")?,
     })
 }
 
@@ -423,6 +474,10 @@ impl Db {
         add_column_if_missing(&conn, "clients", "health", "TEXT")?;
         add_column_if_missing(&conn, "clients", "mode", "TEXT")?;
         add_column_if_missing(&conn, "clients", "last_reboot", "TEXT")?;
+        add_column_if_missing(&conn, "clients", "build", "TEXT")?;
+        add_column_if_missing(&conn, "clients", "ota", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&conn, "clients", "firmware_policy", "TEXT")?;
+        add_column_if_missing(&conn, "clients", "firmware_state", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -449,11 +504,11 @@ impl Db {
             .is_some();
         conn.execute(
             "INSERT INTO clients (id, hostname, version, api_version, capabilities, first_seen,
-                                  last_seen, last_addr, suggested_name)
-             VALUES (?1, ?2, ?3, ?8, ?4, ?5, ?5, ?6, ?7)
+                                  last_seen, last_addr, suggested_name, build, ota)
+             VALUES (?1, ?2, ?3, ?8, ?4, ?5, ?5, ?6, ?7, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET hostname = ?2, version = ?3, api_version = ?8,
                                            capabilities = ?4, last_seen = ?5, last_addr = ?6,
-                                           suggested_name = ?7",
+                                           suggested_name = ?7, build = ?9, ota = ?10",
             params![
                 id.to_string(),
                 req.hostname,
@@ -462,7 +517,9 @@ impl Db {
                 now,
                 addr,
                 suggested_name,
-                req.api_version
+                req.api_version,
+                req.build.as_ref().map(json),
+                req.ota
             ],
         )?;
         Ok(!existed)
@@ -595,6 +652,101 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT * FROM clients ORDER BY last_seen DESC")?;
         stmt.query_map([], row_to_client)?.collect()
+    }
+
+    /// Sets the build the client is to run (None: the one it runs), and its
+    /// update state. Returns false if unknown.
+    pub fn set_firmware_policy(
+        &self,
+        id: ClientId,
+        policy: Option<&FirmwarePolicy>,
+        state: &FirmwareState,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE clients SET firmware_policy = ?2, firmware_state = ?3 WHERE id = ?1",
+            params![id.to_string(), policy.map(json), json(state)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Records the client's update state. Returns false if unknown.
+    pub fn set_firmware_state(
+        &self,
+        id: ClientId,
+        state: &FirmwareState,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE clients SET firmware_state = ?2 WHERE id = ?1",
+            params![id.to_string(), json(state)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Keeps a firmware build (its image is stored apart, by `md5`).
+    pub fn insert_firmware_build(
+        &self,
+        b: &BuildInfo,
+        size: u64,
+        md5: &str,
+        now: Timestamp,
+    ) -> rusqlite::Result<FirmwareBuild> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO firmware_builds (hardware_id, tag, \"commit\", dirty, describe, built_at,
+                                          size, md5, uploaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                b.hardware_id,
+                b.tag,
+                b.commit,
+                b.dirty,
+                b.describe,
+                b.built_at,
+                size as i64,
+                md5,
+                now
+            ],
+        )?;
+        conn.query_row(
+            "SELECT * FROM firmware_builds WHERE id = ?1",
+            [conn.last_insert_rowid()],
+            row_to_firmware,
+        )
+    }
+
+    pub fn get_firmware_build(&self, id: i64) -> rusqlite::Result<Option<FirmwareBuild>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM firmware_builds WHERE id = ?1",
+            [id],
+            row_to_firmware,
+        )
+        .optional()
+    }
+
+    pub fn firmware_build_by_md5(&self, md5: &str) -> rusqlite::Result<Option<FirmwareBuild>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM firmware_builds WHERE md5 = ?1",
+            [md5],
+            row_to_firmware,
+        )
+        .optional()
+    }
+
+    /// Every firmware build, newest build time first.
+    pub fn list_firmware_builds(&self) -> rusqlite::Result<Vec<FirmwareBuild>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("SELECT * FROM firmware_builds ORDER BY built_at DESC, id DESC")?;
+        stmt.query_map([], row_to_firmware)?.collect()
+    }
+
+    pub fn delete_firmware_build(&self, id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM firmware_builds WHERE id = ?1", [id])? > 0)
     }
 
     /// Records the client's latest start. Returns false if unknown.
@@ -1063,6 +1215,8 @@ mod tests {
                 device_name: "mic".into(),
             },
             name: None,
+            build: None,
+            ota: false,
         }
     }
 

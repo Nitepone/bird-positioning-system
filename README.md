@@ -290,6 +290,35 @@ firmware with API 1.1.0 or later; for older firmware they show as not supported.
 browser client answer them as not supported. The same through the API:
 `POST /api/v1/control/clients/{id}/reboot` and `PUT /api/v1/control/clients/{id}/logging`.
 
+**Firmware updates over the air (ESP32).** ESP32 boards with firmware on API 1.2.0 or later can be
+updated from the server instead of by USB:
+
+1. Upload the build's `firmware.bin` (in `firmware/.pio/build/<board>/`) on the **Firmware** page, or
+   with `curl` (the web port; `-k` for the self-signed certificate):
+
+   ```sh
+   curl -k --data-binary @firmware/.pio/build/bps_xiao/firmware.bin \
+        -H 'content-type: application/octet-stream' https://localhost/api/v1/control/firmware
+   ```
+
+   The server reads the board's hardware id, git tag, commit and build time from the image itself
+   and refuses anything that is not an ESP32 app image with that build information. Uploading the
+   same image again changes nothing. The page lists the builds by hardware id, newest first, with the
+   clients running each.
+2. On the **Clients** page (select a client; *Firmware*), choose what it runs: **Latest dev fw** (the
+   newest build for its hardware), **Latest stable fw** (the newest tagged release, built from a
+   clean tree) or **Manual fw version** (one build). Until you choose, a client stays on the build it
+   runs. Clients on "latest" move to a newer upload by themselves.
+3. The client is offered the build in its heartbeat replies (a batch client: at its next contact)
+   and installs it and restarts, unless its battery is low (it then tries again later). If it fails,
+   or the new build does not start properly and the board rolls back, that build is not offered to
+   the client again until you set its choice again. The page shows the build it runs, the one it is
+   to run, and how its last update went; the **Logs** page has `firmware_offered`,
+   `firmware_update_deferred`, `firmware_update_failed` and `firmware_updated` events.
+
+Images are kept in `firmware_dir` (default `firmware-builds/`, relative to where the server runs, as the database). A build a
+client is manually set to cannot be deleted.
+
 **Configure, build and flash.** Two scripts in `firmware/` do it:
 
 ```sh
@@ -326,6 +355,23 @@ as `BPS_GIT_DESCRIBE`; set that variable yourself to build without git. Without 
 is `unknown`. The firmware is rebuilt whenever the version changes. `bsp-client`,
 `firmware/host` and the server work out their versions the same way (`bsp-client --version`,
 `bsp-server --version`, and `build` in `GET /api/v1/control/status`).
+Each image also embeds its board's hardware id (set per board in `platformio.ini`), the exact tag
+(only for a build at a tag from a clean tree), the commit, the dirty flag and the build time.
+`./build.sh --docker` passes these in as `BPS_GIT_COMMIT`, `BPS_GIT_TAG` and `BPS_GIT_DIRTY`
+alongside `BPS_GIT_DESCRIBE`.
+
+**Updating ESP32 boards over the air.** Once a board runs firmware with update support, there is
+no need to flash it by USB again. Upload a build's `firmware/.pio/build/<board>/firmware.bin` on
+the **Firmware** page, or with
+`curl --data-binary @firmware.bin -H 'content-type: application/octet-stream' http://<server>/api/v1/control/firmware`.
+Then choose the client's firmware in its **Firmware** section on the **Clients** page:
+**Latest dev fw** (the newest build for its hardware), **Latest stable fw** (the newest build made
+at a tag from a clean tree), or a **Manual fw version**. The board downloads it at its next
+heartbeat (in batch mode, at its next contact) and restarts into it. Running off a battery, it
+waits until the charge is at least `OTA_MIN_BATTERY` percent (default 50, set in `bps.conf`). A
+build that crashes, or never registers with audio running, is rolled back by the board itself, and
+the server stops offering that build to the board until you change the board's selection. Pico
+boards cannot be updated this way.
 
 For several boards, keep one config per board: `./configure.sh north.conf`, then
 `./build.sh -f north.conf`. Each board's client ID is derived from its chip's unique ID, so it
@@ -532,7 +578,10 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `POST /register`: the client's `version` (its own build) and `api_version` (see
     [API version](#api-version)); the response's `api_version` is the server's, and its
     `flac_uploads` says whether the server takes FLAC uploads. A different major `api_version` is
-    refused with `409` and `{"error": ...}` naming both versions
+    refused with `409` and `{"error": ...}` naming both versions. From API 1.2.0, optionally:
+    `build` (`hardware_id`, `tag`: the git tag or null, `commit`, `dirty`, `describe`, `built_at`:
+    `YYYY-MM-DDTHH:MM:SSZ`; the same as embedded in its image) and `ota: true` from firmware that
+    takes updates over the air (ESP32)
   - `POST /{id}/heartbeat`: clock status and counts, and from boards that have them `battery`
     (`percent`, `voltage_v`, `rate_pct_per_h`), `storage` (`present`, `total_bytes`, `free_bytes`,
     `recordings`, `recorded_bytes`, `errors`, `dropped_bytes`), `devices` (`kind`, `bus`,
@@ -549,7 +598,14 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     `commands`: those not yet acknowledged, `[{"command_id": ..., "command": "reboot"}, {"command_id":
     ..., "command": "logging", "log_level": "on" | "off", "log_duration_s": ...}]`. Command ids
     increase (they are at least the time they were made, in ms since 1970); a client runs only ids
-    above the highest it has run, and remembers that across restarts
+    above the highest it has run, and remembers that across restarts. From API 1.2.0 the heartbeat
+    may carry `firmware_status` (`{"build_id": ..., "state": "deferred" | "failed" | "rolled_back",
+    "detail": ...}`, in every heartbeat until one is delivered), and the reply to a client that
+    registered with `ota: true` and a `build` carries `firmware_offer` (`firmware_build_id`,
+    `firmware_url`, `firmware_size`, `firmware_md5`, `firmware_describe`) while the build chosen
+    for it is for its hardware, differs from the one it runs and has not failed on it
+  - `GET /firmware/{build_id}.bin`: a firmware image (the `firmware_url` of an offer), with
+    `Content-Length` and `x-MD5` (32 lowercase hex digits); `404` for an unknown id
   - `POST /{id}/audio`: WAV or FLAC body plus an `x-bsp-start-ns` header (the microcontroller
     client always sends FLAC, about a quarter the size, with chunked encoding). Optional:
     `x-bps-end-ns`, when the sample after the last was captured (the chunk's real duration), and
@@ -569,7 +625,12 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
     (`reason`, `at`) and `maintenance`: `supported` (whether its firmware takes commands),
     `reboot` and `logging` (the latest command of each: `id`, `params`, `created_at`,
     `delivered_at`, `acked_at`, `result`: null while pending, then the client's answer or
-    `superseded`) and `logging_until` (while it captures its log, when it stops, as it reported)
+    `superseded`) and `logging_until` (while it captures its log, when it stops, as it reported);
+    `build` and `ota` from its registration, and `firmware`: `supported` (or why not in
+    `unsupported`), `running` (the uploaded build it runs, if any), `policy` (null until chosen),
+    `target`, `offering` (the build id its heartbeat replies offer now), `blocked` (builds that
+    failed on it) and `last` (`result`: `updated`, `deferred`, `failed` or `rolled_back`,
+    `build_id`, `detail`, `at`)
   - `GET|PUT|DELETE /clients/{id}`
   - `PUT /clients/{id}/mode`: `{"mode": "live" | "batch", "interval_s": 30-3600}`
   - `POST /clients/{id}/reboot`: queues a reboot (`202` with the command; `200` with the pending
@@ -578,6 +639,18 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `PUT /clients/{id}/logging`: `{"level": "on", "duration_s": 1-86400}` or `{"level": "off"}`
     (`202` with the command; it replaces a pending one; `409` as above). The firmware has one log
     level, so `on` captures every line; `level` is where finer levels would go
+  - `PUT /clients/{id}/firmware`: the build the client is to run, `{"policy": "latest_dev"}`,
+    `{"policy": "latest_stable"}` or `{"policy": "manual", "build_id": 42}` (`200` with its
+    `firmware`, as below). Setting it, even to the same, lets a build that failed on the client be
+    offered again. `409` if the client cannot be updated over the air, `400` for a build for other
+    hardware
+  - `GET /firmware`: the firmware builds, newest build time first: `id`, `hardware_id`, `tag`,
+    `commit`, `dirty`, `describe`, `built_at`, `size`, `md5`, `uploaded_at`, `stable`, `url`,
+    `clients_running`, `clients_targeting` (set to it, running another) and `clients_pinned`
+  - `POST /firmware`: uploads a `firmware.bin` as the raw request body (see the `curl` command
+    above); `201` with the new build, `200` with the existing one for an image already there, `422`
+    for a file that is not an ESP32 app image with build information, `415` for a form upload
+  - `DELETE /firmware/{id}`: `204`; `409` while a client is manually set to it
   - `GET /clients/{id}/clock?minutes=`: the client's clock reports (one per heartbeat) over the
     last `minutes` (default 30, at most 60)
   - `GET /detections`: filters `q` (name contains), `species` (exact scientific name),
@@ -595,7 +668,9 @@ firmware's C clock estimator and band-pass against `bsp-proto` and `bsp-core`).
   - `GET /events?client_id=&kind=&exclude_kind=&after_id=&limit=`: among others `client_log`
     (`text`, `ms`: a line of a client's trace log, at the time it was logged),
     `client_log_dropped`, `client_rebooted` (`reason`, `at`), `reboot_requested`,
-    `logging_requested` and `command_acked` (`command_id`, `command`, `result`)
+    `logging_requested`, `command_acked` (`command_id`, `command`, `result`), `firmware_offered`,
+    `firmware_update_deferred`, `firmware_update_failed`, `firmware_updated` (`build_id`, ...),
+    `firmware_policy_set`, `firmware_uploaded` and `firmware_deleted`
   - `GET|DELETE /positioning-request`
 
 <a id="api-version"></a>
@@ -621,7 +696,10 @@ work: new fields stay optional, and a reader ignores fields it does not know.
 
 History: **1.1.0** added maintenance commands (`commands` in heartbeat replies; `acks`,
 `reboot_reason` and `log` in heartbeats). The server sends commands only to clients that registered
-with 1.1.0 or later.
+with 1.1.0 or later. **1.2.0** added firmware updates over the air (`build` and `ota` in
+registrations, `firmware_offer` in heartbeat replies, `firmware_status` in heartbeats, and
+`GET /firmware/{id}.bin`). The server offers firmware only to clients that registered with 1.2.0 or
+later and `ota: true`.
 
 **Known limitations:**
 

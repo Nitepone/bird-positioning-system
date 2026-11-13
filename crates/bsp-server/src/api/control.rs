@@ -54,6 +54,7 @@ pub fn router() -> Router<SharedState> {
             "/positioning-request",
             get(get_positioning).delete(clear_positioning),
         )
+        .merge(super::firmware::router())
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,8 @@ struct ClientView {
     beacon_line: Option<TsfLine>,
     positioning_requested: bool,
     maintenance: MaintenanceView,
+    /// Updates over the air (API 1.2.0).
+    firmware: super::firmware::FirmwareView,
 }
 
 /// A client's maintenance (API 1.1.0): whether it takes commands, its latest
@@ -115,6 +118,7 @@ fn view(state: &SharedState, record: ClientRecord, now: Timestamp) -> ClientView
     let req = state.positioning_request();
     ClientView {
         maintenance: maintenance_view(state, &record, now),
+        firmware: super::firmware::firmware_view(state, &record),
         api_compat: compat::check(record.api_version.as_deref()).unwrap_or(ApiCompat::Incompatible),
         active: state.is_active(&record, now),
         synced: state.is_synced(&record, now),

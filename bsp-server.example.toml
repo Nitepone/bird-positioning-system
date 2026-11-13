@@ -1,6 +1,7 @@
 client_listen = "0.0.0.0:2473"  # client devices (2473 = "BIRD" on a phone keypad)
 udp_listen = "0.0.0.0:2473"
 db_path = "bsp.db"
+firmware_dir = "firmware-builds"  # firmware images uploaded on the Firmware page
 active_timeout_s = 15
 max_clock_offset_us = 2000
 max_call_skew_ms = 200

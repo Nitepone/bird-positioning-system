@@ -28,7 +28,7 @@ pub const CLIENT_API_PREFIX: &str = "/api/v1/client";
 /// patch for a fix that changes nothing on the wire. The firmware's copy is
 /// `BPS_API_VERSION` in firmware/lib/bps_core/src/proto.h; a test keeps them
 /// equal.
-pub const API_VERSION: &str = "1.1.0";
+pub const API_VERSION: &str = "1.2.0";
 
 /// Header carrying the timestamp of the first sample of an uploaded WAV chunk.
 pub const HEADER_START_NS: &str = "x-bsp-start-ns";
@@ -79,6 +79,61 @@ pub struct RegisterRequest {
     /// precedence; the suggestion is shown while there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The build the client runs, as embedded in its firmware image (API
+    /// 1.2.0; clients that know it). The server matches it against the
+    /// firmware builds it has to tell which one the client runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildInfo>,
+    /// The client takes firmware updates over the air: it acts on
+    /// `firmware_offer` in heartbeat replies and reports `firmware_status`
+    /// (API 1.2.0, ESP32 builds only). Absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ota: bool,
+}
+
+/// Marks the build information in a firmware image: these 15 bytes, then
+/// the build as one compact JSON object (`hw`, `tag`, `commit`, `dirty`,
+/// `describe`, `built`; the same values as [`BuildInfo`]), then a NUL. An
+/// image has exactly one.
+pub const BUILD_INFO_MARKER: &[u8] = b"BPS_BUILD_INFO:";
+
+/// Longest build information after [`BUILD_INFO_MARKER`], in bytes.
+pub const MAX_BUILD_INFO_LEN: usize = 512;
+
+/// Which firmware build a client runs (API 1.2.0). Two builds are the same
+/// when `hardware_id`, `commit`, `dirty` and `built_at` are all equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildInfo {
+    /// What the build is for: board and wiring, e.g. "esp32-s3 on
+    /// xiao-proto-rev0.1". A build is offered only to clients with the same.
+    pub hardware_id: String,
+    /// The git tag, when the build is exactly at one with a clean tree;
+    /// otherwise null (a development build).
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Short git commit hash.
+    pub commit: String,
+    /// Built from a tree with uncommitted changes.
+    pub dirty: bool,
+    /// `git describe --tags --always --dirty`.
+    pub describe: String,
+    /// When it was built, UTC: `YYYY-MM-DDTHH:MM:SSZ`.
+    pub built_at: String,
+}
+
+impl BuildInfo {
+    /// A release: tagged, and built from a clean tree.
+    pub fn is_stable(&self) -> bool {
+        self.tag.is_some() && !self.dirty
+    }
+
+    /// Whether `other` is the same build (see [`BuildInfo`]).
+    pub fn same_build(&self, other: &BuildInfo) -> bool {
+        self.hardware_id == other.hardware_id
+            && self.commit == other.commit
+            && self.dirty == other.dirty
+            && self.built_at == other.built_at
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -399,6 +454,83 @@ mod tests {
     }
 
     #[test]
+    fn firmware_update_wire_format() {
+        // Registration (contract §2).
+        let reg = serde_json::json!({
+            "client_id": "00000000-0000-0000-0000-000000000001", "hostname": "h", "version": "v",
+            "api_version": "1.2.0",
+            "capabilities": { "sample_rate": 48000, "channels": 1, "sample_format": "I32",
+                              "clock_source": "c", "device_name": "d" },
+            "build": { "hardware_id": "esp32-s3 on xiao-proto-rev0.1", "tag": "v1.3.0",
+                       "commit": "3c48fb8", "dirty": false, "describe": "v1.3.0",
+                       "built_at": "2026-11-12T23:10:00Z" },
+            "ota": true });
+        let req: RegisterRequest = serde_json::from_value(reg.clone()).unwrap();
+        let b = req.build.clone().unwrap();
+        assert!(req.ota && b.is_stable());
+        assert_eq!(serde_json::to_value(&req).unwrap(), reg);
+        // A development build: no tag, and the tag is still sent (as null).
+        let dev: BuildInfo = serde_json::from_value(serde_json::json!({
+            "hardware_id": "x", "tag": null, "commit": "3c48fb8", "dirty": true,
+            "describe": "v1.3.0-2-g3c48fb8-dirty", "built_at": "2026-11-12T23:10:00Z" }))
+        .unwrap();
+        assert!(!dev.is_stable());
+        assert_eq!(
+            serde_json::to_value(&dev).unwrap()["tag"],
+            serde_json::Value::Null
+        );
+        // Older clients leave both out.
+        let mut old = reg;
+        let o = old.as_object_mut().unwrap();
+        o.remove("build");
+        o.remove("ota");
+        let req: RegisterRequest = serde_json::from_value(old.clone()).unwrap();
+        assert!(req.build.is_none() && !req.ota);
+        assert_eq!(serde_json::to_value(&req).unwrap(), old);
+
+        // The offer (§4): exactly these keys.
+        let offer = serde_json::json!({
+            "firmware_build_id": 42, "firmware_url": "/api/v1/client/firmware/42.bin",
+            "firmware_size": 1283456, "firmware_md5": "0123456789abcdef0123456789abcdef",
+            "firmware_describe": "v1.3.0-2-g3c48fb8" });
+        let o: FirmwareOffer = serde_json::from_value(offer.clone()).unwrap();
+        assert_eq!(o.firmware_url, firmware_path(42));
+        let r = HeartbeatResponse {
+            mode: ModeSetting::default(),
+            trigger: None,
+            validation: None,
+            commands: Vec::new(),
+            firmware_offer: Some(o),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["firmware_offer"], offer);
+        assert_eq!(serde_json::from_value::<HeartbeatResponse>(v).unwrap(), r);
+        let r: HeartbeatResponse =
+            serde_json::from_str(r#"{"mode":{"mode":"live","interval_s":300}}"#).unwrap();
+        assert!(r.firmware_offer.is_none());
+        assert!(!serde_json::to_string(&r).unwrap().contains("firmware"));
+
+        // The status (§5).
+        for (state, s) in [
+            ("deferred", FirmwareUpdateState::Deferred),
+            ("failed", FirmwareUpdateState::Failed),
+            ("rolled_back", FirmwareUpdateState::RolledBack),
+        ] {
+            let j = serde_json::json!({ "build_id": 42, "state": state, "detail": "battery 34%" });
+            let st: FirmwareStatus = serde_json::from_value(j.clone()).unwrap();
+            assert_eq!((st.build_id, st.state), (42, s));
+            assert_eq!(serde_json::to_value(&st).unwrap(), j);
+        }
+        let hb: Heartbeat = serde_json::from_str(
+            r#"{"clock":null,"uptime_s":3,"chunks_sent":0,"chunks_gated":0,"queue_len":0,
+                "capture_dropouts":0,"firmware_status":{"build_id":7,"state":"exploded"}}"#,
+        )
+        .unwrap();
+        let st = hb.firmware_status.unwrap();
+        assert_eq!((st.state, st.detail), (FirmwareUpdateState::Unknown, None));
+    }
+
+    #[test]
     fn battery_charging_is_optional() {
         // As the MAX17048 driver reports it today: no charger status.
         let b: BatteryStatus =
@@ -558,6 +690,59 @@ pub struct Heartbeat {
     /// since the last delivered heartbeat (API 1.1.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<LogBatch>,
+    /// What became of a firmware offer, in every heartbeat until one is
+    /// delivered (API 1.2.0, clients that take updates). An update that
+    /// worked is not reported here: the client registers with its new build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_status: Option<FirmwareStatus>,
+}
+
+/// A client's report on a firmware build it was offered (API 1.2.0).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FirmwareStatus {
+    /// The offered build ([`FirmwareOffer::firmware_build_id`]).
+    pub build_id: i64,
+    pub state: FirmwareUpdateState,
+    /// Why: e.g. "battery 34%", or the updater's error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirmwareUpdateState {
+    /// Not now (e.g. its battery is low): the server keeps offering it.
+    Deferred,
+    /// Downloading or flashing failed: it is not offered to this client again
+    /// until its firmware selection changes.
+    Failed,
+    /// The client started the build, which never confirmed itself, and its
+    /// bootloader went back to the previous one. As `Failed`.
+    RolledBack,
+    /// A state this build does not know (from a newer peer).
+    #[serde(other)]
+    Unknown,
+}
+
+/// A firmware build for the client to install (API 1.2.0). The keys are
+/// unique across the heartbeat reply: the microcontroller client finds
+/// values by key anywhere in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirmwareOffer {
+    pub firmware_build_id: i64,
+    /// Path of the image on the server's client port (see [`firmware_path`]).
+    pub firmware_url: String,
+    /// Its size in bytes.
+    pub firmware_size: u64,
+    /// Its MD5, 32 lowercase hex digits (also in the download's `x-MD5`).
+    pub firmware_md5: String,
+    pub firmware_describe: String,
+}
+
+/// Where a client downloads firmware build `build_id`: `GET` on its own
+/// port, answered with the image and `Content-Length` and `x-MD5` headers.
+pub fn firmware_path(build_id: i64) -> String {
+    format!("{CLIENT_API_PREFIX}/firmware/{build_id}.bin")
 }
 
 /// A maintenance command for one client, passed on in heartbeat replies until
@@ -726,6 +911,11 @@ pub struct HeartbeatResponse {
     /// clients that speak it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<Command>,
+    /// A firmware build to install, while the one the operator chose for the
+    /// client differs from the one it runs (API 1.2.0; only to clients that
+    /// take updates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_offer: Option<FirmwareOffer>,
 }
 
 /// How a client uses its radio.
