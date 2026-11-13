@@ -5,7 +5,10 @@ use crate::config::ServerConfig;
 use crate::db::{ClientRecord, Db};
 use crate::settings::{LocalSpeciesStatus, Settings};
 use bsp_core::identifier::{Call, Identifier, LocalSpeciesFilter, RangeModel};
-use bsp_proto::{Bssid, ClientId, ClockStatus, NANOS_PER_SEC, OperationMode, Timestamp, now_ns};
+use bsp_proto::{
+    Bssid, ClientId, ClockStatus, LOW_POWER_HEARTBEAT_S, NANOS_PER_SEC, OperationMode, Timestamp,
+    now_ns,
+};
 use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
@@ -180,11 +183,16 @@ impl AppState {
 }
 
 /// How long a client may be out of contact on purpose: a batch client's
-/// interval, and the slack its contacts take.
+/// interval, and the slack its contacts take; a low-power client's slower
+/// heartbeats.
 fn quiet_ns(c: &ClientRecord) -> i64 {
     match c.health.as_ref().and_then(|h| h.mode.as_ref()) {
         Some(m) if m.mode == OperationMode::Batch => {
             m.interval_s as i64 * NANOS_PER_SEC + BATCH_CONTACT_SLACK_NS
+        }
+        // Two heartbeats, one of which may be lost.
+        Some(m) if m.mode == OperationMode::LowPower => {
+            2 * LOW_POWER_HEARTBEAT_S as i64 * NANOS_PER_SEC
         }
         _ => 0,
     }

@@ -59,9 +59,24 @@
  * buffer holds seconds; saving a chunk keeps up easily). */
 #define OFF_IDLE_MS 10
 
+/* Low-power live mode: connected, uploading as it records, but with the
+ * radio in modem sleep between a burst of clock measurements this often
+ * (with power saving off for it), the heartbeat (in every second burst's
+ * wake) and uploads. The clock is measured against the server only: beacon
+ * capture is off, so there is no access point clock. Fits through the
+ * 64 s window (timesync.h) still see four or five bursts. */
+#define LP_BURST_EVERY_US 15000000
+#define LP_BURST_REQUESTS 8
+/* From power saving going off to the first request: the access point learns
+ * the radio is awake, and stops holding its packets. */
+#define LP_SETTLE_US 30000
+#define LP_BURST_GAP_US 30000
+/* The server allows for it (bsp-proto's LOW_POWER_HEARTBEAT_S). */
+#define LP_HEARTBEAT_US 30000000
+
 enum { ST_WIFI, ST_REGISTER, ST_RUN, ST_OFF };
-enum { MODE_LIVE, MODE_BATCH };
-static const char *const MODE_NAMES[] = {"live", "batch"};
+enum { MODE_LIVE, MODE_BATCH, MODE_LOW_POWER };
+static const char *const MODE_NAMES[] = {"live", "batch", "low_power"};
 /* The phases of a contact, once registered. */
 enum { C_SYNC, C_FLUSH, C_LAST_FLUSH, C_FINAL };
 enum { TXN_IDLE, TXN_SENDING, TXN_RECEIVING, TXN_DONE, TXN_FAILED };
@@ -130,6 +145,7 @@ static struct {
     bool waiting, warned;
     int64_t t1;
     uint64_t sent_us, next_us;
+    uint32_t burst_left; /* low-power mode: requests still to send in this burst */
 } ts = {.h = -1};
 
 static struct {
@@ -170,6 +186,21 @@ static struct {
     uint32_t gap_off_s;
     int64_t gap_clock_ns, gap_tsf_ns;
 } mode = {.interval_s = 300, .radio_on = true};
+
+/* Low-power live mode, as run (lp_poll()). */
+static struct {
+    bool on;
+    int level; /* port_wifi_power()'s, as last set */
+    uint64_t next_burst_us;
+    /* Time with the radio awake (power saving off) since the mode started. */
+    uint64_t since_us, awake_us, mark_us;
+    bool awake;
+    uint32_t bursts, wakes;
+} lp = {.level = PORT_WIFI_FULL};
+
+/* The clock is measured in bursts, not every TIMESYNC_INTERVAL_US: low-power
+ * mode, once this session's clock is measured. */
+static bool lp_bursts(void) { return mode.run == MODE_LOW_POWER && mode.session_synced; }
 
 static bps_anchors anchors;
 
@@ -579,6 +610,7 @@ static void start_run(uint64_t now)
         port_log("timesync: cannot open UDP to %s:%u", cfg.server_host, (unsigned)udp_port);
     ts.waiting = false;
     ts.next_us = now;
+    ts.burst_left = 0;
     hb_next_us = now;
     mode.session++;
     mode.session_us = now;
@@ -776,8 +808,15 @@ static void timesync_poll(uint64_t now)
     }
     if (ts.waiting || now < ts.next_us)
         return;
-    ts.next_us = now - ts.next_us > TIMESYNC_INTERVAL_US ? now + TIMESYNC_INTERVAL_US
-                                                         : ts.next_us + TIMESYNC_INTERVAL_US;
+    if (lp_bursts()) {
+        if (ts.burst_left == 0)
+            return; /* lp_poll() starts the next burst */
+        ts.burst_left--;
+        ts.next_us = now + LP_BURST_GAP_US;
+    } else {
+        ts.next_us = now - ts.next_us > TIMESYNC_INTERVAL_US ? now + TIMESYNC_INTERVAL_US
+                                                             : ts.next_us + TIMESYNC_INTERVAL_US;
+    }
     while (timesync_recv()) /* drain late replies */
         ;
     bps_ts_request req = {.seq = ++ts.seq};
@@ -1001,15 +1040,30 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
         port_log("mode: batch, now a contact every %lu s", (unsigned long)interval_s);
     mode.want = want;
     mode.interval_s = interval_s;
-    if (want == MODE_LIVE) {
-        mode.note = NULL;
+    if (want != MODE_BATCH) {
+        const char *note = NULL;
+        if (want == MODE_LOW_POWER && mode.run != MODE_LOW_POWER) {
+            if (port_wifi_power(PORT_WIFI_AWAKE)) {
+                lp.level = PORT_WIFI_AWAKE;
+            } else {
+                want = MODE_LIVE;
+                note = "this board cannot save power on its radio";
+                if (!mode.note)
+                    port_log("mode: low power is not supported on this board; staying live");
+            }
+        }
+        mode.note = note;
+        if (mode.run == want)
+            return;
         if (mode.run == MODE_BATCH) {
-            port_log("mode: live (the radio stays on)");
-            mode.run = MODE_LIVE;
             bps_upload_set_spool(false);
-            mode_started(now);
             bps_spool_kick(); /* what is still on the card */
         }
+        port_log(want == MODE_LIVE ? "mode: live (the radio stays on)"
+                                   : "mode: low-power live (the radio sleeps between clock "
+                                     "measurements, heartbeats and uploads)");
+        mode.run = want;
+        mode_started(now);
         return;
     }
     if (mode.run == MODE_BATCH)
@@ -1556,13 +1610,16 @@ static void heartbeat_reply(uint64_t now)
         interval = 30;
     if (interval > 3600)
         interval = 3600;
-    apply_mode(strcmp(m, "batch") == 0 ? MODE_BATCH : MODE_LIVE, (uint32_t)interval, now);
+    int want = strcmp(m, "batch") == 0       ? MODE_BATCH
+               : strcmp(m, "low_power") == 0 ? MODE_LOW_POWER
+                                             : MODE_LIVE;
+    apply_mode(want, (uint32_t)interval, now);
 }
 
-/* Live mode: chunks left on the card (from batch mode) go up as well. */
+/* Live modes: chunks left on the card (from batch mode) go up as well. */
 static void live_spool_poll(uint64_t now)
 {
-    if (mode.run != MODE_LIVE || !mode.session_synced || bps_spool_busy() ||
+    if (mode.run == MODE_BATCH || !mode.session_synced || bps_spool_busy() ||
         now < mode.live_spool_us)
         return;
     mode.live_spool_us = now + LIVE_SPOOL_US;
@@ -1576,6 +1633,77 @@ static void anchor_poll(uint64_t now)
 {
     if (mode.session_synced && now - mode.anchor_us >= ANCHOR_EVERY_US)
         push_anchor(now);
+}
+
+/* ---- Low-power live mode ---- */
+
+static void lp_account(uint64_t now, bool awake)
+{
+    if (lp.awake)
+        lp.awake_us += now - lp.mark_us;
+    else if (awake)
+        lp.wakes++;
+    lp.awake = awake;
+    lp.mark_us = now;
+}
+
+static double lp_awake_pct(uint64_t now)
+{
+    uint64_t awake = lp.awake_us + (lp.awake ? now - lp.mark_us : 0);
+    uint64_t all = now - lp.since_us;
+    return all ? 100.0 * (double)awake / (double)all : 100.0;
+}
+
+/* Whether the radio must be awake now: a clock burst, a request or upload
+ * on its way, or the client closing down (an update or reboot). */
+static bool lp_busy(void)
+{
+    return ts.burst_left > 0 || ts.waiting || hb_txn.state != TXN_IDLE ||
+           reg_txn.state != TXN_IDLE || pos_txn.state != TXN_IDLE || val_txn.state != TXN_IDLE ||
+           bps_upload_sending() || bps_spool_busy() || closing_down();
+}
+
+/* Sets the CPU's speed and the radio's power saving for the mode, and starts
+ * each clock burst. Every loop, in every state. Until the session's clock is
+ * measured (as live mode does, every TIMESYNC_INTERVAL_US), and while
+ * joining or registering, the radio stays awake. */
+static void lp_poll(uint64_t now)
+{
+    bool on = mode.run == MODE_LOW_POWER;
+    if (on != lp.on) {
+        lp.on = on;
+        port_cpu_low(on);
+        if (on) {
+            lp.since_us = lp.mark_us = now;
+            lp.awake_us = 0;
+            lp.awake = true;
+            lp.bursts = lp.wakes = 0;
+            lp.next_burst_us = now;
+        }
+    }
+    int level = PORT_WIFI_FULL;
+    if (on) {
+        level = PORT_WIFI_AWAKE;
+        if (state == ST_RUN && lp_bursts()) {
+            if (now >= lp.next_burst_us) {
+                lp.next_burst_us = now + LP_BURST_EVERY_US;
+                lp.bursts++;
+                ts.burst_left = LP_BURST_REQUESTS;
+                ts.next_us = now + LP_SETTLE_US;
+                /* A heartbeat due before the next burst goes in this wake. */
+                if (hb_next_us < now + LP_BURST_EVERY_US / 2)
+                    hb_next_us = now;
+            }
+            if (!lp_busy())
+                level = PORT_WIFI_SAVE;
+        }
+    }
+    if (level != lp.level) {
+        port_wifi_power(level);
+        lp.level = level;
+    }
+    if (on && (level == PORT_WIFI_SAVE) == lp.awake)
+        lp_account(now, level != PORT_WIFI_SAVE);
 }
 
 static void mode_json(bps_json *j, uint64_t now)
@@ -1613,6 +1741,8 @@ static void mode_json(bps_json *j, uint64_t now)
             bps_json_raw(j, "}");
         }
     }
+    if (mode.run == MODE_LOW_POWER && lp.on)
+        bps_json_fixed(j, "radio_on_pct", lp_awake_pct(now), 1);
     if (mode.note) {
         bps_json_str(j, "note", mode.note);
     }
@@ -1707,8 +1837,8 @@ static void start_heartbeat(uint64_t now)
 static void heartbeat_poll(uint64_t now)
 {
     if (hb_txn.state == TXN_IDLE && now >= hb_next_us) {
-        hb_next_us = now - hb_next_us > hb_interval_us ? now + hb_interval_us
-                                                       : hb_next_us + hb_interval_us;
+        uint64_t period = mode.run == MODE_LOW_POWER ? LP_HEARTBEAT_US : hb_interval_us;
+        hb_next_us = now - hb_next_us > period ? now + period : hb_next_us + period;
         start_heartbeat(now);
     }
     txn_poll(&hb_txn);
@@ -1841,7 +1971,7 @@ static void update_led(uint64_t now)
 {
     uint64_t ms = now / 1000;
     bool on;
-    if (state == ST_OFF)
+    if (state == ST_OFF || (state == ST_RUN && lp_bursts()))
         on = ms % 10000 < 20; /* a glimmer now and then: the LED costs power */
     else if (state != ST_RUN)
         on = (ms / 250) % 2;
@@ -1906,6 +2036,23 @@ static void log_status(uint64_t now)
     bps_devices_describe(devices, sizeof devices);
     if (devices[0])
         port_log("devices: %s", devices);
+    /* Power saving, for the trace log (a health metric of its own later). */
+    char pw[192], lpi[128] = "", bat[64] = "";
+    port_power_diag(pw, sizeof pw);
+    if (lp.on)
+        snprintf(lpi, sizeof lpi, "; radio awake %s%% of %lu s, %lu wakes, %lu clock bursts",
+                 centi(a, sizeof a, (int32_t)lround(lp_awake_pct(now) * 100)),
+                 (unsigned long)((now - lp.since_us) / 1000000), (unsigned long)lp.wakes,
+                 (unsigned long)lp.bursts);
+    int32_t pct, rate;
+    uint32_t mv;
+    if (bps_devices_battery(&pct, &rate) && bps_devices_cell_mv(&mv))
+        snprintf(bat, sizeof bat, "; battery %lu mV, %s%%, %s %%/h", (unsigned long)mv,
+                 centi(a, sizeof a, pct), centi(b, sizeof b, rate));
+    port_log("power status: mode %s; %s; led %s%s%s", MODE_NAMES[mode.run],
+             pw[0] ? pw : "no board details",
+             state == ST_OFF || (state == ST_RUN && lp_bursts()) ? "glimmer" : "on/blinking", lpi,
+             bat);
     if (mode.run == MODE_BATCH) {
         bps_spool_status sp;
         bps_spool_status_get(&sp);
@@ -2061,8 +2208,9 @@ void bps_client_loop(void)
     if (capturing)
         bps_validate_poll(now);
     bps_devices_poll(now);
+    lp_poll(now);
     update_led(now);
     log_status(now);
-    if (state == ST_OFF)
+    if (state == ST_OFF || (lp.on && lp.level == PORT_WIFI_SAVE))
         port_idle_ms(OFF_IDLE_MS);
 }

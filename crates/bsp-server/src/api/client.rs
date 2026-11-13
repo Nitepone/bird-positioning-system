@@ -726,6 +726,9 @@ mod tests {
         assert!(kinds(Some(&batch), &batch).is_empty());
         assert_eq!(kinds(Some(&batch), &live), ["mode_changed"]);
         assert_eq!(kinds(None, &batch), ["mode_changed"]);
+        let low = with_mode(OperationMode::LowPower);
+        assert_eq!(kinds(Some(&live), &low), ["mode_changed"]);
+        assert!(kinds(Some(&low), &low).is_empty());
     }
 
     #[test]

@@ -134,7 +134,8 @@ function deviceState(c) {
   if (c.api_compat === "incompatible") return { level: "bad", text: "refused" };
   if (!c.active) return { level: "off", text: "offline" };
   if (!c.synced) return { level: "bad", text: "clock not synced" };
-  return { level: "ok", text: c.health?.mode?.mode === "batch" ? "listening (batch)" : "listening" };
+  const m = c.health?.mode?.mode;
+  return { level: "ok", text: m === "batch" ? "listening (batch)" : m === "low_power" ? "listening (low power)" : "listening" };
 }
 
 /// What needs attention on a device, worst first: [{ level: "bad" | "warn" | "info", text, tab }].

@@ -161,7 +161,7 @@ and each of them:
 
 - has a position set,
 - is **active** (sent a heartbeat in the last 15 s; a client in batch mode, its interval plus
-  two minutes), and
+  two minutes; in low-power mode, 75 s), and
 - is **synced** (its audio timestamps are within 2 ms of the server's clock, worst case).
 
 The **Events** page (System) shows the server's log in words, which is useful when something isn't
@@ -303,6 +303,15 @@ complete). After a restart they go up with the timestamps estimated when they we
 without the access point's clock. In batch mode chunks are not also copied to `recordings/`.
 Batch mode needs an ESP32 board (a Pico board has no card slot yet). A board starts in live mode
 and switches at its first heartbeat.
+
+**Low-power mode** (ESP32 boards) stays connected and uploads as it records, like live, but lets
+the Wi-Fi radio sleep (modem sleep) between short wakes: a burst of 8 clock measurements every
+15 s, a heartbeat every 30 s, and uploads. It turns off beacon capture, so the device follows only the
+server's clock, not its access point's, and it runs the processor at 80 MHz instead of 160. Until
+its clock has been measured after joining, the radio stays awake. The heartbeat's `radio_on_pct`
+is the share of time the radio was awake. With trace logging on, a `power status:` line each
+minute gives the CPU clock, the radio's power saving and listen interval, beacon capture, the
+time awake, and the battery's voltage, charge and rate.
 
 **Maintenance: reboot and trace logging.** On the **Devices** page (select a client; *Maintenance* on its Overview tab):
 

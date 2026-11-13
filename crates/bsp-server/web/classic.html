@@ -532,6 +532,7 @@
           <form class="filters" id="mode-form" onsubmit="saveMode(event)">
             <label>Mode <select id="mode-select" onchange="modeFormChanged()">
               <option value="live">Live: always connected</option>
+              <option value="low_power">Low power: connected, radio sleeps between wakes</option>
               <option value="batch">Batch: radio off between contacts</option>
             </select></label>
             <label id="mode-interval-label">contact every <input id="mode-interval" type="number" min="30" max="3600"
@@ -2076,7 +2077,7 @@ function fmtInterval(s) { return s % 60 === 0 ? `${s / 60} min` : `${s} s`; }
 /// mode set for it while it has yet to switch.
 function modeView(c) {
   const m = c.health?.mode, want = c.mode;
-  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : "live";
+  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : x.mode === "low_power" ? "low power" : "live";
   if (!m) return { text: "live", cls: "muted", sub: "reports no mode: cannot switch" };
   const parts = [];
   if (m.note) parts.push(m.note);

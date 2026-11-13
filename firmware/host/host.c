@@ -91,6 +91,20 @@ bool port_wifi_off(void)
 
 void port_idle_ms(uint32_t ms) { usleep(ms * 1000); }
 
+bool port_wifi_power(int level)
+{
+    (void)level;
+    return true;
+}
+
+void port_cpu_low(bool low) { (void)low; }
+
+void port_power_diag(char *out, size_t cap)
+{
+    if (cap)
+        out[0] = 0;
+}
+
 int port_wifi_rssi(void) { return 0; }
 
 void port_wifi_diag(char *out, size_t cap)

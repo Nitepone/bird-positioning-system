@@ -276,6 +276,17 @@ mod tests {
 
     /// The firmware's `BPS_API_VERSION` is the same string as [`API_VERSION`].
     #[test]
+    fn low_power_mode_is_named_low_power() {
+        let m: ModeSetting =
+            serde_json::from_str(r#"{"mode":"low_power","interval_s":300}"#).unwrap();
+        assert_eq!(m.mode, OperationMode::LowPower);
+        assert_eq!(
+            serde_json::to_value(OperationMode::LowPower).unwrap(),
+            serde_json::json!("low_power")
+        );
+    }
+
+    #[test]
     fn api_version_matches_the_firmwares() {
         let header = include_str!("../../../firmware/lib/bps_core/src/proto.h");
         let c = header
@@ -930,7 +941,15 @@ pub enum OperationMode {
     /// at the next contact. Each contact measures the clock again, so audio
     /// recorded in between keeps accurate timestamps.
     Batch,
+    /// Connected and uploading as it records, as `Live`, but with the radio
+    /// in power saving between short wakes: a burst of clock measurements
+    /// every 15 s, a heartbeat every [`LOW_POWER_HEARTBEAT_S`], and uploads.
+    /// The client follows the server's clock only (no access point clock).
+    LowPower,
 }
+
+/// Seconds between a low-power client's heartbeats.
+pub const LOW_POWER_HEARTBEAT_S: u32 = 30;
 
 /// Seconds between a batch client's contacts, unless set otherwise.
 pub const DEFAULT_BATCH_INTERVAL_S: u32 = 300;

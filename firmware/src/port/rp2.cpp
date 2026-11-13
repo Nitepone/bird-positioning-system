@@ -148,6 +148,16 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
 // Batch mode also needs a storage card, which these boards do not have yet.
 extern "C" bool port_wifi_off(void) { return false; }
 
+// The CYW43's power saving would delay the time sync replies, and the low-power
+// live mode is not ported here: the client stays live.
+extern "C" bool port_wifi_power(int level) { return level == PORT_WIFI_FULL; }
+extern "C" void port_cpu_low(bool low) { (void)low; }
+extern "C" void port_power_diag(char *out, size_t cap)
+{
+    if (cap)
+        out[0] = 0;
+}
+
 extern "C" void port_idle_ms(uint32_t ms) { delay(ms); }
 
 extern "C" bool port_wifi_up(void)

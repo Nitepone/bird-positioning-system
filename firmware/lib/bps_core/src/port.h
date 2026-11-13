@@ -38,6 +38,21 @@ void port_wifi_begin(const char *ssid, const char *password, const char *hostnam
 /* Leaves the network and turns the radio off, to save power (batch mode).
  * False where the board cannot. */
 bool port_wifi_off(void);
+/* How the radio uses power while connected (low-power live mode, client.c):
+ * FULL, as port_wifi_begin() leaves it: power saving off, and the access
+ * point's beacons captured (port_beacon_take()). AWAKE: power saving off, no
+ * beacon capture. SAVE: modem sleep (the radio wakes for the beacons it must
+ * hear, and the access point holds packets for it meanwhile), no beacon
+ * capture. Kept across reconnects and port_wifi_off(). False (FULL stays)
+ * where the board cannot. */
+enum { PORT_WIFI_FULL, PORT_WIFI_AWAKE, PORT_WIFI_SAVE };
+bool port_wifi_power(int level);
+/* Runs the CPU slower (`low`), or at its usual speed; nothing where the board
+ * cannot. */
+void port_cpu_low(bool low);
+/* What the board does to save power, for the trace log (CPU clock, the
+ * radio's power saving); empty if the board has nothing to add. */
+void port_power_diag(char *out, size_t cap);
 /* Lets the CPU rest for up to `ms` (the loop has nothing to do meanwhile). */
 void port_idle_ms(uint32_t ms);
 bool port_wifi_up(void);

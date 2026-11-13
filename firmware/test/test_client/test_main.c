@@ -103,6 +103,16 @@ int port_wifi_rssi(void) { return -50; }
 void port_wifi_diag(char *out, size_t cap) { snprintf(out, cap, "fake"); }
 bool port_beacon_take(port_beacon *out) { (void)out; return false; }
 void port_idle_ms(uint32_t ms) { (void)ms; }
+// The radio's power level and CPU speed the client last asked for.
+static int wifi_power = PORT_WIFI_FULL;
+static bool cpu_low;
+bool port_wifi_power(int level)
+{
+    wifi_power = level;
+    return true;
+}
+void port_cpu_low(bool low) { cpu_low = low; }
+void port_power_diag(char *out, size_t cap) { snprintf(out, cap, "fake"); }
 // A MAX17048 battery gauge at 0x36, when `with_gauge`: a 3.7 V cell at
 // `gauge_centi` hundredths of a percent, charging if `gauge_charging`.
 static bool with_gauge;
@@ -402,6 +412,12 @@ static void boot(bool model)
     memset(&mode, 0, sizeof mode);
     mode.interval_s = 300;
     mode.radio_on = true;
+    memset(&lp, 0, sizeof lp);
+    lp.level = PORT_WIFI_FULL;
+    wifi_power = PORT_WIFI_FULL;
+    cpu_low = false;
+    ts.h = -1;
+    ts.burst_left = 0;
     memset(&f, 0, sizeof f);
     f.h = -1;
     memset(&st, 0, sizeof st);
@@ -1199,6 +1215,44 @@ static void test_an_update_in_batch_mode_keeps_the_radio_on(void)
     ota_reset();
 }
 
+// Low-power live mode: the radio stays awake until the session's clock is
+// measured, then sleeps between bursts of clock measurements (awake for each),
+// with the CPU slowed; live mode puts both back.
+static void test_low_power_mode_sleeps_between_clock_bursts(void)
+{
+    boot(false);
+    ts.h = 0; // time sync requests go out (and are never answered)
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"low_power\",\"interval_s\":300}}"));
+    TEST_ASSERT_EQUAL_INT(MODE_LOW_POWER, mode.run);
+    hb_next_us = UINT64_MAX / 2;
+    run_ms(100);
+    TEST_ASSERT_TRUE(cpu_low);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_AWAKE, wifi_power); // the clock is not measured yet
+
+    mode.session_synced = true;
+    run_ms(20);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_AWAKE, wifi_power); // the first burst
+    TEST_ASSERT_TRUE(ts.burst_left > 0);
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_UINT32(0, ts.burst_left);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power); // asleep after it
+    run_ms(10000);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power);
+    run_ms(5000); // 15 s on: the next burst has come and gone
+    TEST_ASSERT_EQUAL_UINT32(2, lp.bursts);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power);
+    TEST_ASSERT_TRUE(lp_awake_pct(now_us) < 20.0);
+
+    const char *hb = heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"live\",\"interval_s\":300}}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"mode\":\"low_power\""));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"radio_on_pct\""));
+    run_ms(20);
+    TEST_ASSERT_EQUAL_INT(MODE_LIVE, mode.run);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_FULL, wifi_power);
+    TEST_ASSERT_FALSE(cpu_low);
+    ts.h = -1;
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1221,5 +1275,6 @@ int main(void)
     RUN_TEST(test_a_rollback_is_reported_until_delivered);
     RUN_TEST(test_a_low_battery_defers_an_update);
     RUN_TEST(test_an_update_in_batch_mode_keeps_the_radio_on);
+    RUN_TEST(test_low_power_mode_sleeps_between_clock_bursts);
     return UNITY_END();
 }

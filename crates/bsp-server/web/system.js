@@ -48,11 +48,12 @@ const CHARGING = `<span class="badge ok">charging</span>`;
 /// yet to switch.
 function modeView(c) {
   const m = c.health?.mode, want = c.mode;
-  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : "live";
+  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : x.mode === "low_power" ? "low power" : "live";
   if (!m) return { text: "live", cls: "muted", sub: "reports no mode: cannot be switched" };
   const parts = [];
   if (m.note) parts.push(m.note);
   else if (name(want) !== name(m)) parts.push(`switching to ${name(want)} at its next ${m.mode === "batch" ? "contact" : "heartbeat"}`);
+  if (m.mode === "low_power" && m.radio_on_pct != null) parts.push(`radio awake ${m.radio_on_pct.toFixed(1)}% of the time`);
   if (m.mode === "batch") {
     if (m.radio_on_pct != null) parts.push(`radio on ${m.radio_on_pct.toFixed(1)}% of the time`);
     if (m.next_contact_s != null && c.health) {
@@ -311,6 +312,9 @@ function fillModeForm(c) {
   for (const el of $("mode-form").querySelectorAll("select, input, button")) el.disabled = !can;
   setText("mode-hint", can ? "" : "This device reports no mode (older firmware, or a computer or browser client), so it cannot be switched.");
   setHtml("mode-info", info("Live: stays connected and uploads audio as it records.\n" +
+    "Low power: stays connected and uploads as it records, but its Wi-Fi radio sleeps between short wakes (its clock is measured " +
+    "every 15 s, a heartbeat every 30 s, and uploads), and its processor runs slower. It follows the server's clock only, not its " +
+    "access point's. ESP32 boards only.\n" +
     "Batch (needs a storage card): the Wi-Fi radio is off between contacts and audio is kept on the card. At each contact the device " +
     "measures its clock again and uploads what it recorded, so the audio can still be placed in time; what it heard shows up to an interval later."));
 }

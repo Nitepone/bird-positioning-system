@@ -292,6 +292,8 @@ extern "C" bool port_beacon_take(port_beacon *out)
 static volatile uint8_t wifi_reason; // why the last connection or attempt ended
 static int wifi_retries;              // since the connection was lost
 static bool promiscuous_on;
+// port_wifi_power()'s level is in force (joining sets power saving off).
+static bool wifi_level_applied;
 // The access point last joined, to join it again straight away (no scan)
 // after the radio was off; `fast_join` while such a join is being tried.
 static uint8_t join_bssid[6];
@@ -366,6 +368,7 @@ static void wifi_resume(const char *ssid, const char *password, const char *host
 {
     radio_off = false;
     wifi_retries = 0;
+    wifi_level_applied = false;
     beacons_forget();
     WiFi.setHostname(hostname);
     WiFi.mode(WIFI_STA);
@@ -389,6 +392,70 @@ extern "C" bool port_wifi_off(void)
     memset(ap_bssid, 0, 6);
     beacons_forget();
     return ok;
+}
+
+// ---- Power saving (low-power live mode) ----
+//
+// The radio's level (port.h) is applied once connected, and again after each
+// (re)connect, since joining sets power saving off. Modem sleep is IDF's
+// "max" one: the radio wakes every listen interval (the driver's default, 3
+// beacons, unless set) rather than every DTIM. Beacon capture stays off below
+// FULL: promiscuous mode would keep the receiver on.
+
+static int wifi_level = PORT_WIFI_FULL;
+static bool cpu_low;
+
+#define CPU_MHZ 160
+#define CPU_LOW_MHZ 80 // the lowest the PLL gives: I2S (160 MHz PLL) and Wi-Fi keep working
+
+static void apply_wifi_level(void)
+{
+    if (wifi_level != PORT_WIFI_FULL && promiscuous_on)
+        set_promiscuous(false);
+    WiFi.setSleep(wifi_level == PORT_WIFI_SAVE ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE);
+    wifi_level_applied = true;
+}
+
+extern "C" bool port_wifi_power(int level)
+{
+    if (level == wifi_level && (wifi_level_applied || radio_off))
+        return true;
+    wifi_level = level;
+    wifi_level_applied = false;
+    if (!radio_off && WiFi.status() == WL_CONNECTED)
+        apply_wifi_level();
+    return true;
+}
+
+extern "C" void port_cpu_low(bool low)
+{
+    if (low == cpu_low)
+        return;
+    cpu_low = low;
+    setCpuFrequencyMhz(low ? CPU_LOW_MHZ : CPU_MHZ);
+}
+
+extern "C" void port_power_diag(char *out, size_t cap)
+{
+    const char *ps = "unknown";
+    switch (WiFi.getSleep()) {
+    case WIFI_PS_NONE:
+        ps = "off";
+        break;
+    case WIFI_PS_MIN_MODEM:
+        ps = "modem sleep (every DTIM)";
+        break;
+    case WIFI_PS_MAX_MODEM:
+        ps = "modem sleep (listen interval)";
+        break;
+    }
+    wifi_config_t wc = {};
+    int listen = -1;
+    if (!radio_off && esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK)
+        listen = wc.sta.listen_interval ? wc.sta.listen_interval : 3; // 0: the driver's default
+    snprintf(out, cap, "cpu %lu MHz, radio %s, power saving %s, listen interval %d, beacon capture %s",
+             (unsigned long)getCpuFrequencyMhz(), radio_off ? "off" : "on", ps, listen,
+             promiscuous_on ? "on" : "off");
 }
 
 extern "C" void port_idle_ms(uint32_t ms)
@@ -446,6 +513,7 @@ extern "C" void port_wifi_begin(const char *ssid, const char *password, const ch
     }
     WiFi.onEvent(on_wifi_event);
     started = true;
+    wifi_level_applied = false;
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
     // Power saving delays packets by tens of ms, which ruins clock measurement.
@@ -463,7 +531,9 @@ extern "C" bool port_wifi_up(void)
     if (up) {
         wifi_retries = 0;
         fast_join = false;
-        if (!promiscuous_on)
+        if (!wifi_level_applied)
+            apply_wifi_level();
+        if (!promiscuous_on && wifi_level == PORT_WIFI_FULL)
             set_promiscuous(true);
     }
     return up;
