@@ -55,6 +55,41 @@ void port_keep_command(int64_t id, bool restarting)
     restart_marked = restart_marked || restarting;
 }
 void port_restart(void) { restarts++; }
+// Firmware updates, as the ESP32 port has them: a build being installed is
+// kept (NVS) until confirmed or forgotten; the next boot is told how it went.
+static bool ota_supported = true;
+static port_ota_state ota_next_boot; // what port_ota_boot_info() says
+static int64_t ota_pending;          // the build id kept
+static int ota_confirms, ota_updates;
+static bool ota_update_works;
+static char ota_update_path[128];
+bool port_ota_supported(void) { return ota_supported; }
+void port_ota_boot_info(port_ota_state *out)
+{
+    *out = ota_next_boot;
+    memset(&ota_next_boot, 0, sizeof ota_next_boot);
+}
+void port_ota_confirm(void)
+{
+    ota_confirms++;
+    ota_pending = 0;
+}
+void port_ota_forget(void) { ota_pending = 0; }
+bool port_ota_update(const char *host, uint16_t port, const char *path, int64_t build_id,
+                     char *err, size_t err_cap)
+{
+    (void)host, (void)port;
+    ota_updates++;
+    ota_pending = build_id;
+    snprintf(ota_update_path, sizeof ota_update_path, "%s", path);
+    if (ota_update_works)
+        return true; // restarting into it
+    ota_pending = 0;
+    // HTTPUpdate's text can be long: the client reports 120 characters of it.
+    snprintf(err, err_cap, "Wrong HTTP Code: the server answered 404 for the firmware image, "
+                           "which it no longer has; and this sentence goes on beyond 120 chars");
+    return false;
+}
 static bool sd_busy;
 bool port_sd_idle(void) { return !sd_busy; }
 uint64_t port_mono_us(void) { return now_us; }
@@ -68,11 +103,34 @@ int port_wifi_rssi(void) { return -50; }
 void port_wifi_diag(char *out, size_t cap) { snprintf(out, cap, "fake"); }
 bool port_beacon_take(port_beacon *out) { (void)out; return false; }
 void port_idle_ms(uint32_t ms) { (void)ms; }
-bool port_i2c_begin(int sda, int scl, uint32_t hz) { (void)sda, (void)scl, (void)hz; return false; }
+// A MAX17048 battery gauge at 0x36, when `with_gauge`: a 3.7 V cell at
+// `gauge_centi` hundredths of a percent, charging if `gauge_charging`.
+static bool with_gauge;
+static int32_t gauge_centi = 8000;
+static bool gauge_charging;
+bool port_i2c_begin(int sda, int scl, uint32_t hz)
+{
+    (void)sda, (void)scl, (void)hz;
+    return with_gauge;
+}
 bool port_i2c_xfer(uint8_t a, const uint8_t *tx, size_t tn, uint8_t *rx, size_t rn)
 {
-    (void)a, (void)tx, (void)tn, (void)rx, (void)rn;
-    return false;
+    if (!with_gauge || a != 0x36 || tn < 1)
+        return false;
+    if (tn > 1)
+        return true; // a register written
+    uint16_t v = 0;
+    switch (tx[0]) {
+    case 0x08: v = 0x0012; break;                                 // version
+    case 0x02: v = (uint16_t)(3700000 / 78.125); break;           // 3.7 V
+    case 0x04: v = (uint16_t)((uint32_t)gauge_centi * 256 / 100); break; // charge
+    case 0x16: v = gauge_charging ? 0x0030 : 0xfff0; break;      // %/h
+    }
+    if (rn >= 2) {
+        rx[0] = (uint8_t)(v >> 8);
+        rx[1] = (uint8_t)v;
+    }
+    return true;
 }
 bool port_sd_begin(int sck, int miso, int mosi, int cs) { (void)sck, (void)miso, (void)mosi, (void)cs; return true; }
 void port_audio_start(uint32_t rate) { (void)rate; }
@@ -369,7 +427,10 @@ static void boot(bool model)
     s.sample_rate = RATE;
     s.ring_bytes = 1024 * 1024; // 10.9 s
     s.lookback_ms = 750;
-    s.buses = (bps_bus_settings){-1, -1, -1, -1, -1, ""};
+    s.buses = with_gauge ? (bps_bus_settings){5, 6, -1, -1, -1, "max17048@0x36"}
+                         : (bps_bus_settings){-1, -1, -1, -1, -1, ""};
+    s.build = NULL;
+    s.ota_min_battery = 50;
     bps_client_setup(&s);
     chunk_len = 9 * RATE;
     bps_trigger_config t;
@@ -902,6 +963,239 @@ static void test_a_reboot_closes_the_card_first(void)
     TEST_ASSERT_EQUAL_INT(2, restarts);
 }
 
+// ---- Firmware updates over the air ----
+
+static const bps_build BUILD = {"esp32-s3 on xiao-proto-rev0.1", NULL, "3c48fb8", true,
+                                "3c48fb8-dirty", "2026-11-12T23:10:00Z", NULL};
+
+#define OFFER "\"firmware_offer\":{\"firmware_build_id\":42," \
+              "\"firmware_url\":\"/api/v1/client/firmware/42.bin\",\"firmware_size\":1283456," \
+              "\"firmware_md5\":\"0123456789abcdef0123456789abcdef\"," \
+              "\"firmware_describe\":\"v1.3.0-2-g3c48fb8\"}"
+#define OFFER_REPLY "{\"mode\":{\"mode\":\"live\",\"interval_s\":300},\"commands\":[]," OFFER "}"
+
+static void ota_reset(void)
+{
+    ota_supported = true;
+    memset(&ota_next_boot, 0, sizeof ota_next_boot);
+    ota_pending = 0;
+    ota_confirms = ota_updates = 0;
+    ota_update_works = false;
+    ota_update_path[0] = 0;
+    with_gauge = false;
+    gauge_centi = 8000;
+    gauge_charging = false;
+    restarts = 0;
+}
+
+// The registration's body.
+static const char *registration_body(void)
+{
+    room = SIZE_MAX;
+    request_len = 0;
+    start_register();
+    for (int i = 0; i < 20 && reg_txn.state != TXN_DONE && reg_txn.state != TXN_FAILED; i++)
+        txn_poll(&reg_txn);
+    txn_reset(&reg_txn);
+    request[request_len < sizeof request ? request_len : sizeof request - 1] = 0;
+    const char *body = strstr((const char *)request, "\r\n\r\n");
+    TEST_ASSERT_NOT_NULL(body);
+    return body + 4;
+}
+
+static void test_registration_reports_the_build_and_ota(void)
+{
+    ota_reset();
+    boot(false);
+    cfg.build = &BUILD;
+    const char *body = registration_body();
+    TEST_ASSERT_NOT_NULL(strstr(
+        body, "\"build\":{\"hardware_id\":\"esp32-s3 on xiao-proto-rev0.1\",\"tag\":null,"
+              "\"commit\":\"3c48fb8\",\"dirty\":true,\"describe\":\"3c48fb8-dirty\","
+              "\"built_at\":\"2026-11-12T23:10:00Z\"},\"ota\":true}"));
+    TEST_ASSERT_NOT_NULL(strstr(body, "\"api_version\":\"" BPS_API_VERSION "\""));
+    // A board that cannot update itself (a Pico) says what it is, not "ota".
+    ota_supported = false;
+    boot(false);
+    cfg.build = &BUILD;
+    body = registration_body();
+    TEST_ASSERT_NOT_NULL(strstr(body, "\"build\":{"));
+    TEST_ASSERT_NULL(strstr(body, "\"ota\""));
+    // A build without an identity leaves it out.
+    cfg.build = NULL;
+    body = registration_body();
+    TEST_ASSERT_NULL(strstr(body, "\"build\""));
+    ota_reset();
+}
+
+static void test_a_board_without_updates_ignores_an_offer(void)
+{
+    ota_reset();
+    ota_supported = false;
+    boot(false);
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_INT(0, ota_updates);
+    const char *hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "firmware_status"));
+    ota_reset();
+}
+
+// The detail of the status in heartbeat `hb`.
+static const char *status_detail(const char *hb, char *out, size_t cap)
+{
+    if (!bps_json_string(hb, strlen(hb), "detail", out, cap))
+        out[0] = 0;
+    return out;
+}
+
+// An offer is taken once the upload in progress is done; a failed download
+// is reported until a heartbeat is delivered, and capture goes on.
+static void test_a_failed_update_is_reported_until_delivered(void)
+{
+    ota_reset();
+    boot(false);
+    gate_pass(); // an upload in progress
+    run_ms(100);
+    TEST_ASSERT_TRUE(bps_upload_sending());
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_TRUE(maint.rebooting);
+    TEST_ASSERT_TRUE(maint.updating);
+    TEST_ASSERT_EQUAL_INT(0, ota_updates);
+    // Waits for the upload (15 s at most), then installs.
+    run_ms(16000);
+    TEST_ASSERT_EQUAL_INT(1, ota_updates);
+    TEST_ASSERT_EQUAL_STRING("/api/v1/client/firmware/42.bin", ota_update_path);
+    TEST_ASSERT_EQUAL_INT(0, restarts);
+    TEST_ASSERT_FALSE(maint.rebooting);
+    TEST_ASSERT_FALSE(maint.updating);
+    TEST_ASSERT_NOT_EQUAL(ST_RUN, state); // connecting again
+    TEST_ASSERT_EQUAL_INT64(0, ota_pending);
+
+    char d[160];
+    const char *hb = heartbeat_answered(SERVER_ERROR);
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"firmware_status\":{\"build_id\":42,\"state\":\"failed\","));
+    TEST_ASSERT_EQUAL_INT(120, (int)strlen(status_detail(hb, d, sizeof d)));
+    TEST_ASSERT_EQUAL_STRING_LEN("Wrong HTTP Code: the server answered 404", d, 40);
+    // Not delivered: again. Delivered with an offer of the same build in the
+    // reply (the server had not taken the failure in yet): not taken.
+    hb = heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"state\":\"failed\""));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "firmware_status"));
+    // Offered again later (the server's selection changed): taken.
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_TRUE(maint.updating);
+    ota_reset();
+}
+
+// A successful download restarts into the new build, which runs on trial
+// until registered with audio flowing.
+static void test_an_update_restarts_and_the_new_build_confirms_itself(void)
+{
+    ota_reset();
+    ota_update_works = true;
+    boot(false);
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    run_ms(100);
+    TEST_ASSERT_EQUAL_INT(1, ota_updates);
+    TEST_ASSERT_EQUAL_INT64(42, ota_pending);
+    TEST_ASSERT_EQUAL_INT(2, maint.reboot_phase); // restarting
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_INT(1, ota_updates);
+
+    // The new build starts.
+    ota_next_boot = (port_ota_state){42, true, false};
+    boot(false);
+    TEST_ASSERT_TRUE(ota.trial);
+    // An offer of the build running on trial is not taken again.
+    const char *hb = heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_NULL(strstr(hb, "firmware_status"));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_INT(0, ota_confirms); // half a second of audio
+    run_ms(600);
+    TEST_ASSERT_EQUAL_INT(1, ota_confirms);
+    TEST_ASSERT_EQUAL_INT64(0, ota_pending);
+    run_ms(2000);
+    TEST_ASSERT_EQUAL_INT(1, ota_confirms);
+    ota_reset();
+}
+
+// The old build after a rollback reports it, across failed heartbeats.
+static void test_a_rollback_is_reported_until_delivered(void)
+{
+    ota_reset();
+    ota_pending = 42;
+    ota_next_boot = (port_ota_state){42, false, true};
+    boot(false);
+    TEST_ASSERT_FALSE(ota.trial);
+    const char *hb = heartbeat_answered(SERVER_ERROR);
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"firmware_status\":{\"build_id\":42,\"state\":\"rolled_back\""));
+    TEST_ASSERT_EQUAL_INT64(42, ota_pending); // kept until the server has it
+    hb = heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"state\":\"rolled_back\""));
+    TEST_ASSERT_EQUAL_INT64(0, ota_pending);
+    TEST_ASSERT_FALSE(maint.rebooting); // the build that was rolled back
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "firmware_status"));
+    ota_reset();
+}
+
+// A low battery that is not charging defers the update.
+static void test_a_low_battery_defers_an_update(void)
+{
+    ota_reset();
+    with_gauge = true;
+    gauge_centi = 3400;
+    boot(false);
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    char d[64];
+    const char *hb = heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"firmware_status\":{\"build_id\":42,\"state\":\"deferred\""));
+    TEST_ASSERT_EQUAL_STRING("battery 34%", status_detail(hb, d, sizeof d));
+    TEST_ASSERT_FALSE(maint.rebooting);
+    // No offer any more: nothing to report.
+    heartbeat_answered(ok_reply("{}"));
+    hb = heartbeat_answered(ok_reply("{}"));
+    TEST_ASSERT_NULL(strstr(hb, "firmware_status"));
+    // Charging: it goes ahead.
+    gauge_charging = true;
+    run_ms(11000); // the gauge's next reading
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_TRUE(maint.updating);
+    // So does a charged battery.
+    gauge_charging = false;
+    gauge_centi = 5000;
+    boot(false);
+    heartbeat_answered(ok_reply(OFFER_REPLY));
+    TEST_ASSERT_TRUE(maint.updating);
+    ota_reset();
+}
+
+// In batch mode, an offer in the contact's last heartbeat keeps the radio on
+// for the update.
+static void test_an_update_in_batch_mode_keeps_the_radio_on(void)
+{
+    ota_reset();
+    ota_update_works = true;
+    boot(false);
+    mode.run = MODE_BATCH;
+    mode.want = MODE_BATCH;
+    mode.contact_us = now_us;
+    mode.phase = C_FINAL;
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"batch\",\"interval_s\":300}," OFFER "}"));
+    TEST_ASSERT_TRUE(maint.updating);
+    TEST_ASSERT_NOT_EQUAL(ST_OFF, state);
+    run_ms(200);
+    TEST_ASSERT_EQUAL_INT(1, ota_updates);
+    TEST_ASSERT_NOT_EQUAL(ST_OFF, state);
+    ota_reset();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -917,5 +1211,12 @@ int main(void)
     RUN_TEST(test_stored_uploads_and_a_model_being_loaded_keep_to_their_reads);
     RUN_TEST(test_a_spool_pass_waits_for_a_model_to_load);
     RUN_TEST(test_a_chunk_saved_during_a_pass_is_not_swept_up);
+    RUN_TEST(test_registration_reports_the_build_and_ota);
+    RUN_TEST(test_a_board_without_updates_ignores_an_offer);
+    RUN_TEST(test_a_failed_update_is_reported_until_delivered);
+    RUN_TEST(test_an_update_restarts_and_the_new_build_confirms_itself);
+    RUN_TEST(test_a_rollback_is_reported_until_delivered);
+    RUN_TEST(test_a_low_battery_defers_an_update);
+    RUN_TEST(test_an_update_in_batch_mode_keeps_the_radio_on);
     return UNITY_END();
 }

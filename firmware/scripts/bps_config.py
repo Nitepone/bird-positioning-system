@@ -13,6 +13,7 @@ Used two ways:
     bps_config.py max-lookback RING_KB the longest look-back a ring buffer allows
     bps_config.py drivers              device kinds for DEVICES: kind, bus, what it is
     bps_config.py version              the firmware version from git (or $BPS_GIT_DESCRIBE)
+    bps_config.py identity             the build's git identity (shell), for ./build.sh --docker
 """
 
 import os
@@ -20,6 +21,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 SAMPLE_RATE = 48000
 
@@ -117,12 +119,13 @@ COMMON_DEFAULTS = {
     "SPI_MISO": "none",
     "SPI_MOSI": "none",
     "DEVICES": "",
+    "OTA_MIN_BATTERY": "50",
 }
 
 KEYS = ["BOARD", "WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST", "SERVER_PORT", "CLIENT_NAME",
         "I2S_BCLK", "I2S_WS", "I2S_DATA", "MIC_CHANNEL", "BUTTON_PIN", "LED_PIN",
         "I2C_SDA", "I2C_SCL", "SPI_SCK", "SPI_MISO", "SPI_MOSI", "DEVICES",
-        "LOOKBACK_MS", "RING_KB", "DEVICE_NAME", "CLIENT_ID"]
+        "LOOKBACK_MS", "RING_KB", "DEVICE_NAME", "CLIENT_ID", "OTA_MIN_BATTERY"]
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -303,6 +306,11 @@ def validate(cfg):
     if len(nums) != len(set(nums)):
         errors.append("the microphone, bus, chip select, button and LED pins must all be different")
 
+    ota = cfg.get("OTA_MIN_BATTERY", "")
+    if not ota.isdigit() or int(ota) > 100:
+        errors.append("OTA_MIN_BATTERY must be 0-100 (the battery charge, in %, a firmware "
+                      "update needs)")
+
     ring = cfg.get("RING_KB", "")
     lookback = cfg.get("LOOKBACK_MS", "")
     if not ring.isdigit() or not 32 <= int(ring) <= 1024:
@@ -336,6 +344,7 @@ def defines(cfg):
         ("BPS_LED_PIN", pin_value(cfg["LED_PIN"]), False),
         ("BPS_LOOKBACK_MS", int(cfg["LOOKBACK_MS"]), False),
         ("BPS_RING_BYTES", int(cfg["RING_KB"]) * 1024, False),
+        ("BPS_OTA_MIN_BATTERY", int(cfg.get("OTA_MIN_BATTERY") or 50), False),
     ] + [(f"BPS_{k}", pin_value(cfg[k]), False) for keys in BUS_KEYS.values() for k in keys] + [
         ("BPS_DEVICES", format_devices(parse_devices(cfg.get("DEVICES", ""))), True),
     ]
@@ -368,6 +377,12 @@ def cli(argv):
             print(f"{kind}\t{d['bus']}\t{d['about']}")
     elif cmd == "version":
         print(git_describe(os.path.dirname(os.path.abspath(__file__))))
+    elif cmd == "identity":
+        ident = build_identity(os.path.dirname(os.path.abspath(__file__)))
+        sys.stdout.write(shell({
+            "BPS_GIT_DESCRIBE": ident["describe"], "BPS_GIT_COMMIT": ident["commit"],
+            "BPS_GIT_TAG": ident["tag"] or "", "BPS_GIT_DIRTY": "1" if ident["dirty"] else "0",
+        }))
     elif cmd == "max-lookback" and len(argv) == 3 and argv[2].isdigit():
         print(max_lookback_ms(int(argv[2])))
     elif (cmd in ("write", "check") and len(argv) == 3) or (cmd == "check-env" and len(argv) == 2):
@@ -391,6 +406,20 @@ def cli(argv):
     return 0
 
 
+def sanitize(text):
+    """`text` safe in a C string and a JSON one: no quotes, backslashes or control characters."""
+    return re.sub(r"[^A-Za-z0-9._+/-]", "_", text.strip())
+
+
+def git(project_dir, *args):
+    """Output of a git command in the project, or None if git cannot tell."""
+    try:
+        return subprocess.run(["git", "-C", project_dir, *args], capture_output=True, text=True,
+                              timeout=30, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def git_describe(project_dir):
     """What the firmware reports as its version: `git describe --tags --always --dirty`.
 
@@ -399,15 +428,65 @@ def git_describe(project_dir):
     """
     described = os.environ.get("BPS_GIT_DESCRIBE", "").strip()
     if not described:
-        try:
-            described = subprocess.run(
-                ["git", "-C", project_dir, "describe", "--tags", "--always", "--dirty"],
-                capture_output=True, text=True, timeout=30, check=True,
-            ).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            described = ""
-    # It goes into a C string and a JSON one.
-    return re.sub(r"[^A-Za-z0-9._+/-]", "_", described) or "unknown"
+        described = git(project_dir, "describe", "--tags", "--always", "--dirty") or ""
+    return sanitize(described) or "unknown"
+
+
+def build_identity(project_dir):
+    """The build's identity from git: describe, the short commit, whether the tree is dirty
+    (as describe's -dirty says), and the tag HEAD is exactly at on a clean tree (else None).
+
+    $BPS_GIT_DESCRIBE, $BPS_GIT_COMMIT, $BPS_GIT_TAG (empty: none) and $BPS_GIT_DIRTY (0/1)
+    win when set: ./build.sh --docker works them out on the host (`identity`).
+    """
+    describe = git_describe(project_dir)
+    if "BPS_GIT_COMMIT" in os.environ:
+        commit = os.environ["BPS_GIT_COMMIT"]
+        dirty = os.environ.get("BPS_GIT_DIRTY", "0").strip() in ("1", "true", "yes")
+        tag = os.environ.get("BPS_GIT_TAG", "")
+    else:
+        commit = git(project_dir, "rev-parse", "--short", "HEAD") or ""
+        dirty = describe.endswith("-dirty")
+        tag = git(project_dir, "describe", "--tags", "--exact-match", "HEAD") or ""
+    tag = sanitize(tag)
+    return {
+        "describe": describe,
+        "commit": sanitize(commit) or "unknown",
+        "dirty": dirty,
+        "tag": tag if tag and not dirty else None,
+    }
+
+
+def build_time():
+    """Now, UTC, to the second: when the firmware was built."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def hardware_id(env):
+    """BPS_HW_ID from the environment's build_flags in platformio.ini, or None."""
+    flags = env.ParseFlags(env.GetProjectOption("build_flags", ""))
+    for d in flags.get("CPPDEFINES", []):
+        if isinstance(d, (list, tuple)) and d[0].strip() == "BPS_HW_ID":
+            return str(d[1]).strip().strip('"').replace('\\"', "").replace("\\", "")
+    return None
+
+
+HW_ID_RE = re.compile(r"^[A-Za-z0-9 ._+/-]{1,64}$")
+
+
+def build_info_defines(env, ident, built):
+    """Defines for src/build_info.c only (its build time changes on every build, and
+    with it this one file's command line, so SCons rebuilds just that file)."""
+    tag = ident["tag"]
+    return [
+        ("BPS_BUILD_TAG", env.StringifyMacro(tag or "")),
+        ("BPS_BUILD_TAG_JSON", env.StringifyMacro(f'"{tag}"' if tag else "null")),
+        ("BPS_BUILD_COMMIT", env.StringifyMacro(ident["commit"])),
+        ("BPS_BUILD_DIRTY", 1 if ident["dirty"] else 0),
+        ("BPS_BUILD_TIME", env.StringifyMacro(built)),
+        # esp_app_desc_t.version holds 31 characters.
+        ("BPS_APP_VERSION", env.StringifyMacro(ident["describe"][:31])),
+    ]
 
 
 def scons(env):
@@ -428,15 +507,32 @@ def scons(env):
     errors = validate(cfg)
     if not errors and cfg["BOARD"] != name:
         errors.append(f"it is for BOARD={cfg['BOARD']}; build with: pio run -e {cfg['BOARD']}")
+    hw = hardware_id(env)
+    if hw is None:
+        errors.append(f"platformio.ini: [env:{name}] needs a hardware id in its build_flags, "
+                      "e.g. '-DBPS_HW_ID=\"esp32-s3 on xiao-proto-rev0.1\"'")
+    elif not HW_ID_RE.match(hw):
+        errors.append(f"platformio.ini: [env:{name}]: BPS_HW_ID {hw!r} must be 1-64 letters, "
+                      "digits, spaces and ._+/-")
     if errors:
         sys.stderr.write(f"bps: {path}:\n  " + "\n  ".join(errors) + "\n")
         env.Exit(1)
         return
     print(f"bps: using {path} ({cfg['BOARD']}, server {cfg['SERVER_HOST']}:{cfg['SERVER_PORT']})")
-    version = git_describe(env["PROJECT_DIR"])
-    print(f"bps: firmware version bps-mcu {version}")
+    ident = build_identity(env["PROJECT_DIR"])
+    version = ident["describe"]
+    built = build_time()
+    print(f"bps: firmware version bps-mcu {version} (commit {ident['commit']}, tag "
+          f"{ident['tag'] or 'none'}, {'dirty' if ident['dirty'] else 'clean'}), hardware "
+          f"{hw!r}, built {built}")
     env.Append(CPPDEFINES=[(n, env.StringifyMacro(v) if s else v) for n, v, s in defines(cfg)])
     env.Append(CPPDEFINES=[("BPS_GIT_DESCRIBE", env.StringifyMacro(version))])
+    extra = build_info_defines(env, ident, built)
+
+    def with_build_info(env, node):
+        return env.Object(node, CPPDEFINES=list(env["CPPDEFINES"]) + extra)
+
+    env.AddBuildMiddleware(with_build_info, "*build_info.c")
 
 
 try:

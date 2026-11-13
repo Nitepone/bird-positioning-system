@@ -118,6 +118,24 @@ extern "C" void port_restart(void)
         tight_loop_contents();
 }
 
+// ---- Firmware updates: not on the Pico boards (they neither advertise nor take them) ----
+
+extern "C" bool port_ota_supported(void) { return false; }
+
+extern "C" void port_ota_boot_info(port_ota_state *out) { memset(out, 0, sizeof *out); }
+
+extern "C" void port_ota_confirm(void) {}
+
+extern "C" void port_ota_forget(void) {}
+
+extern "C" bool port_ota_update(const char *host, uint16_t port, const char *path,
+                                int64_t build_id, char *err, size_t err_cap)
+{
+    (void)host, (void)port, (void)path, (void)build_id;
+    snprintf(err, err_cap, "this board cannot update itself");
+    return false;
+}
+
 extern "C" void port_wifi_begin(const char *ssid, const char *password, const char *hostname)
 {
     WiFi.mode(WIFI_STA);

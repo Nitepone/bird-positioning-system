@@ -8,6 +8,8 @@ extern "C" {
 #include "board_config.h"
 
 extern "C" void port_board_init(void);
+// What this build is (build_info.c).
+extern "C" const bps_build bps_build_this;
 
 void setup()
 {
@@ -27,6 +29,8 @@ void setup()
         BPS_RING_BYTES,
         BPS_LOOKBACK_MS,
         {BPS_I2C_SDA, BPS_I2C_SCL, BPS_SPI_SCK, BPS_SPI_MISO, BPS_SPI_MOSI, BPS_DEVICES},
+        &bps_build_this,
+        BPS_OTA_MIN_BATTERY,
     };
     bps_client_setup(&settings);
 }

@@ -182,3 +182,19 @@ void bps_devices_describe(char *out, size_t cap)
         len += (size_t)w;
     }
 }
+
+bool bps_devices_battery(int32_t *centi_percent, int32_t *centi_pct_per_h)
+{
+    for (size_t i = 0; i < n_devs; i++) {
+        const bps_device *d = &devs[i];
+        if (strcmp(d->drv->role, "battery") != 0 || !d->present)
+            continue;
+        const bps_max17048 *g = &d->u.gauge;
+        if (!g->valid || !g->battery)
+            continue;
+        *centi_percent = g->centi_percent;
+        *centi_pct_per_h = g->centi_pct_per_h;
+        return true;
+    }
+    return false;
+}

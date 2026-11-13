@@ -9,6 +9,7 @@
 #include "capture.h"
 #include "devices.h"
 #include "logbuf.h"
+#include "ota.h"
 #include "port.h"
 #include "proto.h"
 #include "record.h"
@@ -117,7 +118,7 @@ static txn reg_txn, hb_txn, pos_txn, val_txn;
  * others are small. A heartbeat's body is written in place, after room for
  * the request head (txn_start_at). */
 #define HB_HEAD_ROOM 320
-static char reg_tx[1024], hb_tx[4096], pos_tx[512], val_tx[768];
+static char reg_tx[1536], hb_tx[4096], pos_tx[512], val_tx[768];
 static char reg_rx[768], hb_rx[1024], pos_rx[768], val_rx[768];
 static uint64_t reg_next_us, reg_delay_us, hb_next_us, status_next_us;
 static bool hb_failing;
@@ -322,9 +323,11 @@ static bool txn_unknown(const txn *t) { return t->state == TXN_DONE && t->resp.s
 
 /* ---- Registration ---- */
 
+static bool ota_advertised(void);
+
 static void start_register(void)
 {
-    static char body[640];
+    static char body[1152];
     char path[64];
     bps_json j;
     bps_json_init(&j, body, sizeof body);
@@ -343,7 +346,14 @@ static void start_register(void)
     if (cfg.name[0]) {
         bps_json_str(&j, "name", cfg.name);
     }
+    if (cfg.build)
+        bps_build_json(&j, cfg.build);
+    /* Only where the board can update itself (not the Pico boards). */
+    if (ota_advertised())
+        bps_json_bool(&j, "ota", true);
     bps_json_raw(&j, "}");
+    if (j.overflow)
+        port_log("registration: too long for its buffer; not sent");
     path_for(path, sizeof path, NULL);
     txn_start(&reg_txn, "registration", path, body, j.overflow ? 0 : j.len);
 }
@@ -788,6 +798,7 @@ static void timesync_poll(uint64_t now)
 /* ---- Operation modes ---- */
 
 static bool synced(void);
+static bool closing_down(void);
 
 static void radio_account(uint64_t now, bool on)
 {
@@ -917,8 +928,8 @@ static void wake(uint64_t now)
 /* A contact's steps once registered (batch mode). */
 static void contact_poll(uint64_t now)
 {
-    if (mode.run != MODE_BATCH)
-        return;
+    if (mode.run != MODE_BATCH || closing_down())
+        return; /* for an update the radio stays on */
     bool over = now - mode.contact_us > CONTACT_MAX_US;
     if (!card_has_room()) {
         /* Audio would be lost with the radio off: upload it as it comes. */
@@ -964,7 +975,7 @@ static void contact_poll(uint64_t now)
 /* A contact that cannot get as far as registering waits for the next. */
 static void contact_connect_poll(uint64_t now)
 {
-    if (mode.run == MODE_BATCH && now - mode.contact_us > CONTACT_CONNECT_US) {
+    if (mode.run == MODE_BATCH && !closing_down() && now - mode.contact_us > CONTACT_CONNECT_US) {
         port_log("contact: could not reach the server; trying again at the next contact");
         go_off(now);
     }
@@ -1048,7 +1059,8 @@ static struct {
     uint32_t n_answered;
     int boot_reason;
     bool boot_reported, boot_sending;
-    bool rebooting;
+    bool rebooting; /* closing down: to restart, or (`updating`) to install an update */
+    bool updating;
     int reboot_phase; /* 0: letting an upload finish; 1: closing the card; 2: restarting */
     uint64_t reboot_us;
     uint64_t log_until_us;
@@ -1217,18 +1229,24 @@ static void commands_reply(const char *body, size_t len, uint64_t now)
         command_run(body + c[i].obj, c[i].len, c[i].id, now);
 }
 
-/* Restarting, once asked: true while the client is closing down, and the
- * rest of the loop is left alone. */
+static bool ota_install(uint64_t now);
+
+/* Restarting or updating: the radio stays on, and no new work starts. */
+static bool closing_down(void) { return maint.rebooting; }
+
+/* Restarting, or installing an update, once asked: true while the client is
+ * closing down, and the rest of the loop is left alone. */
 static bool reboot_poll(uint64_t now)
 {
     if (!maint.rebooting)
         return false;
+    const char *what = maint.updating ? "update" : "reboot";
     if (maint.reboot_phase == 0) {
         bool busy = bps_upload_sending() || bps_spool_busy();
         if (busy && now - maint.reboot_us < REBOOT_UPLOAD_WAIT_US)
             return false; /* the loop goes on meanwhile */
         if (busy)
-            port_log("reboot: giving up the upload in progress");
+            port_log("%s: giving up the upload in progress", what);
         drop_connections();
         port_sd_close();
         maint.reboot_phase = 1;
@@ -1238,12 +1256,183 @@ static bool reboot_poll(uint64_t now)
         if (!port_sd_idle() && now - maint.reboot_us < REBOOT_CARD_WAIT_US)
             return true;
         if (!port_sd_idle())
-            port_log("reboot: the SD card's queue is still being written; restarting anyway");
+            port_log("%s: the SD card's queue is still being written; going on anyway", what);
+        if (maint.updating) {
+            if (ota_install(now))
+                maint.reboot_phase = 2; /* restarting into the new firmware */
+            return true;
+        }
         port_log("reboot: restarting");
         maint.reboot_phase = 2;
         port_restart();
     }
     return true;
+}
+
+/* ---- Firmware updates over the air ----
+ *
+ * Heartbeat replies offer another build while the server wants this client
+ * to run it (ota.h). The client takes the offer unless its battery is low
+ * (then it says so, `deferred`, and the server offers again), closes down as
+ * for a reboot (the upload in progress, the card), and the board downloads
+ * the build into its other app slot and restarts into it (port_ota_update()).
+ * A new build runs on trial: it confirms itself once registered with audio
+ * flowing; if the board restarts before that, the bootloader goes back to the
+ * old one, which then reports `rolled_back`. A failed download is reported
+ * `failed`. Each status goes in every heartbeat until one is delivered. */
+
+static struct {
+    bool supported;
+    bool trial; /* running build `trial_id`, which has yet to confirm itself */
+    int64_t trial_id;
+    bps_ota_offer offer; /* being installed */
+    /* The status to report, and which of them the heartbeat in flight has. */
+    bool has_status;
+    uint32_t gen, sending_gen;
+    int64_t status_id;
+    char state[16];
+    char detail[BPS_OTA_DETAIL_MAX + 1];
+    /* An offer of the build whose failure was just delivered is not taken
+     * (the server stops offering it once it has the failure). */
+    int64_t skip_id;
+    /* The latest deferral logged. */
+    int64_t deferred_id;
+    char deferred[32];
+} ota;
+
+static bool ota_advertised(void) { return ota.supported; }
+
+static void ota_status(int64_t id, const char *state, const char *detail)
+{
+    ota.has_status = true;
+    ota.gen++;
+    ota.status_id = id;
+    snprintf(ota.state, sizeof ota.state, "%s", state);
+    snprintf(ota.detail, sizeof ota.detail, "%s", detail ? detail : "");
+}
+
+static void ota_setup(void)
+{
+    char t[24];
+    memset(&ota, 0, sizeof ota);
+    ota.supported = port_ota_supported();
+    if (!ota.supported)
+        return;
+    port_ota_state st;
+    port_ota_boot_info(&st);
+    if (st.rolled_back) {
+        char detail[BPS_OTA_DETAIL_MAX + 1];
+        snprintf(detail, sizeof detail, "did not confirm itself; back on %s", cfg.version);
+        port_log("update: build %s did not confirm itself; the board went back to this firmware",
+                 id_text(t, st.build_id));
+        ota_status(st.build_id, "rolled_back", detail);
+    } else if (st.trial) {
+        ota.trial = true;
+        ota.trial_id = st.build_id;
+        port_log("update: running build %s on trial; it is kept once registered with audio "
+                 "flowing",
+                 id_text(t, st.build_id));
+    }
+}
+
+/* Once registered with audio flowing, a new build is kept. */
+static void ota_confirm_poll(void)
+{
+    if (!ota.trial || state != ST_RUN || !capturing ||
+        bps_ring_written(&ring) < cfg.sample_rate)
+        return;
+    char t[24];
+    port_ota_confirm();
+    ota.trial = false;
+    port_log("update: build %s is registered with audio flowing; keeping it",
+             id_text(t, ota.trial_id));
+}
+
+static void ota_json(bps_json *j)
+{
+    ota.sending_gen = ota.has_status ? ota.gen : 0;
+    if (ota.has_status)
+        bps_ota_status_json(j, ota.status_id, ota.state, ota.detail);
+}
+
+/* The server has the heartbeat (2xx). */
+static void ota_delivered(void)
+{
+    if (!ota.has_status || !ota.sending_gen || ota.sending_gen != ota.gen)
+        return;
+    ota.has_status = false;
+    if (strcmp(ota.state, "deferred") != 0)
+        ota.skip_id = ota.status_id;
+    if (strcmp(ota.state, "rolled_back") == 0)
+        port_ota_forget();
+}
+
+/* An offer in a heartbeat reply. */
+static void ota_reply(const char *body, size_t len, uint64_t now)
+{
+    int64_t skip = ota.skip_id;
+    ota.skip_id = 0;
+    bps_ota_offer o;
+    if (!bps_ota_offer_parse(body, len, &o))
+        return;
+    if (!ota.supported || maint.rebooting || o.build_id == skip ||
+        (ota.trial && o.build_id == ota.trial_id))
+        return;
+    char t[24], detail[32];
+    bps_battery_reading b = {0};
+    int32_t rate = 0;
+    b.present = bps_devices_battery(&b.centi_percent, &rate);
+    b.charging = rate > 0;
+    if (!bps_ota_battery_ok(&b, cfg.ota_min_battery, detail, sizeof detail)) {
+        if (o.build_id != ota.deferred_id || strcmp(detail, ota.deferred) != 0)
+            port_log("update: build %s (%s) offered; not now: %s, under the %d%% needed",
+                     id_text(t, o.build_id), o.describe[0] ? o.describe : "?", detail,
+                     cfg.ota_min_battery);
+        ota.deferred_id = o.build_id;
+        snprintf(ota.deferred, sizeof ota.deferred, "%s", detail);
+        ota_status(o.build_id, "deferred", detail);
+        return;
+    }
+    ota.deferred_id = 0;
+    ota.offer = o;
+    maint.rebooting = true;
+    maint.updating = true;
+    maint.reboot_phase = 0;
+    maint.reboot_us = now;
+    port_log("update: build %s (%s, %ld bytes) offered; installing once the upload in progress "
+             "is done",
+             id_text(t, o.build_id), o.describe[0] ? o.describe : "?", (long)o.size);
+}
+
+/* Downloads and installs the offered build: true if the board is restarting
+ * into it, else the client goes on with this firmware. */
+static bool ota_install(uint64_t now)
+{
+    char t[24], err[BPS_OTA_DETAIL_MAX + 1] = "";
+    const bps_ota_offer *o = &ota.offer;
+    if (!port_wifi_up()) {
+        port_log("update: Wi-Fi is down; build %s waits for a later offer",
+                 id_text(t, o->build_id));
+    } else {
+        port_log("update: downloading build %s from %s:%u%s", id_text(t, o->build_id),
+                 cfg.server_host, (unsigned)cfg.server_port, o->url);
+        if (port_ota_update(cfg.server_host, cfg.server_port, o->url, o->build_id, err,
+                            sizeof err))
+            return true;
+        if (!err[0])
+            snprintf(err, sizeof err, "update failed");
+        port_log("update: build %s failed: %s", id_text(t, o->build_id), err);
+        ota_status(o->build_id, "failed", err);
+    }
+    /* Back to work: connect again (a batch contact starts over). */
+    maint.rebooting = false;
+    maint.updating = false;
+    maint.reboot_phase = 0;
+    drop_connections();
+    if (mode.run == MODE_BATCH)
+        mode.contact_us = now;
+    set_state(ST_WIFI);
+    return false;
 }
 
 /* What the heartbeat says of maintenance: acknowledgements, why the board
@@ -1312,6 +1501,7 @@ static void heartbeat_reply(uint64_t now)
     if (capturing && (has_t || has_v))
         apply_trigger(&t, &v);
     commands_reply(body, len, now);
+    ota_reply(body, len, now);
     char m[16];
     double interval = mode.interval_s;
     if (!bps_json_string(body, len, "mode", m, sizeof m))
@@ -1459,6 +1649,7 @@ static void start_heartbeat(uint64_t now)
         }
         bps_json_i64(&j, "chunks_rejected", (int64_t)stats.chunks_rejected);
     }
+    ota_json(&j);
     maint_json(&j, now);
     bps_json_raw(&j, "}");
     mode.final_hb = mode.run == MODE_BATCH && mode.phase == C_FINAL;
@@ -1485,6 +1676,7 @@ static void heartbeat_poll(uint64_t now)
             port_log("heartbeat: delivered again");
         hb_failing = false;
         maint_delivered(now);
+        ota_delivered();
         heartbeat_reply(now);
     } else if (txn_unknown(&hb_txn)) {
         port_log("server forgot this client; re-registering");
@@ -1501,7 +1693,7 @@ static void heartbeat_poll(uint64_t now)
      * asked for live mode. */
     if (mode.final_hb) {
         mode.final_hb = false;
-        if (mode.run == MODE_BATCH && mode.phase == C_FINAL && !need_register)
+        if (mode.run == MODE_BATCH && mode.phase == C_FINAL && !need_register && !closing_down())
             go_off(now);
     }
 }
@@ -1730,7 +1922,14 @@ void bps_client_setup(const bps_settings *s)
     pos_txn.rx = pos_rx, pos_txn.rx_cap = sizeof pos_rx;
     port_log("bps client %s on %s, id %s, %lu bytes free", cfg.version, cfg.board, id_str,
              (unsigned long)port_free_heap());
+    if (cfg.build && cfg.build->info)
+        port_log("build: %s", cfg.build->info);
+    else if (cfg.build)
+        port_log("build: %s, commit %s%s, built %s, for %s", cfg.build->describe,
+                 cfg.build->commit, cfg.build->dirty ? " (dirty)" : "", cfg.build->built_at,
+                 cfg.build->hardware_id);
     maint_setup();
+    ota_setup();
     bps_devices_setup(&cfg.buses);
     port_wifi_begin(cfg.wifi_ssid, cfg.wifi_password, hostname);
     set_state(ST_WIFI);
@@ -1793,6 +1992,7 @@ void bps_client_loop(void)
         live_spool_poll(now);
         bps_spool_poll(now);
         report_poll();
+        ota_confirm_poll();
         diag_loop_part("stored uploads");
         if (state == ST_RUN)
             contact_poll(now);

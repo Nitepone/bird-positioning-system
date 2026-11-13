@@ -23,3 +23,4 @@ SPI_MOSI=none
 DEVICES=none                # e.g. 'max17048@0x36 sd@2' (battery gauge, microSD card)
 LOOKBACK_MS=750             # audio kept before the sound that opened the gate
 RING_KB=160                 # RAM asked for the ring buffer
+OTA_MIN_BATTERY=50          # ESP32: battery % an over-the-air update needs, unless charging

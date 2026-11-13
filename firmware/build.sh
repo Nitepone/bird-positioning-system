@@ -96,7 +96,7 @@ pio_run() {
         local a
         for a in "${extra[@]}"; do
             case $a in
-                BPS_CONF=* | BPS_GIT_DESCRIBE=*) args+=(-e "$a") ;;
+                BPS_CONF=* | BPS_GIT_*=*) args+=(-e "$a") ;;
                 *) args+=("$a") ;;
             esac
         done
@@ -136,11 +136,22 @@ if [[ $runner == docker ]]; then
     fi
 fi
 
-# The firmware's version, from git: the container cannot see .git, so it is
-# worked out here and handed in (bps_config.py prefers it to running git).
+# The firmware's version and build identity (describe, commit, tag, dirty),
+# from git: the container cannot see .git, so they are worked out here and
+# handed in (bps_config.py prefers them to running git). Set BPS_GIT_DESCRIBE
+# (and BPS_GIT_COMMIT, BPS_GIT_TAG, BPS_GIT_DIRTY) to override.
 version_env=()
 if [[ $runner == docker ]]; then
-    version_env=(BPS_GIT_DESCRIBE="${BPS_GIT_DESCRIBE:-$("${cfgpy[@]}" version)}")
+    if [[ -z ${BPS_GIT_COMMIT:-} ]]; then
+        eval "$(env -u BPS_GIT_DESCRIBE "${cfgpy[@]}" identity | sed 's/^/ident_/')"
+        BPS_GIT_DESCRIBE=${BPS_GIT_DESCRIBE:-$ident_BPS_GIT_DESCRIBE}
+        BPS_GIT_COMMIT=$ident_BPS_GIT_COMMIT
+        BPS_GIT_TAG=$ident_BPS_GIT_TAG
+        BPS_GIT_DIRTY=$ident_BPS_GIT_DIRTY
+    fi
+    version_env=(BPS_GIT_DESCRIBE="${BPS_GIT_DESCRIBE:-$("${cfgpy[@]}" version)}"
+        BPS_GIT_COMMIT="$BPS_GIT_COMMIT" BPS_GIT_TAG="${BPS_GIT_TAG:-}"
+        BPS_GIT_DIRTY="${BPS_GIT_DIRTY:-0}")
 fi
 
 # ---- Build ----

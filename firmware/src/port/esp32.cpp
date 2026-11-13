@@ -4,6 +4,7 @@
 #if defined(ARDUINO_ARCH_ESP32)
 
 #include <Arduino.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
@@ -14,6 +15,7 @@
 #include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
+#include <esp_ota_ops.h>
 #include <esp_private/wifi.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -484,6 +486,8 @@ extern "C" void port_wifi_diag(char *out, size_t cap)
 #define DMA_DESCS 8
 
 static i2s_chan_handle_t rx;
+// Set while a firmware update has capture stopped (port_ota_update()).
+static volatile bool capture_paused;
 
 // When each DMA buffer completed, stamped in the I2S interrupt: far less
 // delayed than the capture task's wake-up. The driver hands buffers to reads
@@ -522,8 +526,11 @@ static void capture_task(void *)
     uint32_t reads = 0;
     for (;;) {
         size_t got = 0;
-        if (i2s_channel_read(rx, buf, sizeof buf, &got, portMAX_DELAY) != ESP_OK ||
-            got < 2 * sizeof(slot_t))
+        if (i2s_channel_read(rx, buf, sizeof buf, &got, portMAX_DELAY) != ESP_OK) {
+            vTaskDelay(1); // the channel is stopped (a firmware update): rest
+            continue;
+        }
+        if (got < 2 * sizeof(slot_t) || capture_paused)
             continue;
         uint64_t t = port_mono_us();
         uint32_t k = reads++ + __atomic_load_n(&isr_dropped, __ATOMIC_ACQUIRE);
@@ -1030,6 +1037,130 @@ extern "C" bool port_button(void)
 #else
     return false;
 #endif
+}
+
+// ---- Firmware updates over the air ----
+//
+// HTTPUpdate downloads the image into the other app slot (checking the
+// server's x-MD5) and makes it the one to boot. The bootloader's rollback
+// (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE in the prebuilt libraries) starts it
+// on trial: verifyRollbackLater() below keeps the Arduino core from confirming
+// it at boot, so the client confirms it once registered with audio flowing
+// (port_ota_confirm()), and a restart before that returns to the old image.
+// NVS remembers the build being installed, the slot it was installed from,
+// and whether it was flashed, so the old image can tell it was rolled back to.
+
+// Keep a new image on trial (ESP_OTA_IMG_PENDING_VERIFY) past the core's boot.
+extern "C" bool verifyRollbackLater(void) { return true; }
+
+#define OTA_NVS "bps"
+#define OTA_KEY_ID "ota_id"
+#define OTA_KEY_FROM "ota_from"
+#define OTA_KEY_FLASHED "ota_flashed"
+
+extern "C" bool port_ota_supported(void) { return true; }
+
+extern "C" void port_ota_forget(void)
+{
+    Preferences nvs;
+    if (nvs.begin(OTA_NVS, false)) {
+        nvs.remove(OTA_KEY_ID);
+        nvs.remove(OTA_KEY_FROM);
+        nvs.remove(OTA_KEY_FLASHED);
+        nvs.end();
+    }
+}
+
+extern "C" void port_ota_boot_info(port_ota_state *out)
+{
+    memset(out, 0, sizeof *out);
+    int64_t id = 0;
+    uint32_t from = 0;
+    bool flashed = false;
+    Preferences nvs;
+    if (nvs.begin(OTA_NVS, true)) {
+        id = nvs.getLong64(OTA_KEY_ID, 0);
+        from = nvs.getUInt(OTA_KEY_FROM, 0);
+        flashed = nvs.getBool(OTA_KEY_FLASHED, false);
+        nvs.end();
+    }
+    if (id <= 0)
+        return;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (running && running->address != from) {
+        // The new image: on trial until it confirms itself.
+        if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
+            st == ESP_OTA_IMG_PENDING_VERIFY) {
+            out->build_id = id;
+            out->trial = true;
+            return;
+        }
+        port_ota_forget(); // kept already
+        return;
+    }
+    if (flashed) {
+        // Flashed and restarted into, yet this is the old image: rolled back.
+        out->build_id = id;
+        out->rolled_back = true;
+        return;
+    }
+    port_ota_forget(); // the update never got as far as flashing (power lost meanwhile)
+}
+
+extern "C" void port_ota_confirm(void)
+{
+    esp_ota_mark_app_valid_cancel_rollback();
+    port_ota_forget();
+}
+
+static void capture_stop(void)
+{
+    capture_paused = true;
+    if (rx)
+        i2s_channel_disable(rx); // waits for the read in progress
+}
+
+static void capture_resume(void)
+{
+    if (rx)
+        i2s_channel_enable(rx);
+    capture_paused = false;
+}
+
+extern "C" bool port_ota_update(const char *host, uint16_t port, const char *path,
+                                int64_t build_id, char *err, size_t err_cap)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    Preferences nvs;
+    if (nvs.begin(OTA_NVS, false)) {
+        nvs.putLong64(OTA_KEY_ID, build_id);
+        nvs.putUInt(OTA_KEY_FROM, running ? running->address : 0);
+        nvs.putBool(OTA_KEY_FLASHED, false);
+        nvs.end();
+    }
+    // Flash writes stall code and data in flash and PSRAM on both cores: audio
+    // would be lost anyway, so capture stops for the download.
+    capture_stop();
+    NetworkClient client;
+    httpUpdate.rebootOnUpdate(false); // restarted below, once NVS says it was flashed
+    httpUpdate.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    t_httpUpdate_return r = httpUpdate.update(client, String(host), port, String(path));
+    if (r == HTTP_UPDATE_OK) {
+        if (nvs.begin(OTA_NVS, false)) {
+            nvs.putBool(OTA_KEY_FLASHED, true);
+            nvs.end();
+        }
+        port_log("update: flashed; restarting into it");
+        port_restart();
+    }
+    if (r == HTTP_UPDATE_NO_UPDATES)
+        snprintf(err, err_cap, "no update: the server answered 304");
+    else
+        snprintf(err, err_cap, "%s", httpUpdate.getLastErrorString().c_str());
+    port_ota_forget();
+    capture_resume();
+    return false;
 }
 
 extern "C" void port_board_init(void)

@@ -438,6 +438,24 @@ void port_restart(void)
     exit(1);
 }
 
+/* ---- Firmware updates: not in the host build (it does not advertise them) ---- */
+
+bool port_ota_supported(void) { return false; }
+
+void port_ota_boot_info(port_ota_state *out) { memset(out, 0, sizeof *out); }
+
+void port_ota_confirm(void) {}
+
+void port_ota_forget(void) {}
+
+bool port_ota_update(const char *host, uint16_t port, const char *path, int64_t build_id,
+                     char *err, size_t err_cap)
+{
+    (void)host, (void)port, (void)path, (void)build_id;
+    snprintf(err, err_cap, "the host build cannot update itself");
+    return false;
+}
+
 /* From `git describe --tags --always --dirty`, set by the Makefile. */
 #ifndef BPS_GIT_DESCRIBE
 #define BPS_GIT_DESCRIBE "unknown"

@@ -82,6 +82,10 @@ void bps_devices_poll(uint64_t now_us);
 void bps_devices_heartbeat(bps_json *j);
 /* One line about every device, for the status log ("" if there are none). */
 void bps_devices_describe(char *out, size_t cap);
+/* The battery's charge and its rate of change (positive while charging), from
+ * the first battery gauge with a reading of a battery; false if there is none
+ * (no gauge, or one running off the charger with no cell). */
+bool bps_devices_battery(int32_t *centi_percent, int32_t *centi_pct_per_h);
 
 /* The drivers (devices.c), for tests. */
 const bps_driver *bps_driver_find(const char *kind, size_t len);

@@ -39,6 +39,11 @@
 #define BPS_DEVICES ""
 #endif
 
+/* The battery charge (%) a firmware update needs, unless charging. */
+#ifndef BPS_OTA_MIN_BATTERY
+#define BPS_OTA_MIN_BATTERY 50
+#endif
+
 /* From `git describe --tags --always --dirty`, set by scripts/bps_config.py. */
 #ifndef BPS_GIT_DESCRIBE
 #define BPS_GIT_DESCRIBE "unknown"

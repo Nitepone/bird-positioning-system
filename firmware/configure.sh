@@ -26,7 +26,7 @@ backtitle="bps (bird positioning system) - microcontroller client"
 
 keys=(BOARD WIFI_SSID WIFI_PASSWORD SERVER_HOST SERVER_PORT CLIENT_NAME I2S_BCLK I2S_WS I2S_DATA
     MIC_CHANNEL BUTTON_PIN LED_PIN I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI DEVICES
-    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID)
+    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID OTA_MIN_BATTERY)
 bus_keys=(I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI)
 declare -A label=(
     [BOARD]="Board" [WIFI_SSID]="Wi-Fi network" [WIFI_PASSWORD]="Wi-Fi password"
@@ -36,7 +36,7 @@ declare -A label=(
     [I2C_SDA]="I2C SDA pin" [I2C_SCL]="I2C SCL pin" [SPI_SCK]="SPI SCK pin"
     [SPI_MISO]="SPI MISO pin" [SPI_MOSI]="SPI MOSI pin" [DEVICES]="Devices"
     [LOOKBACK_MS]="Look-back" [RING_KB]="Ring buffer" [DEVICE_NAME]="Mic name"
-    [CLIENT_ID]="Client ID"
+    [CLIENT_ID]="Client ID" [OTA_MIN_BATTERY]="Update battery"
 )
 declare -A board_title=()
 board_keys=()
@@ -139,6 +139,10 @@ show() {
             ;;
         LOOKBACK_MS) echo "${v:-?} ms (at most $("${cfgpy[@]}" max-lookback "${RING_KB:-0}" 2>/dev/null || echo ?) ms)" ;;
         RING_KB) echo "${v:-?} KB" ;;
+        OTA_MIN_BATTERY)
+            if pico; then echo "${v:-?}% (the Pico boards do not update over the air)"
+            else echo "${v:-?}% (unless charging)"; fi
+            ;;
         *) echo "${v:-(not set)}" ;;
     esac
 }
@@ -237,6 +241,7 @@ edit() {
         RING_KB) input RING_KB "Ring buffer" "RAM asked for recent audio, in KB (used in 16 KB blocks; 94 KB holds a second). The board takes what fits while keeping 32 KB free, and logs what it got:" ;;
         DEVICE_NAME) input DEVICE_NAME "Mic name" "Reported to the server as the microphone's name:" ;;
         CLIENT_ID) input CLIENT_ID "Client ID" "UUID to use as this client's ID, or empty to derive a stable one from the chip:" ;;
+        OTA_MIN_BATTERY) input OTA_MIN_BATTERY "Firmware updates" "The ESP32 boards update their firmware over the air when the server offers a new build. On a battery that is not charging, the update waits until the battery gauge reads at least this charge, in % (0-100; boards without a gauge update anyway):" ;;
     esac
     return 0 # a cancelled dialog just leaves the setting as it was
 }

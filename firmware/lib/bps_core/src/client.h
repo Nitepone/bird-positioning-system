@@ -9,6 +9,7 @@
 
 #include "bps_common.h"
 #include "devices.h"
+#include "ota.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,8 @@ typedef struct {
     uint32_t ring_bytes;
     uint32_t lookback_ms;
     bps_bus_settings buses; /* peripherals: battery gauge, storage card */
+    const bps_build *build; /* what this firmware is (registration); NULL if unknown */
+    int ota_min_battery;    /* % of charge an update needs on a battery that is not charging */
 } bps_settings;
 
 void bps_client_setup(const bps_settings *s);

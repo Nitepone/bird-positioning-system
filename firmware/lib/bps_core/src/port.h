@@ -195,6 +195,31 @@ void port_keep_command(int64_t id, bool restarting);
 /* Restarts the board now. */
 void port_restart(void);
 
+/* ---- Firmware updates over the air (ota.h; client.c) ---- */
+
+/* False where the board cannot update itself (the Pico boards, the host
+ * build): it then neither advertises updates nor is offered any. */
+bool port_ota_supported(void);
+
+typedef struct {
+    int64_t build_id; /* the build an update was last started for; 0 if none is pending */
+    bool trial;       /* running that build, which has yet to confirm itself */
+    bool rolled_back; /* it never did, and the bootloader went back to this firmware */
+} port_ota_state;
+/* Called once, at setup. */
+void port_ota_boot_info(port_ota_state *out);
+/* The build on trial is healthy: keeps it (no rollback any more) and forgets
+ * the pending build id. */
+void port_ota_confirm(void);
+/* Forgets the pending build id (a rollback has been reported). */
+void port_ota_forget(void);
+/* Remembers `build_id` as pending (across restarts), stops capture, downloads
+ * http://host:port`path` into the other app slot and restarts into it. Returns
+ * true where the restart is left to the caller; on failure false, with capture
+ * running again, the pending id forgotten, and the reason in `err`. */
+bool port_ota_update(const char *host, uint16_t port, const char *path, int64_t build_id,
+                     char *err, size_t err_cap);
+
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);
 
