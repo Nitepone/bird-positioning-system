@@ -22,6 +22,7 @@
 #include "validate.h"
 
 #define LOAD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
+#define STORE(p, v) __atomic_store_n(p, v, __ATOMIC_RELEASE)
 
 #define TIMESYNC_INTERVAL_US 500000
 #define TIMESYNC_TIMEOUT_US 400000
@@ -35,6 +36,24 @@
 #define SYNCED_ERROR_NS 2000000
 /* Heap left for the network stack and Wi-Fi driver after the ring buffer. */
 #define HEAP_RESERVE (32 * 1024)
+/* The store on boards without PSRAM, unless the settings say otherwise, and
+ * the least worth having. */
+#define STORE_DEFAULT_BYTES (32 * 1024)
+#define STORE_MIN_BYTES (16 * 1024)
+/* Boards with PSRAM size the store to it: all that is free but this (the
+ * card's write queue, the network stack, smaller buffers), the ring's way
+ * back from internal RAM, and what the selected model needs. */
+#define BIG_RESERVE (512 * 1024)
+#define STORE_FIT_US 10000000
+#define STORE_FIT_STEP (256 * 1024) /* resized only for at least this */
+/* Internal RAM left free after a ring buffer there (low-power mode): Wi-Fi's
+ * buffers and the tasks' stacks must come from it. The ring takes what is
+ * free above this, up to the full look-back. */
+#define INTERNAL_RESERVE (32 * 1024)
+/* The shortest look-back worth moving the ring to internal RAM for. */
+#define LOOKBACK_MIN_MS 250
+/* How often a ring that did not fit in internal RAM tries again. */
+#define RING_RETRY_US 60000000
 
 /* Batch mode's contacts: the radio comes on, the client joins Wi-Fi and
  * registers, measures its clock afresh, uploads what it saved, sends a last
@@ -73,10 +92,24 @@
 #define LP_BURST_GAP_US 30000
 /* The server allows for it (bsp-proto's LOW_POWER_HEARTBEAT_S). */
 #define LP_HEARTBEAT_US 30000000
+/* Ultra-low-power mode (nights): as low-power mode, but the radio wakes once
+ * every ULP_WAKE_US for a clock burst, the heartbeat (bsp-proto's
+ * ULTRA_LOW_POWER_HEARTBEAT_S) and the recordings stored since, together;
+ * sooner only once the store is ULP_FLUSH_PCT full. The clock fit keeps
+ * ULP_CLOCK_WINDOW_NS of bursts, so drift still shows (best effort: a
+ * timestamp is extrapolated up to a wake ahead). A sound must pass the gate
+ * for ULP_MIN_RUN frames in a row to be recorded. */
+#define ULP_WAKE_US 300000000ull
+#define ULP_BURST_REQUESTS 16
+#define ULP_CLOCK_WINDOW_NS (16 * 60 * BPS_NANOS_PER_SEC)
+#define ULP_MIN_RUN 3
+#define ULP_FLUSH_PCT 50
 
 enum { ST_WIFI, ST_REGISTER, ST_RUN, ST_OFF };
-enum { MODE_LIVE, MODE_BATCH, MODE_LOW_POWER };
-static const char *const MODE_NAMES[] = {"live", "batch", "low_power"};
+enum { MODE_LIVE, MODE_BATCH, MODE_LOW_POWER, MODE_ULTRA_LOW };
+static const char *const MODE_NAMES[] = {"live", "batch", "low_power", "ultra_low_power"};
+/* The modes with the radio sleeping between wakes, connected. */
+static bool lp_mode(int m) { return m == MODE_LOW_POWER || m == MODE_ULTRA_LOW; }
 /* The phases of a contact, once registered. */
 enum { C_SYNC, C_FLUSH, C_LAST_FLUSH, C_FINAL };
 enum { TXN_IDLE, TXN_SENDING, TXN_RECEIVING, TXN_DONE, TXN_FAILED };
@@ -109,6 +142,23 @@ static bps_clock clk;
 
 static bps_ring ring;
 static bps_capture cap;
+/* Recordings waiting to be uploaded (store.h). store_fits: it is sized to
+ * the free PSRAM (boards with some), resized as a model comes and goes. */
+static bps_store store;
+static bool store_fits, store_waiting;
+static uint64_t store_fit_us;
+/* Where the ring is: in PSRAM (where there is some), or in the chip's own
+ * RAM in low-power mode, which leaves PSRAM idle more of the time. There it
+ * is as big as fits, and the look-back shrinks to match.
+ * ring_refused: the move last tried could not be made (-1: none), and
+ * ring_retry_us when to try again; ring_note says why, for the log. */
+static const bps_ring_mem RING_BIG = {port_big_alloc, port_big_free};
+static const bps_ring_mem RING_INTERNAL = {port_internal_alloc, port_internal_free};
+static bool ring_internal;
+static int ring_refused = -1;
+static uint64_t ring_retry_us;
+static char ring_note[112];
+static uint32_t ring_big_samples; /* the ring's size in PSRAM */
 /* The connected access point's clock, from its beacons (where the radio can). */
 static bps_beacon beacon;
 static bool capturing;
@@ -116,7 +166,8 @@ static bool capturing;
 /* From the latest registration. */
 static uint16_t udp_port;
 static uint64_t hb_interval_us;
-static uint32_t chunk_len, lookback;
+/* lookback: in use, samples; lookback_full: as set, as far as the PSRAM ring allows. */
+static uint32_t chunk_len, lookback, lookback_full;
 /* The gate as the capture side runs it (the energy trigger). */
 static bps_gate_config gate_cfg;
 
@@ -150,6 +201,7 @@ static struct {
 
 static struct {
     uint64_t chunks_sent, chunks_gated, chunks_rejected;
+    uint32_t kept_seen; /* bps_upload_kept() when count_gated() last looked */
     uint32_t reports_skipped; /* validation reports not sent: one still on its way */
     uint32_t overruns;
     uint32_t dropouts_reported, dropouts_sending;
@@ -196,11 +248,14 @@ static struct {
     uint64_t since_us, awake_us, mark_us;
     bool awake;
     uint32_t bursts, wakes;
+    /* Ultra-low-power mode's settings are in force; its stored recordings
+     * may go up now (a wake, or the store filling). */
+    bool ultra, flush;
 } lp = {.level = PORT_WIFI_FULL};
 
 /* The clock is measured in bursts, not every TIMESYNC_INTERVAL_US: low-power
  * mode, once this session's clock is measured. */
-static bool lp_bursts(void) { return mode.run == MODE_LOW_POWER && mode.session_synced; }
+static bool lp_bursts(void) { return lp_mode(mode.run) && mode.session_synced; }
 
 static bps_anchors anchors;
 
@@ -517,6 +572,218 @@ static void report_poll(void)
         txn_reset(&val_txn);
 }
 
+/* The store's size to fit the PSRAM, leaving room for a model needing
+ * `need` bytes more: at most STORE_KB if set, and never so small that chunks
+ * would have to stream. */
+static uint32_t store_target(size_t need)
+{
+    uint64_t avail = (uint64_t)port_big_free_size() + store.cap;
+    uint64_t hold = BIG_RESERVE + (uint64_t)need;
+    if (ring_internal)
+        hold += (uint64_t)ring_big_samples * 2; /* its way back to PSRAM */
+    avail = avail > hold ? avail - hold : 0;
+    if (cfg.store_bytes && avail > cfg.store_bytes)
+        avail = cfg.store_bytes;
+    if (avail > UINT32_MAX)
+        avail = UINT32_MAX;
+    uint32_t least = bps_upload_store_least(chunk_len);
+    if (avail < least)
+        avail = least;
+    return (uint32_t)avail / 4096 * 4096;
+}
+
+static bool store_resize(uint32_t to, const char *why)
+{
+    uint32_t from = store.cap;
+    if (!bps_store_resize(&store, to, port_store_realloc))
+        return false;
+    port_log("audio: store resized from %lu to %lu KB%s; %lu KB of PSRAM free",
+             (unsigned long)from / 1024, (unsigned long)to / 1024, why,
+             (unsigned long)port_big_free_size() / 1024);
+    return true;
+}
+
+/* Validation, before loading a model: the store shrinks to make room (once
+ * what it holds fits the smaller size). */
+static bool store_room_for(size_t need)
+{
+    if (store_fits) {
+        uint32_t to = store_target(need);
+        if (to < store.cap && !store_resize(to, " to make room for the model")) {
+            if (!store_waiting)
+                port_log("audio: the model waits for the store to shrink to %lu KB (%lu KB held)",
+                         (unsigned long)to / 1024, (unsigned long)store.used / 1024);
+            store_waiting = true;
+            return false;
+        }
+    }
+    store_waiting = false;
+    return port_big_free_size() >= need;
+}
+
+/* Every STORE_FIT_US: once no model is being loaded or let go, the store
+ * grows into what is free (or shrinks, if something else took it). A buffer
+ * that cannot grow where it is is made anew once the store is empty. */
+static void store_fit_poll(uint64_t now)
+{
+    if (!store_fits || !capturing || now < store_fit_us)
+        return;
+    store_fit_us = now + STORE_FIT_US;
+    if (bps_validate_settling())
+        return;
+    uint32_t to = store_target(0);
+    if (to + STORE_FIT_STEP <= store.cap) {
+        store_resize(to, "");
+        return;
+    }
+    if (to < store.cap + STORE_FIT_STEP || store_resize(to, ""))
+        return;
+    if (bps_store_count(&store) || store.open)
+        return;
+    uint32_t from = store.cap;
+    port_big_free(store.buf);
+    uint8_t *buf = port_store_realloc(NULL, to);
+    if (!buf)
+        buf = port_store_realloc(NULL, to = from);
+    store.buf = buf;
+    store.cap = buf ? to : 0;
+    store.used = 0;
+    port_log("audio: store made anew: %lu KB (was %lu KB); %lu KB of PSRAM free",
+             (unsigned long)store.cap / 1024, (unsigned long)from / 1024,
+             (unsigned long)port_big_free_size() / 1024);
+}
+
+/* The store: sized to the free PSRAM where there is some, else as big as
+ * asked for, or as fits (leaving the heap's reserve). */
+static void start_store(void)
+{
+    store_fits = port_has_psram();
+    store_fit_us = 0;
+    store_waiting = false;
+    uint8_t *buf = NULL;
+    uint32_t want;
+    if (store_fits) {
+        want = store_target(0);
+        for (; want >= STORE_MIN_BYTES && !(buf = port_store_realloc(NULL, want));
+             want = want / 4 * 3 / 4096 * 4096)
+            ;
+        bps_store_init(&store, buf, buf ? want : 0);
+        port_log("audio: %lu KB store for recordings (the PSRAM free%s); %lu KB of PSRAM free",
+                 (unsigned long)store.cap / 1024, cfg.store_bytes ? ", at most STORE_KB" : "",
+                 (unsigned long)port_big_free_size() / 1024);
+        return;
+    }
+    want = cfg.store_bytes ? cfg.store_bytes : STORE_DEFAULT_BYTES;
+    size_t free_bytes = port_free_heap();
+    if (free_bytes < want + HEAP_RESERVE)
+        want = free_bytes > HEAP_RESERVE ? (uint32_t)(free_bytes - HEAP_RESERVE) : 0;
+    for (; want >= STORE_MIN_BYTES && !(buf = port_big_alloc(want)); want = want / 4 * 3)
+        ;
+    bps_store_init(&store, buf, buf ? want : 0);
+    uint32_t asked = cfg.store_bytes ? cfg.store_bytes : STORE_DEFAULT_BYTES;
+    port_log("audio: %lu KB store for recordings%s", (unsigned long)store.cap / 1024,
+             store.cap < asked ? " (less than asked for: that is what fit)" : "");
+}
+
+/* Samples a ring holds besides its look-back: a gate frame, and the slack
+ * the encoder may fall behind by (as start_capture() keeps clear). */
+static uint32_t ring_overhead(void)
+{
+    uint32_t run = LOAD(&cap.min_run);
+    uint32_t frame = cfg.sample_rate * gate_cfg.frame_ms / 1000 * (run ? run : 1);
+    return frame + cfg.sample_rate * BPS_UPLOAD_SLACK_MS / 1000 + 4096;
+}
+
+static uint32_t whole_blocks_up(uint32_t samples)
+{
+    return (samples + BPS_RING_BLOCK - 1) / BPS_RING_BLOCK * BPS_RING_BLOCK;
+}
+
+static uint32_t samples_ms(uint32_t samples)
+{
+    return (uint32_t)((uint64_t)samples * 1000 / cfg.sample_rate);
+}
+
+/* The look-back a ring of `capacity` samples allows, at most the one set. */
+static void set_lookback(uint32_t capacity)
+{
+    uint32_t o = ring_overhead();
+    uint32_t lb = capacity > o ? capacity - o : 0;
+    lookback = lb < lookback_full ? lb : lookback_full;
+    bps_upload_set_lookback(lookback);
+}
+
+static void ring_refuse(bool want, uint64_t now)
+{
+    ring_refused = want;
+    ring_retry_us = now + RING_RETRY_US;
+    port_log("audio: %s", ring_note);
+}
+
+/* Moves the ring to internal RAM in low-power mode, as big as fits there
+ * above INTERNAL_RESERVE (at most the full look-back's), and back to PSRAM in
+ * the others. The capture core is held off meanwhile (a few ms: no audio is
+ * lost), and the ring keeps its newest audio. Every loop. */
+static void ring_place_poll(uint64_t now)
+{
+    if (!capturing)
+        return;
+    bool want = lp_mode(mode.run);
+    if (want == ring_internal) {
+        ring_refused = -1;
+        ring_note[0] = '\0';
+        return;
+    }
+    if (ring_refused == (int)want && now < ring_retry_us)
+        return;
+    uint32_t samples = ring_big_samples, least = ring_big_samples;
+    if (want) {
+        uint32_t full = whole_blocks_up(lookback_full + ring_overhead());
+        uint32_t min_lb = cfg.sample_rate * LOOKBACK_MIN_MS / 1000;
+        least = whole_blocks_up((min_lb < lookback_full ? min_lb : lookback_full) + ring_overhead());
+        size_t internal = port_internal_free_heap();
+        size_t room = internal > INTERNAL_RESERVE ? (internal - INTERNAL_RESERVE) / 2 : 0;
+        samples = room < full ? (uint32_t)room / BPS_RING_BLOCK * BPS_RING_BLOCK : full;
+        if (samples < least) {
+            snprintf(ring_note, sizeof ring_note,
+                     "no room for the ring buffer in internal RAM (%lu KB free, %lu KB needed); "
+                     "it stays in PSRAM",
+                     (unsigned long)internal / 1024,
+                     (unsigned long)((size_t)least * 2 + INTERNAL_RESERVE) / 1024);
+            ring_refuse(want, now);
+            return;
+        }
+    }
+    if (!port_audio_hold(true)) {
+        snprintf(ring_note, sizeof ring_note,
+                 "could not pause capture to move the ring buffer to %s; it stays",
+                 want ? "internal RAM" : "PSRAM");
+        ring_refuse(want, now);
+        return;
+    }
+    /* Free RAM can be in pieces: a block fewer at a time, down to the least. */
+    bool ok = false;
+    for (; samples >= least && samples >= BPS_RING_BLOCK; samples -= BPS_RING_BLOCK)
+        if ((ok = bps_ring_move(&ring, samples, want ? &RING_INTERNAL : &RING_BIG)))
+            break;
+    port_audio_hold(false);
+    if (!ok) {
+        snprintf(ring_note, sizeof ring_note, "could not move the ring buffer to %s; it stays",
+                 want ? "internal RAM" : "PSRAM");
+        ring_refuse(want, now);
+        return;
+    }
+    ring_internal = want;
+    ring_refused = -1;
+    ring_note[0] = '\0';
+    set_lookback(ring.capacity);
+    port_log("audio: ring buffer moved to %s: %lu ms, look-back %lu ms (%lu ms set); %lu KB of "
+             "internal RAM free",
+             want ? "internal RAM" : "PSRAM", (unsigned long)samples_ms(ring.capacity),
+             (unsigned long)samples_ms(lookback), (unsigned long)samples_ms(lookback_full),
+             (unsigned long)port_internal_free_heap() / 1024);
+}
+
 static void start_capture(void)
 {
     /* As much as asked for, but always leave some heap for the network stack. */
@@ -526,28 +793,30 @@ static void start_capture(void)
     if (fits < want)
         want = fits;
     want = want / BPS_RING_BLOCK * BPS_RING_BLOCK;
-    uint32_t got = bps_ring_alloc(&ring, cfg.sample_rate, want);
+    uint32_t got = bps_ring_alloc_in(&ring, cfg.sample_rate, want, &RING_BIG);
+    ring_big_samples = got;
     if (got < cfg.ring_bytes / 2 / BPS_RING_BLOCK * BPS_RING_BLOCK)
         port_log("audio: %lu of the %lu KB asked for fit in the ring buffer",
                  (unsigned long)got / 512, (unsigned long)cfg.ring_bytes / 1024);
-    uint32_t frame = cfg.sample_rate * gate_cfg.frame_ms / 1000;
-    uint32_t slack = cfg.sample_rate * BPS_UPLOAD_SLACK_MS / 1000 + 4096 + frame;
+    uint32_t slack = ring_overhead();
     uint32_t max_lb = got > slack ? got - slack : 0;
     lookback = (uint32_t)((uint64_t)cfg.lookback_ms * cfg.sample_rate / 1000);
     if (lookback > max_lb) {
         port_log("audio: look-back limited to %lu ms by the ring buffer",
-                 (unsigned long)((uint64_t)max_lb * 1000 / cfg.sample_rate));
+                 (unsigned long)samples_ms(max_lb));
         lookback = max_lb;
     }
+    lookback_full = lookback;
     port_log("audio: %lu ms ring buffer, %lu ms look-back, %lu bytes free",
              (unsigned long)((uint64_t)got * 1000 / cfg.sample_rate),
              (unsigned long)((uint64_t)lookback * 1000 / cfg.sample_rate),
              (unsigned long)port_free_heap());
+    start_store();
     bps_capture_init(&cap, &ring, cfg.sample_rate, cfg.mic_channel, &gate_cfg);
     bps_upload_ctx u = {
         .cfg = &cfg, .ring = &ring, .cap = &cap, .clk = &clk, .beacon = &beacon,
         .epoch_ns = &epoch_ns, .epoch_set = &epoch_set,
-        .chunk_len = chunk_len, .lookback = lookback,
+        .chunk_len = chunk_len, .lookback = lookback, .store = &store,
         .chunks_sent = &stats.chunks_sent, .overruns = &stats.overruns,
         .need_register = &need_register,
         .connect_server = connect_server, .path_for = path_for,
@@ -556,6 +825,7 @@ static void start_capture(void)
     };
     bps_upload_init(&u);
     stats.idle_mark = bps_ring_written(&ring);
+    stats.kept_seen = bps_upload_kept();
     port_audio_start(cfg.sample_rate);
     capturing = true;
 }
@@ -1042,7 +1312,7 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
     mode.interval_s = interval_s;
     if (want != MODE_BATCH) {
         const char *note = NULL;
-        if (want == MODE_LOW_POWER && mode.run != MODE_LOW_POWER) {
+        if (lp_mode(want) && !lp_mode(mode.run)) {
             if (port_wifi_power(PORT_WIFI_AWAKE)) {
                 lp.level = PORT_WIFI_AWAKE;
             } else {
@@ -1052,6 +1322,18 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
                     port_log("mode: low power is not supported on this board; staying live");
             }
         }
+        if (want == MODE_ULTRA_LOW) {
+            /* Its recordings wait in the store: one must hold whole chunks. */
+            bps_upload_status us;
+            bps_upload_status_get(&us);
+            if (us.streaming || !us.cap) {
+                want = MODE_LOW_POWER;
+                note = "ultra-low-power mode needs PSRAM to keep recordings: low power instead";
+                if (!mode.note)
+                    port_log("mode: ultra-low-power needs a store that holds whole recordings; "
+                             "low power instead");
+            }
+        }
         mode.note = note;
         if (mode.run == want)
             return;
@@ -1059,9 +1341,11 @@ static void apply_mode(int want, uint32_t interval_s, uint64_t now)
             bps_upload_set_spool(false);
             bps_spool_kick(); /* what is still on the card */
         }
-        port_log(want == MODE_LIVE ? "mode: live (the radio stays on)"
-                                   : "mode: low-power live (the radio sleeps between clock "
-                                     "measurements, heartbeats and uploads)");
+        port_log(want == MODE_LIVE        ? "mode: live (the radio stays on)"
+                 : want == MODE_LOW_POWER ? "mode: low-power live (the radio sleeps between clock "
+                                            "measurements, heartbeats and uploads)"
+                                          : "mode: ultra-low-power (the radio wakes every 5 min "
+                                            "for the clock, a heartbeat and the recordings since)");
         mode.run = want;
         mode_started(now);
         return;
@@ -1341,7 +1625,8 @@ static bool reboot_poll(uint64_t now)
         return false;
     const char *what = maint.updating ? "update" : "reboot";
     if (maint.reboot_phase == 0) {
-        bool busy = bps_upload_sending() || bps_spool_busy();
+        /* Recordings in the store would be lost: they go first (if they can). */
+        bool busy = !bps_upload_idle() || bps_spool_busy();
         if (busy && now - maint.reboot_us < REBOOT_UPLOAD_WAIT_US)
             return false; /* the loop goes on meanwhile */
         if (busy)
@@ -1610,9 +1895,10 @@ static void heartbeat_reply(uint64_t now)
         interval = 30;
     if (interval > 3600)
         interval = 3600;
-    int want = strcmp(m, "batch") == 0       ? MODE_BATCH
-               : strcmp(m, "low_power") == 0 ? MODE_LOW_POWER
-                                             : MODE_LIVE;
+    int want = strcmp(m, "batch") == 0             ? MODE_BATCH
+               : strcmp(m, "low_power") == 0       ? MODE_LOW_POWER
+               : strcmp(m, "ultra_low_power") == 0 ? MODE_ULTRA_LOW
+                                                   : MODE_LIVE;
     apply_mode(want, (uint32_t)interval, now);
 }
 
@@ -1655,21 +1941,59 @@ static double lp_awake_pct(uint64_t now)
 }
 
 /* Whether the radio must be awake now: a clock burst, a request or upload
- * on its way, or the client closing down (an update or reboot). */
-static bool lp_busy(void)
+ * on its way (or a stored recording ready to go), or the client closing down
+ * (an update or reboot). */
+static bool lp_busy(uint64_t now)
 {
     return ts.burst_left > 0 || ts.waiting || hb_txn.state != TXN_IDLE ||
            reg_txn.state != TXN_IDLE || pos_txn.state != TXN_IDLE || val_txn.state != TXN_IDLE ||
-           bps_upload_sending() || bps_spool_busy() || closing_down();
+           bps_upload_sending() || bps_upload_ready(now) || bps_spool_busy() || closing_down();
 }
 
 /* Sets the CPU's speed and the radio's power saving for the mode, and starts
  * each clock burst. Every loop, in every state. Until the session's clock is
  * measured (as live mode does, every TIMESYNC_INTERVAL_US), and while
  * joining or registering, the radio stays awake. */
+/* Ultra-low-power mode's settings: the gate's run, the clock's window and
+ * (with the run) the look-back. */
+static void ulp_settings(bool ultra, uint64_t now)
+{
+    lp.ultra = ultra;
+    lp.flush = false;
+    STORE(&cap.min_run, ultra ? ULP_MIN_RUN : 1u);
+    clk.est.window_ns = ultra ? ULP_CLOCK_WINDOW_NS : BPS_CLOCK_WINDOW_NS;
+    if (capturing)
+        set_lookback(ring.capacity);
+    if (ultra)
+        lp.next_burst_us = now; /* a wake now, then every ULP_WAKE_US */
+}
+
+/* Ultra-low-power mode: stored recordings go up in a wake, until none is
+ * ready; sooner once the store is filling, or when the client closes down
+ * (a reboot or update waits for the store). Otherwise they wait. */
+static void ulp_flush_poll(uint64_t now, bool held)
+{
+    if (!lp.ultra || !held) {
+        bps_upload_hold(false);
+        return;
+    }
+    bps_upload_status us;
+    bps_upload_status_get(&us);
+    if (!lp.flush && (closing_down() || (uint64_t)us.bytes * 100 >= (uint64_t)us.cap * ULP_FLUSH_PCT ||
+                      us.queued >= BPS_STORE_ITEMS * 3 / 4))
+        lp.flush = true;
+    bps_upload_hold(false);
+    if (lp.flush && !bps_upload_sending() && !bps_upload_ready(now))
+        lp.flush = false;
+    bps_upload_hold(!lp.flush);
+}
+
 static void lp_poll(uint64_t now)
 {
-    bool on = mode.run == MODE_LOW_POWER;
+    bool on = lp_mode(mode.run);
+    bool ultra = mode.run == MODE_ULTRA_LOW;
+    if (ultra != lp.ultra)
+        ulp_settings(ultra, now);
     if (on != lp.on) {
         lp.on = on;
         port_cpu_low(on);
@@ -1685,18 +2009,25 @@ static void lp_poll(uint64_t now)
     if (on) {
         level = PORT_WIFI_AWAKE;
         if (state == ST_RUN && lp_bursts()) {
+            uint64_t every = ultra ? ULP_WAKE_US : LP_BURST_EVERY_US;
             if (now >= lp.next_burst_us) {
-                lp.next_burst_us = now + LP_BURST_EVERY_US;
+                lp.next_burst_us = now + every;
                 lp.bursts++;
-                ts.burst_left = LP_BURST_REQUESTS;
+                ts.burst_left = ultra ? ULP_BURST_REQUESTS : LP_BURST_REQUESTS;
                 ts.next_us = now + LP_SETTLE_US;
                 /* A heartbeat due before the next burst goes in this wake. */
-                if (hb_next_us < now + LP_BURST_EVERY_US / 2)
+                if (hb_next_us < now + every / 2)
                     hb_next_us = now;
+                lp.flush = true; /* and what is stored */
             }
-            if (!lp_busy())
+            ulp_flush_poll(now, true);
+            if (!lp_busy(now))
                 level = PORT_WIFI_SAVE;
+        } else {
+            ulp_flush_poll(now, false);
         }
+    } else {
+        ulp_flush_poll(now, false);
     }
     if (level != lp.level) {
         port_wifi_power(level);
@@ -1741,8 +2072,26 @@ static void mode_json(bps_json *j, uint64_t now)
             bps_json_raw(j, "}");
         }
     }
-    if (mode.run == MODE_LOW_POWER && lp.on)
+    if (lp_mode(mode.run) && lp.on)
         bps_json_fixed(j, "radio_on_pct", lp_awake_pct(now), 1);
+    if (mode.run == MODE_ULTRA_LOW) {
+        /* Recordings wait for a wake: everything before the oldest still
+         * held, or (none) before a chunk starting now would start, is in. */
+        int64_t through;
+        if (!bps_upload_oldest_start(&through))
+            through = bps_clock_at(&clk, local_ns(now) - bps_samples_to_ns(lookback + chunk_len / 4,
+                                                                           cfg.sample_rate));
+        bps_json_i64(j, "delivered_through", through);
+    }
+    if (capturing) {
+        /* Where the ring buffer is, and the look-back it leaves room for. */
+        bps_json_str(j, "ring_memory", ring_internal ? "internal" : "psram");
+        bps_json_i64(j, "ring_ms", samples_ms(ring.capacity));
+        bps_json_i64(j, "lookback_ms", samples_ms(lookback));
+        bps_json_i64(j, "lookback_set_ms", samples_ms(lookback_full));
+        bps_json_i64(j, "internal_free_bytes", (int64_t)port_internal_free_heap());
+        bps_json_i64(j, "store_bytes", store.cap);
+    }
     if (mode.note) {
         bps_json_str(j, "note", mode.note);
     }
@@ -1837,7 +2186,9 @@ static void start_heartbeat(uint64_t now)
 static void heartbeat_poll(uint64_t now)
 {
     if (hb_txn.state == TXN_IDLE && now >= hb_next_us) {
-        uint64_t period = mode.run == MODE_LOW_POWER ? LP_HEARTBEAT_US : hb_interval_us;
+        uint64_t period = mode.run == MODE_ULTRA_LOW   ? ULP_WAKE_US
+                          : mode.run == MODE_LOW_POWER ? LP_HEARTBEAT_US
+                                                       : hb_interval_us;
         hb_next_us = now - hb_next_us > period ? now + period : hb_next_us + period;
         start_heartbeat(now);
     }
@@ -1913,14 +2264,14 @@ static void count_gated(void)
 {
     if (chunk_len == 0)
         return;
-    if (bps_upload_sending()) {
+    /* A chunk being encoded may yet be rejected, or given up: once it is,
+     * its stretch counts from where counting stopped. One kept is not gated. */
+    if (bps_upload_encoding())
+        return;
+    if (bps_upload_kept() != stats.kept_seen) {
+        stats.kept_seen = bps_upload_kept();
         stats.idle_mark = bps_upload_end();
-        return;
     }
-    /* A chunk waiting for validation or to connect may yet go: once it is
-     * rejected (or dropped), its stretch counts from where counting stopped. */
-    if (!bps_upload_idle())
-        return;
     uint32_t w = bps_ring_written(&ring);
     while (bps_idx_diff(w, stats.idle_mark) >= (int32_t)chunk_len) {
         int64_t mono_ts;
@@ -1943,17 +2294,17 @@ static void keep_marks_recent(void)
     if (!capturing)
         return;
     /* Past what count_gated() leaves behind, in ST_RUN, by a chunk. */
-    if (!bps_upload_sending())
+    if (!bps_upload_encoding())
         stats.chunks_gated +=
             bps_ring_catch_up(&ring, &stats.idle_mark, chunk_len, ring.capacity + chunk_len);
     bps_upload_keep_recent();
 }
 
-/* While connecting: chunks being saved on the card (batch mode) go on, or the
- * audio is lost if joining or registering takes longer than the ring holds. */
-static void offline_poll(uint64_t now)
+/* Chunks are encoded (into the store, or onto the card in batch mode)
+ * whatever the network does: every state. */
+static void audio_poll(uint64_t now)
 {
-    if (capturing && bps_upload_offline()) {
+    if (capturing) {
         bps_upload_poll(now);
         count_gated();
     }
@@ -2049,10 +2400,27 @@ static void log_status(uint64_t now)
     if (bps_devices_battery(&pct, &rate) && bps_devices_cell_mv(&mv))
         snprintf(bat, sizeof bat, "; battery %lu mV, %s%%, %s %%/h", (unsigned long)mv,
                  centi(a, sizeof a, pct), centi(b, sizeof b, rate));
-    port_log("power status: mode %s; %s; led %s%s%s", MODE_NAMES[mode.run],
-             pw[0] ? pw : "no board details",
-             state == ST_OFF || (state == ST_RUN && lp_bursts()) ? "glimmer" : "on/blinking", lpi,
-             bat);
+    port_log("power status: mode %s; %s; led %s; ring buffer in %s (%lu ms, look-back %lu ms of "
+             "%lu; internal RAM %lu KB free)%s%s%s%s",
+             MODE_NAMES[mode.run], pw[0] ? pw : "no board details",
+             state == ST_OFF || (state == ST_RUN && lp_bursts()) ? "glimmer" : "on/blinking",
+             ring_internal ? "internal RAM" : "PSRAM", (unsigned long)samples_ms(ring.capacity),
+             (unsigned long)samples_ms(lookback), (unsigned long)samples_ms(lookback_full),
+             (unsigned long)port_internal_free_heap() / 1024, ring_note[0] ? ": " : "", ring_note,
+             lpi, bat);
+    if (capturing) {
+        bps_upload_status us;
+        bps_upload_status_get(&us);
+        char oldest[48] = "";
+        if (us.oldest_us)
+            snprintf(oldest, sizeof oldest, ", the oldest stored %lu s ago",
+                     (unsigned long)((now - us.oldest_us) / 1000000));
+        port_log("store: %lu chunks, %lu of %lu KB (at most %lu KB so far)%s; %lu dropped unsent%s",
+                 (unsigned long)us.queued, (unsigned long)us.bytes / 1024,
+                 (unsigned long)us.cap / 1024, (unsigned long)us.peak_bytes / 1024, oldest,
+                 (unsigned long)us.dropped,
+                 us.streaming ? "; too small for a chunk: chunks stream as encoded" : "");
+    }
     if (mode.run == MODE_BATCH) {
         bps_spool_status sp;
         bps_spool_status_get(&sp);
@@ -2103,6 +2471,7 @@ void bps_client_setup(const bps_settings *s)
     bps_spool_init(&sc);
     mode_started(boot_us);
     bps_validate_init(&ring, cfg.sample_rate);
+    bps_validate_set_room(store_room_for);
     reg_txn.h = hb_txn.h = pos_txn.h = val_txn.h = -1;
     val_txn.tx = val_tx, val_txn.tx_cap = sizeof val_tx;
     reg_txn.tx = reg_tx, reg_txn.tx_cap = sizeof reg_tx;
@@ -2145,7 +2514,7 @@ void bps_client_loop(void)
     }
     switch (state) {
     case ST_WIFI:
-        offline_poll(now);
+        audio_poll(now);
         if (port_wifi_up()) {
             char wifi[128];
             port_wifi_diag(wifi, sizeof wifi);
@@ -2162,7 +2531,7 @@ void bps_client_loop(void)
             contact_connect_poll(now);
         break;
     case ST_REGISTER:
-        offline_poll(now);
+        audio_poll(now);
         register_poll(now);
         if (state == ST_REGISTER)
             contact_connect_poll(now);
@@ -2175,9 +2544,9 @@ void bps_client_loop(void)
         diag_loop_part("heartbeat");
         position_poll(now);
         diag_loop_part("positioning");
-        bps_upload_poll(now);
+        audio_poll(now);
+        bps_upload_send_poll(now);
         diag_loop_part("upload");
-        count_gated();
         sync_poll(now);
         anchor_poll(now);
         /* The card's reads are one at a time: the spool's pass and a model
@@ -2198,8 +2567,7 @@ void bps_client_loop(void)
         break;
     case ST_OFF:
         /* Chunks are saved on the card meanwhile. */
-        bps_upload_poll(now);
-        count_gated();
+        audio_poll(now);
         /* Early if the card went: what is recorded cannot be kept. */
         if (now >= mode.next_contact_us || (!card_has_room() && !card_held()))
             wake(now);
@@ -2209,6 +2577,8 @@ void bps_client_loop(void)
         bps_validate_poll(now);
     bps_devices_poll(now);
     lp_poll(now);
+    ring_place_poll(now);
+    store_fit_poll(now);
     update_led(now);
     log_status(now);
     if (state == ST_OFF || (lp.on && lp.level == PORT_WIFI_SAVE))

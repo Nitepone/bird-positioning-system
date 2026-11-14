@@ -27,8 +27,16 @@ typedef struct {
     bps_timeline tl;      /* its samples' capture times (monotonic ns) */
 } bps_ring_segment;
 
+/* Where blocks come from: e.g. PSRAM, or the chip's internal RAM. NULL
+ * functions mean malloc() and free(). */
+typedef struct {
+    void *(*alloc)(size_t n);
+    void (*release)(void *p);
+} bps_ring_mem;
+
 typedef struct {
     uint32_t sample_rate;
+    bps_ring_mem mem;
     int16_t *blocks[BPS_RING_MAX_BLOCKS];
     uint32_t n_blocks;
     uint32_t capacity; /* samples */
@@ -49,6 +57,15 @@ static inline int32_t bps_idx_diff(uint32_t b, uint32_t a) { return (int32_t)(b 
 /* Allocates up to `max_samples` of storage (rounded down to whole blocks);
  * returns the capacity actually obtained. */
 uint32_t bps_ring_alloc(bps_ring *r, uint32_t sample_rate, uint32_t max_samples);
+/* The same, from `mem` (NULL: malloc). */
+uint32_t bps_ring_alloc_in(bps_ring *r, uint32_t sample_rate, uint32_t max_samples,
+                           const bps_ring_mem *mem);
+/* Moves the ring to `max_samples` (rounded down to whole blocks, at most
+ * BPS_RING_MAX_BLOCKS of them) from `mem`, keeping its newest samples
+ * (as many as the new storage holds) and their indices and timelines. Only
+ * while the producer is held off (port_audio_hold) and no consumer is
+ * reading. False (nothing changed) if the new storage cannot be had. */
+bool bps_ring_move(bps_ring *r, uint32_t max_samples, const bps_ring_mem *mem);
 
 /* Producer. */
 void bps_ring_write(bps_ring *r, const int16_t *pcm, size_t n);

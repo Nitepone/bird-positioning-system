@@ -58,7 +58,13 @@ static void take_gate(bps_capture *c)
 static void on_frame(void *ctx, size_t end, const bps_gate_frame *f)
 {
     bps_capture *c = ctx;
-    if (!f->pass)
+    if (!f->pass) {
+        c->run = 0;
+        return;
+    }
+    c->run++;
+    uint32_t min_run = LOAD(&c->min_run);
+    if (c->run < (min_run ? min_run : 1))
         return;
     STORE(&c->last_pass_end, c->block_start + (uint32_t)end);
     STORE(&c->pass_count, c->pass_count + 1);

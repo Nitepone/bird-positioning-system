@@ -311,6 +311,8 @@ extern "C" void port_udp_close(int h)
 static volatile uint32_t audio_rate;
 
 extern "C" void port_audio_start(uint32_t sample_rate) { audio_rate = sample_rate; }
+// The ring stays where it is (no PSRAM to move it from).
+extern "C" bool port_audio_hold(bool) { return false; }
 
 void setup1()
 {
@@ -421,6 +423,12 @@ extern "C" void port_board_init(void)
 
 extern "C" void *port_big_alloc(size_t n) { return malloc(n); }
 extern "C" void port_big_free(void *p) { free(p); }
+extern "C" void *port_store_realloc(void *p, size_t n) { return realloc(p, n); }
+extern "C" size_t port_big_free_size(void) { return port_free_heap(); }
+extern "C" bool port_has_psram(void) { return false; }
+extern "C" void *port_internal_alloc(size_t n) { return malloc(n); }
+extern "C" void port_internal_free(void *p) { free(p); }
+extern "C" size_t port_internal_free_heap(void) { return port_free_heap(); }
 extern "C" bool port_ml_load(const void *, size_t, size_t, port_ml_tensor *, port_ml_tensor *,
                              size_t *, char *err, size_t cap)
 {

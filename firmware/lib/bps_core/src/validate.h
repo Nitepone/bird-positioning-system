@@ -48,6 +48,13 @@ void bps_validate_init(const bps_ring *ring, uint32_t sample_rate);
 void bps_validate_configure(const bps_validation_config *v);
 /* Drives loading; call from the client's loop. */
 void bps_validate_poll(uint64_t now);
+/* Asked, before a model is loaded, to make `bytes` of big memory free (by
+ * shrinking the store); true once it is. Until then the model waits. */
+void bps_validate_set_room(bool (*room)(size_t bytes));
+/* The memory a model waiting for room needs (0 if none is waiting). */
+size_t bps_validate_need(void);
+/* A model is being loaded or let go: memory use is about to change. */
+bool bps_validate_settling(void);
 
 /* A model is loaded and checks recordings. */
 bool bps_validate_active(void);
@@ -65,6 +72,18 @@ uint32_t bps_validate_margin(void);
 /* Checks the window starting at ring index `start` (whose window and margin
  * must have been captured). False while a check is still running. */
 bool bps_validate_start(uint32_t start);
+/* Instead of reading the ring when it starts, a check can be fed its audio as
+ * it is captured (upload.c: a ring in internal RAM is too short to hold the
+ * window): collecting starts for the window at ring index `start` (and its
+ * margin either side). False while a check is still running. */
+bool bps_validate_collect(uint32_t start);
+/* `n` samples from ring index `idx` on, given in order (again is harmless);
+ * the check starts once the window and its margins are all in. */
+void bps_validate_feed(uint32_t idx, const int16_t *pcm, uint32_t n);
+/* Gives up collecting (the recording was dropped). */
+void bps_validate_uncollect(void);
+/* Collecting, and the window not complete yet. */
+bool bps_validate_collecting(void);
 /* True once per check, when it is done; judged against the threshold then. */
 bool bps_validate_take(bps_validate_result *out);
 

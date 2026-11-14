@@ -7,7 +7,7 @@ use crate::settings::{LocalSpeciesStatus, Settings};
 use bsp_core::identifier::{Call, Identifier, LocalSpeciesFilter, RangeModel};
 use bsp_proto::{
     Bssid, ClientId, ClockStatus, LOW_POWER_HEARTBEAT_S, NANOS_PER_SEC, OperationMode, Timestamp,
-    now_ns,
+    ULTRA_LOW_POWER_HEARTBEAT_S, now_ns,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
@@ -95,9 +95,15 @@ impl AppState {
             .filter(|c| self.is_active(c, now))
             .filter_map(|c| {
                 let m = c.health.as_ref()?.mode.as_ref()?;
-                (m.mode == OperationMode::Batch).then(|| BatchHold {
+                let interval_s = match m.mode {
+                    OperationMode::Batch => m.interval_s,
+                    // Its recordings wait for its next wake.
+                    OperationMode::UltraLowPower => ULTRA_LOW_POWER_HEARTBEAT_S,
+                    _ => return None,
+                };
+                Some(BatchHold {
                     delivered_through: m.delivered_through.unwrap_or(c.first_seen),
-                    max_wait_ns: m.interval_s as i64 * NANOS_PER_SEC
+                    max_wait_ns: interval_s as i64 * NANOS_PER_SEC
                         + BATCH_CONTACT_SLACK_NS
                         + window,
                 })
@@ -193,6 +199,9 @@ fn quiet_ns(c: &ClientRecord) -> i64 {
         // Two heartbeats, one of which may be lost.
         Some(m) if m.mode == OperationMode::LowPower => {
             2 * LOW_POWER_HEARTBEAT_S as i64 * NANOS_PER_SEC
+        }
+        Some(m) if m.mode == OperationMode::UltraLowPower => {
+            2 * ULTRA_LOW_POWER_HEARTBEAT_S as i64 * NANOS_PER_SEC
         }
         _ => 0,
     }

@@ -89,38 +89,80 @@ void bps_record_frame(const uint8_t *frame, size_t len)
         rec_write(frame, len, true);
 }
 
-void bps_record_end(uint32_t samples, uint32_t lost, const char *upload)
+void bps_record_close(bps_record_file *out)
 {
+    memset(out, 0, sizeof *out);
     if (!rec.active)
         return;
     rec.active = false;
     port_sd_close();
+    out->kept = true;
+    snprintf(out->dir, sizeof out->dir, "%s", rec.dir);
+    snprintf(out->file, sizeof out->file, "%s", rec.file);
+    snprintf(out->tsf, sizeof out->tsf, "%s", rec.tsf);
+    out->start_ns = rec.start_ns;
+    out->end_ns = rec.end_ns;
+    out->sample_rate = rec.sample_rate;
+    out->bytes = rec.bytes;
+    out->dropped = rec.dropped;
+}
+
+void bps_record_index(const bps_record_file *f, uint32_t samples, uint32_t lost,
+                      const char *upload)
+{
+    if (!f->kept)
+        return;
     char line[384], index[48];
     bps_json j;
     bps_json_init(&j, line, sizeof line - 1);
     bps_json_raw(&j, "{");
-    bps_json_str(&j, "file", rec.file);
-    bps_json_i64(&j, "start_ns", rec.start_ns);
-    bps_json_i64(&j, "end_ns", rec.end_ns);
-    bps_json_i64(&j, "sample_rate", rec.sample_rate);
+    bps_json_str(&j, "file", f->file);
+    bps_json_i64(&j, "start_ns", f->start_ns);
+    bps_json_i64(&j, "end_ns", f->end_ns);
+    bps_json_i64(&j, "sample_rate", f->sample_rate);
     bps_json_i64(&j, "samples", samples);
     bps_json_i64(&j, "lost_samples", lost);
-    bps_json_i64(&j, "bytes", (int64_t)rec.bytes);
-    if (rec.dropped) { /* the file misses some of its frames */
-        bps_json_i64(&j, "dropped_bytes", (int64_t)rec.dropped);
+    bps_json_i64(&j, "bytes", (int64_t)f->bytes);
+    if (f->dropped) { /* the file misses some of its frames */
+        bps_json_i64(&j, "dropped_bytes", (int64_t)f->dropped);
     }
-    if (rec.tsf[0]) {
-        bps_json_str(&j, "tsf", rec.tsf);
+    if (f->tsf[0]) {
+        bps_json_str(&j, "tsf", f->tsf);
     }
     bps_json_str(&j, "upload", upload);
     bps_json_raw(&j, "}\n");
     if (j.overflow)
         return;
-    snprintf(index, sizeof index, "%s/index.jsonl", rec.dir);
+    snprintf(index, sizeof index, "%s/index.jsonl", f->dir);
     port_sd_write(index, line, j.len, true);
     port_sd_close();
     stats.files++;
-    stats.bytes += rec.bytes;
+    stats.bytes += f->bytes;
+}
+
+void bps_record_end(uint32_t samples, uint32_t lost, const char *upload)
+{
+    bps_record_file f;
+    bps_record_close(&f);
+    bps_record_index(&f, samples, lost, upload);
+}
+
+void bps_record_abort(void)
+{
+    if (!rec.active)
+        return;
+    rec.active = false;
+    port_sd_close();
+    port_sd_remove(rec.path);
+}
+
+void bps_record_discard(const bps_record_file *f)
+{
+    if (!f->kept)
+        return;
+    char path[48];
+    snprintf(path, sizeof path, "%s/%s", f->dir, f->file);
+    port_sd_remove(path);
 }
 
 void bps_record_stats_get(bps_record_stats *out) { *out = stats; }

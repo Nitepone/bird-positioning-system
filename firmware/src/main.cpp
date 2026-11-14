@@ -33,6 +33,7 @@ void setup()
         BPS_OTA_MIN_BATTERY,
         BPS_SD_MIN_MV,
         BPS_SD_RESUME_MV,
+        BPS_STORE_BYTES,
     };
     bps_client_setup(&settings);
 }

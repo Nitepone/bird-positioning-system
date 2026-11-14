@@ -23,8 +23,12 @@ typedef struct {
     bps_timestamper stamper;
 
     /* Published to the network side. */
-    uint32_t pass_count;    /* gate frames that passed */
+    uint32_t pass_count;    /* gate frames that passed (in a long enough run) */
     uint32_t last_pass_end; /* ring index just past the newest passing frame */
+    /* Set by the network side: passing frames count only from the
+     * `min_run`-th in a row on (1: every one). */
+    uint32_t min_run;
+    uint32_t run; /* capture side: passing frames in a row */
     uint32_t dropouts;      /* capture timeline jumps */
     int32_t rate_err_ppb;   /* sample rate vs. the monotonic clock, parts per billion */
     int32_t scatter_ns;     /* how far the timeline's points lie from it (RMS) */

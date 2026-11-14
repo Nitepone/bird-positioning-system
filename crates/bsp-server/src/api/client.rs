@@ -712,6 +712,12 @@ mod tests {
                 radio_on_pct: None,
                 gap: None,
                 note: None,
+                ring_memory: None,
+                ring_ms: None,
+                lookback_ms: None,
+                lookback_set_ms: None,
+                internal_free_bytes: None,
+                store_bytes: None,
             }),
             ..health(None, None)
         };

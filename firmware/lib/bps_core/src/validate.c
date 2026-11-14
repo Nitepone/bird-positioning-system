@@ -80,7 +80,14 @@ bool bps_model_config_parse(const char *json, size_t len, bps_model_config *out,
 
 /* ---- State ---- */
 
-typedef enum { V_OFF, V_JSON, V_MODEL, V_INIT, V_READY, V_FAILED } vstate;
+/* V_ROOM: model.json read, waiting for the memory the model needs. */
+typedef enum { V_OFF, V_JSON, V_ROOM, V_MODEL, V_INIT, V_READY, V_FAILED } vstate;
+
+/* Besides the model and its arena: the front end and its buffers. */
+#define MODEL_EXTRA_BYTES (128 * 1024)
+
+static bool (*room_for)(size_t bytes);
+static bool room_noted; /* the note says the model waits for memory */
 enum { JOB_NONE, JOB_INIT, JOB_CHECK };
 
 static struct {
@@ -118,6 +125,11 @@ static struct {
     /* Set by the loop only, and applied when a check is taken: a change while
      * one runs is not lost. */
     float threshold;
+    /* A window being fed (bps_validate_collect): v.pcm holds `col_have`
+     * samples from ring index `col_from` on. `fed`: the check takes them
+     * from v.pcm instead of the ring. */
+    bool collecting, fed;
+    uint32_t col_from, col_have;
 } v;
 
 static void set_note(const char *fmt, const char *a, const char *b)
@@ -206,7 +218,7 @@ static void run_check(void)
     r.window_ms = v.m.fe.window_samples * 1000 / v.m.fe.sample_rate;
     uint64_t t0 = port_mono_us();
     uint32_t total = v.window48 + 2 * v.margin;
-    if (bps_ring_read(v.ring, r.window_start - v.margin, v.pcm, total)) {
+    if (v.fed || bps_ring_read(v.ring, r.window_start - v.margin, v.pcm, total)) {
         if (v.factor == 1) {
             for (uint32_t i = 0; i < v.m.fe.window_samples; i++)
                 v.x[i] = v.pcm[i] * (1.0f / 32768.0f);
@@ -354,6 +366,30 @@ static void finish_load(uint64_t now)
     post(JOB_INIT);
 }
 
+/* V_ROOM: once the memory the model needs is free, it is read (V_MODEL). */
+static bool take_room(uint64_t now)
+{
+    size_t need = bps_validate_need();
+    if (room_for && !room_for(need)) {
+        char kb[16];
+        snprintf(kb, sizeof kb, "%lu", (unsigned long)(need / 1024));
+        set_note("model %s: waiting for %s KB of memory", v.want.model, kb);
+        room_noted = true;
+        return false;
+    }
+    v.model = port_big_alloc(v.m.model_bytes);
+    if (!v.model) {
+        fail(now, "not enough memory for it", NULL);
+        return false;
+    }
+    if (room_noted)
+        set_note("model %s: loading%s", v.want.model, "");
+    room_noted = false;
+    v.got = 0;
+    v.st = V_MODEL;
+    return true;
+}
+
 static void poll(uint64_t now)
 {
     if (!v.worker) {
@@ -405,6 +441,9 @@ static void poll(uint64_t now)
         return;
     }
 
+    if (v.st == V_ROOM && !take_room(now))
+        return;
+
     /* Reading the card. */
     if (v.reading) {
         int n = port_sd_result(&data, &total);
@@ -420,11 +459,9 @@ static void poll(uint64_t now)
             const char *why; /* parsed where the card's task left it */
             if (!bps_model_config_parse((const char *)data, (size_t)n, &v.m, &why))
                 return fail(now, why, NULL);
-            v.model = port_big_alloc(v.m.model_bytes);
-            if (!v.model)
-                return fail(now, "not enough memory for it", NULL);
-            v.got = 0;
-            v.st = V_MODEL;
+            v.st = V_ROOM;
+            if (!take_room(now))
+                return;
         } else {
             if (n == 0)
                 return fail(now, "model.tflite is shorter than model.json's model_bytes", NULL);
@@ -459,6 +496,19 @@ void bps_validate_poll(uint64_t now)
 
 bool bps_validate_active(void) { return v.st == V_READY; }
 
+void bps_validate_set_room(bool (*room)(size_t bytes)) { room_for = room; }
+
+size_t bps_validate_need(void)
+{
+    return v.st == V_ROOM ? (size_t)v.m.model_bytes + v.m.arena_bytes + MODEL_EXTRA_BYTES : 0;
+}
+
+bool bps_validate_settling(void)
+{
+    return v.st == V_JSON || v.st == V_ROOM || v.st == V_MODEL || v.st == V_INIT ||
+           (v.st == V_OFF && (v.model || v.loaded));
+}
+
 void bps_validate_running(bps_validation_config *out)
 {
     if (v.st == V_READY) {
@@ -485,6 +535,7 @@ bool bps_validate_start(uint32_t start)
 {
     if (v.st != V_READY || !worker_idle())
         return false;
+    v.collecting = v.fed = false;
     v.res.window_start = start;
     post(JOB_CHECK);
     return true;
@@ -500,3 +551,57 @@ bool bps_validate_take(bps_validate_result *out)
     out->upload = !out->ok || out->score >= out->threshold;
     return true;
 }
+
+bool bps_validate_collect(uint32_t start)
+{
+    if (v.st != V_READY || !worker_idle() || !v.pcm)
+        return false;
+    v.collecting = true;
+    v.fed = false;
+    v.col_from = start - v.margin;
+    v.col_have = 0;
+    v.res.window_start = start;
+    return true;
+}
+
+void bps_validate_feed(uint32_t idx, const int16_t *pcm, uint32_t n)
+{
+    if (!v.collecting)
+        return;
+    if (v.st != V_READY || !v.pcm) { /* the model went meanwhile */
+        v.collecting = false;
+        return;
+    }
+    uint32_t total = v.window48 + 2 * v.margin;
+    /* Samples must come in order: skip what is already in, and stop at a gap. */
+    int32_t at = bps_idx_diff(idx, v.col_from);
+    if (at < 0) {
+        if ((uint32_t)-at >= n)
+            return;
+        pcm += -at;
+        n -= (uint32_t)-at;
+        at = 0;
+    }
+    if ((uint32_t)at > v.col_have)
+        return;
+    if ((uint32_t)at < v.col_have) {
+        uint32_t skip = v.col_have - (uint32_t)at;
+        if (skip >= n)
+            return;
+        pcm += skip;
+        n -= skip;
+    }
+    if (n > total - v.col_have)
+        n = total - v.col_have;
+    memcpy(v.pcm + v.col_have, pcm, n * sizeof *pcm);
+    v.col_have += n;
+    if (v.col_have == total && worker_idle()) {
+        v.collecting = false;
+        v.fed = true;
+        post(JOB_CHECK);
+    }
+}
+
+void bps_validate_uncollect(void) { v.collecting = false; }
+
+bool bps_validate_collecting(void) { return v.collecting; }

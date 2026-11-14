@@ -162,6 +162,19 @@ int port_sd_result(const void **data, uint32_t *total);
 /* Large buffers, in PSRAM where there is some; 16-byte aligned. */
 void *port_big_alloc(size_t n);
 void port_big_free(void *p);
+/* The store's buffer (store.h): realloc in that memory (NULL, the old
+ * buffer kept, if it cannot), freed with port_big_free(). Shrinking keeps
+ * the buffer in place. */
+void *port_store_realloc(void *p, size_t n);
+/* Bytes free in that memory (PSRAM where there is some), and whether there
+ * is PSRAM. */
+size_t port_big_free_size(void);
+bool port_has_psram(void);
+/* Buffers in the chip's own RAM, where the board has PSRAM too (as malloc
+ * where it has not), and how much of that RAM is free. */
+void *port_internal_alloc(size_t n);
+void port_internal_free(void *p);
+size_t port_internal_free_heap(void);
 
 /* A model's input or output tensor. */
 typedef struct {
@@ -244,6 +257,10 @@ bool port_ota_update(const char *host, uint16_t port, const char *path, int64_t 
 
 /* Starts I2S capture on the capture core; it then calls bps_capture_frames(). */
 void port_audio_start(uint32_t sample_rate);
+/* Holds the capture core off the ring (`hold`), between two of its calls to
+ * bps_capture_frames(), or lets it go on; a hold must be short (the I2S
+ * driver's queue holds 40 ms). False where the board cannot. */
+bool port_audio_hold(bool hold);
 
 void port_led(bool on);
 /* True while the positioning button is held (false if there is none). */

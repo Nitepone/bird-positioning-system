@@ -383,6 +383,14 @@ int port_sd_result(const void **data, uint32_t *total)
 /* No on-device models on the host: validation reports that it cannot run them. */
 void *port_big_alloc(size_t n) { return malloc(n); }
 void port_big_free(void *p) { free(p); }
+void *port_store_realloc(void *p, size_t n) { return realloc(p, n); }
+size_t port_big_free_size(void) { return port_free_heap(); }
+bool port_has_psram(void) { return false; }
+void *port_internal_alloc(size_t n) { return malloc(n); }
+void port_internal_free(void *p) { free(p); }
+size_t port_internal_free_heap(void) { return port_free_heap(); }
+/* The audio thread is not held: the ring stays where it is. */
+bool port_audio_hold(bool hold) { (void)hold; return false; }
 bool port_ml_load(const void *model, size_t model_bytes, size_t arena_bytes, port_ml_tensor *in,
                   port_ml_tensor *out, size_t *arena_used, char *err, size_t err_cap)
 {

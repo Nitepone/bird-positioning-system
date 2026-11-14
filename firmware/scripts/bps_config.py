@@ -54,7 +54,8 @@ BOARDS = {
         "family": "rp2",
         "out_pins": PICO_PINS, "in_pins": PICO_PINS, "builtin_led": True,
         "defaults": {"I2S_BCLK": "18", "I2S_DATA": "20", "LED_PIN": "builtin",
-                     "BUTTON_PIN": "none", "RING_KB": "160", "LOOKBACK_MS": "750"},
+                     "BUTTON_PIN": "none", "RING_KB": "160", "LOOKBACK_MS": "750",
+                     "STORE_KB": "32"},
     },
     "pico2_w": {
         "title": "Raspberry Pi Pico 2 W (RP2350)",
@@ -62,7 +63,8 @@ BOARDS = {
         "family": "rp2",
         "out_pins": PICO_PINS, "in_pins": PICO_PINS, "builtin_led": True,
         "defaults": {"I2S_BCLK": "18", "I2S_DATA": "20", "LED_PIN": "builtin",
-                     "BUTTON_PIN": "none", "RING_KB": "400", "LOOKBACK_MS": "2500"},
+                     "BUTTON_PIN": "none", "RING_KB": "400", "LOOKBACK_MS": "2500",
+                     "STORE_KB": "32"},
     },
     "esp32": {
         "title": "ESP32 (classic, e.g. ESP32-DevKitC)",
@@ -70,7 +72,8 @@ BOARDS = {
         "family": "esp32",
         "out_pins": ESP32_OUT_PINS, "in_pins": ESP32_IN_PINS, "builtin_led": False,
         "defaults": {"I2S_BCLK": "26", "I2S_WS": "25", "I2S_DATA": "33", "LED_PIN": "2",
-                     "BUTTON_PIN": "0", "RING_KB": "192", "LOOKBACK_MS": "1000"},
+                     "BUTTON_PIN": "0", "RING_KB": "192", "LOOKBACK_MS": "1000",
+                     "STORE_KB": "32"},
     },
     "xiao_esp32s3": {
         "title": "Seeed XIAO ESP32S3 (8 MB PSRAM)",
@@ -78,7 +81,8 @@ BOARDS = {
         "family": "esp32",
         "out_pins": XIAO_S3_PINS, "in_pins": XIAO_S3_PINS | {0}, "builtin_led": True,
         "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
-                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "2500"},
+                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "1000",
+                     "STORE_KB": "auto"},
     },
     "xiao_esp32s3_plus": {
         "title": "Seeed XIAO ESP32S3 Plus (8 MB PSRAM)",
@@ -86,7 +90,8 @@ BOARDS = {
         "family": "esp32",
         "out_pins": XIAO_S3_PLUS_PINS, "in_pins": XIAO_S3_PLUS_PINS | {0}, "builtin_led": True,
         "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
-                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "2500"},
+                     "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "1000",
+                     "STORE_KB": "auto"},
     },
     "bps_xiao": {
         "title": "bps XIAO board (XIAO ESP32S3, PDM mic)",
@@ -102,7 +107,7 @@ BOARDS = {
                   "SPI_SCK": "7", "SPI_MISO": "8", "SPI_MOSI": "9"},
         "out_pins": XIAO_S3_PINS, "in_pins": XIAO_S3_PINS | {0}, "builtin_led": True,
         "defaults": {"LED_PIN": "builtin", "BUTTON_PIN": "0", "RING_KB": "1024",
-                     "LOOKBACK_MS": "2500", "DEVICE_NAME": "IM73D122",
+                     "LOOKBACK_MS": "1000", "STORE_KB": "auto", "DEVICE_NAME": "IM73D122",
                      "DEVICES": "max17048@0x36 sd@2"},
     },
 }
@@ -127,7 +132,7 @@ COMMON_DEFAULTS = {
 KEYS = ["BOARD", "WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST", "SERVER_PORT", "CLIENT_NAME",
         "I2S_BCLK", "I2S_WS", "I2S_DATA", "MIC_CHANNEL", "BUTTON_PIN", "LED_PIN",
         "I2C_SDA", "I2C_SCL", "SPI_SCK", "SPI_MISO", "SPI_MOSI", "DEVICES",
-        "LOOKBACK_MS", "RING_KB", "DEVICE_NAME", "CLIENT_ID", "OTA_MIN_BATTERY",
+        "LOOKBACK_MS", "RING_KB", "STORE_KB", "DEVICE_NAME", "CLIENT_ID", "OTA_MIN_BATTERY",
         "SD_MIN_MV", "SD_RESUME_MV"]
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -331,6 +336,14 @@ def validate(cfg):
     elif not lookback.isdigit() or int(lookback) > max_lookback_ms(int(ring)):
         errors.append(f"LOOKBACK_MS must be 0-{max_lookback_ms(int(ring))} "
                       f"(the {ring} KB ring buffer holds {ring_ms(int(ring))} ms)")
+    store = cfg.get("STORE_KB", "")
+    if store == "auto" and "ESP32S3" not in BOARDS.get(cfg.get("BOARD", ""), {}).get("title", "ESP32S3"):
+        errors.append("STORE_KB=auto needs a board with PSRAM (the XIAO ESP32S3 boards); "
+                      "give a size in KB")
+    elif store and store != "auto" and (not store.isdigit() or not 16 <= int(store) <= 8192):
+        errors.append("STORE_KB must be auto or 16-8192 (memory for recordings waiting to be "
+                      "uploaded; with PSRAM, auto takes what is free and a number is the most; "
+                      "under about 900 KB, chunks stream as they are recorded instead)")
     return errors
 
 
@@ -357,6 +370,7 @@ def defines(cfg):
         ("BPS_LED_PIN", pin_value(cfg["LED_PIN"]), False),
         ("BPS_LOOKBACK_MS", int(cfg["LOOKBACK_MS"]), False),
         ("BPS_RING_BYTES", int(cfg["RING_KB"]) * 1024, False),
+        ("BPS_STORE_BYTES", 0 if cfg.get("STORE_KB") in (None, "", "auto") else int(cfg["STORE_KB"]) * 1024, False),
         ("BPS_OTA_MIN_BATTERY", int(cfg.get("OTA_MIN_BATTERY") or 50), False),
         ("BPS_SD_MIN_MV", int(cfg.get("SD_MIN_MV") or 3400), False),
         ("BPS_SD_RESUME_MV", int(cfg.get("SD_RESUME_MV") or 3550), False),

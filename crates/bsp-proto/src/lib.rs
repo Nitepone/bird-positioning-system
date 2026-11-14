@@ -287,6 +287,13 @@ mod tests {
     }
 
     #[test]
+    fn ultra_low_power_mode_is_named_ultra_low_power() {
+        let m: ModeStatus =
+            serde_json::from_str(r#"{"mode":"ultra_low_power","interval_s":300}"#).unwrap();
+        assert_eq!(m.mode, OperationMode::UltraLowPower);
+    }
+
+    #[test]
     fn api_version_matches_the_firmwares() {
         let header = include_str!("../../../firmware/lib/bps_core/src/proto.h");
         let c = header
@@ -946,10 +953,20 @@ pub enum OperationMode {
     /// every 15 s, a heartbeat every [`LOW_POWER_HEARTBEAT_S`], and uploads.
     /// The client follows the server's clock only (no access point clock).
     LowPower,
+    /// For nights: as `LowPower`, but the radio wakes only every
+    /// [`ULTRA_LOW_POWER_HEARTBEAT_S`] (sooner if its store is filling) for a
+    /// burst of clock measurements, the heartbeat, and the recordings made
+    /// since, which wait on the client meanwhile. Its heartbeats carry
+    /// `delivered_through`, as a batch client's. A sound must last longer to
+    /// be recorded. Timestamps are best effort: the clock's drift is
+    /// measured across wakes.
+    UltraLowPower,
 }
 
 /// Seconds between a low-power client's heartbeats.
 pub const LOW_POWER_HEARTBEAT_S: u32 = 30;
+/// Seconds between an ultra-low-power client's wakes (and heartbeats).
+pub const ULTRA_LOW_POWER_HEARTBEAT_S: u32 = 300;
 
 /// Seconds between a batch client's contacts, unless set otherwise.
 pub const DEFAULT_BATCH_INTERVAL_S: u32 = 300;
@@ -1012,6 +1029,27 @@ pub struct ModeStatus {
     /// Why the client is not in the mode the server asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Where the client's ring buffer is (`internal` RAM or `psram`), while
+    /// it captures. In internal RAM (low-power mode) it is as big as fits,
+    /// and the look-back can be shorter than the one set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_memory: Option<String>,
+    /// The ring buffer's length, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_ms: Option<u32>,
+    /// The look-back in use, ms: audio kept from before the trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback_ms: Option<u32>,
+    /// The look-back set (`LOOKBACK_MS`), as far as the PSRAM ring allows, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback_set_ms: Option<u32>,
+    /// The chip's own RAM free, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_free_bytes: Option<u64>,
+    /// The store for recordings waiting to go, bytes. Sized to the free
+    /// PSRAM, it shrinks while a validation model is loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_bytes: Option<u64>,
 }
 
 /// See [`ModeStatus::gap`].

@@ -35,6 +35,11 @@ typedef struct {
     /* The storage card is closed while the cell is under sd_cut_mv, until it
      * is back at sd_resume_mv (power.h); 0: never. */
     int sd_cut_mv, sd_resume_mv;
+    /* Recordings waiting to be uploaded (store.h), in PSRAM where there is
+     * some. There, it is sized to what is free (leaving room for the
+     * selected model), at most this unless 0. Without PSRAM, this (0: 32 KB).
+     * Smaller than a chunk can be (about 900 KB for 9 s), chunks stream. */
+    uint32_t store_bytes;
 } bps_settings;
 
 void bps_client_setup(const bps_settings *s);

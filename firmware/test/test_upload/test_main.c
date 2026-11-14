@@ -1,7 +1,9 @@
-// Which sounds upload.c uploads, and when. After the network was down for 13
-// hours, or the gate was shut that long, the ring indices it keeps between
-// chunks must still compare once 2^31 samples (12.4 h at 48 kHz) went by, or
-// every upload is held back for as long again (or bogus ones start).
+// Which sounds upload.c uploads, and when: a chunk goes once it is complete
+// in the store (or, with a store too small for one, as it is encoded), and
+// never if validation rejects it. After the network was down for 13 hours, or
+// the gate was shut that long, the ring indices it keeps between chunks must
+// still compare once 2^31 samples (12.4 h at 48 kHz) went by, or every upload
+// is held back for as long again (or bogus ones start).
 #include <unity.h>
 
 #include <stdio.h>
@@ -23,7 +25,8 @@ static size_t read_len;
 static bool read_queued;
 
 void port_log(const char *fmt, ...) { (void)fmt; }
-uint64_t port_mono_us(void) { return 0; }
+static uint64_t mono_us;
+uint64_t port_mono_us(void) { return mono_us; }
 void *port_big_alloc(size_t n) { return malloc(n); }
 void port_big_free(void *p) { free(p); }
 void port_tcp_close(int h) { (void)h; }
@@ -101,25 +104,32 @@ void port_ml_unload(void) {}
 #define CHUNK 4800 // 0.1 s
 #define LOOKBACK 480
 #define HOUR_SAMPLES (3600ull * RATE)
+#define STORE_BYTES (2u << 20)
 
 // For the next set_up().
-static uint32_t chunk_len = CHUNK, lookback = LOOKBACK;
+static uint32_t chunk_len = CHUNK, lookback = LOOKBACK, store_bytes = STORE_BYTES;
 
 static bps_settings cfg;
 static bps_ring ring;
 static bps_capture cap;
 static bps_clock clk;
 static bps_beacon beacon;
+static bps_store store;
+static uint8_t *store_buf;
 static int64_t epoch_ns;
 static bool epoch_set = true, need_register;
 static uint64_t chunks_sent, chunks_rejected, total; // total: samples since boot
 static uint32_t overruns;
 static int connects;   // upload attempts
 static bool server_up; // else none gets through
+static bool noisy;     // capture noise (FLAC hardly shrinks it), else silence
+static int writes_before_end; // bytes written of an upload before the chunk was complete
 
 int port_tcp_write(int h, const void *b, size_t n)
 {
     (void)h, (void)b;
+    if (server_up && bps_upload_encoding())
+        writes_before_end++;
     return server_up ? (int)n : -1;
 }
 
@@ -149,19 +159,25 @@ static void refine_timeline(void)
     bps_ring_timeline(&ring, &tl, false, 0);
 }
 
+static uint64_t now_us(void) { return total * 1000000 / RATE + 1000000; }
+
 static void capture(uint32_t n)
 {
-    static int16_t silence[4800];
+    static int16_t pcm[4800];
+    static uint32_t seed = 1;
     while (n > 0) {
         uint32_t k = n < 4800 ? n : 4800;
-        bps_ring_write(&ring, silence, k);
+        for (uint32_t i = 0; i < k; i++) {
+            seed = seed * 1103515245u + 12345u;
+            pcm[i] = noisy ? (int16_t)(seed >> 16) : 0;
+        }
+        bps_ring_write(&ring, pcm, k);
         total += k;
         n -= k;
     }
     refine_timeline();
+    mono_us = now_us();
 }
-
-static uint64_t now_us(void) { return total * 1000000 / RATE + 1000000; }
 
 // The gate passes at the newest sample but `back`.
 static void pass(uint32_t back)
@@ -188,12 +204,17 @@ static void set_up(uint32_t blocks, bool validation)
     memset(&cap, 0, sizeof cap);
     total = 0;
     connects = 0;
+    writes_before_end = 0;
     server_up = false;
     chunks_sent = chunks_rejected = 0;
+    overruns = 0;
     cfg.server_host = "server";
     cfg.server_port = 8443;
     cfg.sample_rate = RATE;
     bps_ring_alloc(&ring, RATE, blocks * BPS_RING_BLOCK);
+    free(store_buf);
+    store_buf = malloc(store_bytes);
+    bps_store_init(&store, store_buf, store_bytes);
     bps_gate_config g;
     bps_gate_config_default(&g);
     bps_capture_init(&cap, &ring, RATE, 0, &g);
@@ -206,9 +227,10 @@ static void set_up(uint32_t blocks, bool validation)
     bps_upload_ctx u = {
         .cfg = &cfg, .ring = &ring, .cap = &cap, .clk = &clk, .beacon = &beacon,
         .epoch_ns = &epoch_ns, .epoch_set = &epoch_set, .chunk_len = chunk_len, .lookback = lookback,
-        .chunks_sent = &chunks_sent, .overruns = &overruns, .need_register = &need_register,
-        .connect_server = connect_server, .path_for = path_for, .read_response = read_response,
-        .centi = centi, .on_validated = NULL, .chunks_rejected = &chunks_rejected,
+        .store = &store, .chunks_sent = &chunks_sent, .overruns = &overruns,
+        .need_register = &need_register, .connect_server = connect_server, .path_for = path_for,
+        .read_response = read_response, .centi = centi, .on_validated = NULL,
+        .chunks_rejected = &chunks_rejected,
     };
     bps_upload_init(&u);
     bps_upload_set_spool(false);
@@ -246,9 +268,22 @@ void setUp(void)
 {
     chunk_len = CHUNK;
     lookback = LOOKBACK;
+    store_bytes = STORE_BYTES;
+    noisy = false;
     out_tensor[1] = -128;
 }
 void tearDown(void) {}
+
+// The client's loop for `seconds`: capturing, and polling every 0.1 s.
+static void run(int seconds)
+{
+    for (int n = seconds * 10; n > 0; n--) {
+        capture(RATE / 10);
+        bps_upload_keep_recent();
+        bps_upload_poll(now_us());
+        bps_upload_send_poll(now_us());
+    }
+}
 
 static void test_uploads_resume_after_13_hours_without_network(void)
 {
@@ -264,21 +299,23 @@ static void test_uploads_resume_after_13_hours_without_network(void)
 
     outage(13);
     pass(1000);
-    bps_upload_poll(now_us());
-    TEST_ASSERT_EQUAL_INT_MESSAGE(1, connects, "the first sound after the network came back is not uploaded");
+    run(1);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(1, connects, "the first sound after the network came back is not uploaded");
 }
 
 // Runs validation on the chunk the gate opened: polls while capturing.
 static void validate_chunk(void)
 {
-    for (int i = 0; i < 40 && !bps_upload_idle(); i++) {
+    for (int i = 0; i < 60 && !bps_upload_idle(); i++) {
         capture(RATE / 10);
         bps_upload_poll(now_us());
+        bps_upload_send_poll(now_us());
     }
 }
 
 static void test_a_rejected_window_does_not_hold_back_uploads_after_13_hours(void)
 {
+    chunk_len = 9 * RATE; // the model's window (3 s) fits
     set_up(32, true);
     capture(RATE);
     pass(1000);
@@ -287,6 +324,7 @@ static void test_a_rejected_window_does_not_hold_back_uploads_after_13_hours(voi
     validate_chunk();
     TEST_ASSERT_TRUE(bps_upload_idle());
     TEST_ASSERT_EQUAL_UINT64(1, chunks_rejected);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, connects, "a rejected chunk was sent");
 
     outage(13);
     pass(1000);
@@ -298,29 +336,20 @@ static void test_a_rejected_window_does_not_hold_back_uploads_after_13_hours(voi
 
 static void test_a_chunk_awaiting_validation_through_13_hours_is_dropped(void)
 {
+    chunk_len = 9 * RATE;
     set_up(32, true);
     capture(RATE);
     pass(1000);
     bps_upload_poll(now_us());
-    TEST_ASSERT_FALSE(bps_upload_idle()); // waiting for the model's window
+    TEST_ASSERT_FALSE(bps_upload_idle()); // encoding, collecting the model's window
 
     outage(13);
-    TEST_ASSERT_TRUE_MESSAGE(bps_upload_idle(), "still waiting for audio that is gone");
+    TEST_ASSERT_TRUE_MESSAGE(bps_upload_idle(), "still encoding audio that is gone");
     pass(1000);
     bps_upload_poll(now_us());
     TEST_ASSERT_FALSE(bps_upload_idle());
     validate_chunk();
     TEST_ASSERT_EQUAL_UINT64(1, chunks_rejected);
-}
-
-// The client's loop for `seconds`: capturing, and polling every 0.1 s.
-static void run(int seconds)
-{
-    for (int n = seconds * 10; n > 0; n--) {
-        capture(RATE / 10);
-        bps_upload_keep_recent();
-        bps_upload_poll(now_us());
-    }
 }
 
 // The gate stays shut for `hours`, the network up: the loop goes on (every
@@ -333,6 +362,7 @@ static void quiet(int hours)
         refine_timeline();
         bps_upload_keep_recent();
         bps_upload_poll(now_us());
+        bps_upload_send_poll(now_us());
     }
     capture(RATE);
 }
@@ -397,9 +427,41 @@ static void test_a_long_look_back_uploads_one_chunk_per_sound(void)
     TEST_ASSERT_EQUAL_INT(1, connects);
 }
 
+// Nothing goes while the chunk is recorded: the radio is needed only for a
+// burst once it is complete.
+static void test_a_chunk_goes_only_once_complete(void)
+{
+    chunk_len = 9 * RATE;
+    set_up(16, false);
+    server_up = true;
+    pass(1000);
+    run(5);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, connects, "an upload started before the chunk was complete");
+    TEST_ASSERT_TRUE(bps_upload_encoding());
+    TEST_ASSERT_FALSE(bps_upload_ready(now_us()));
+    run(6);
+    TEST_ASSERT_EQUAL_INT(1, connects);
+    TEST_ASSERT_EQUAL_UINT64(1, chunks_sent);
+    TEST_ASSERT_EQUAL_INT(0, writes_before_end);
+    TEST_ASSERT_TRUE(bps_upload_idle());
+}
+
+// A chunk validation rejects never leaves the device.
+static void test_a_rejected_chunk_is_never_sent(void)
+{
+    chunk_len = 9 * RATE;
+    set_up(32, true);
+    server_up = true;
+    pass(1000);
+    run(15);
+    TEST_ASSERT_EQUAL_UINT64(1, chunks_rejected);
+    TEST_ASSERT_EQUAL_INT(0, connects);
+    TEST_ASSERT_TRUE(bps_upload_idle());
+}
+
 // Validation lets a chunk through, but the server cannot be reached: the
-// decision stands while connecting is tried again each second (the model
-// ran again, and was reported again, for every attempt).
+// chunk stays in the store, and goes once the server is back (the model ran
+// once for it).
 static void test_a_chunk_validation_let_through_waits_for_the_server(void)
 {
     chunk_len = 9 * RATE;
@@ -414,13 +476,59 @@ static void test_a_chunk_validation_let_through_waits_for_the_server(void)
     connects = 0;
     int checks = invokes;
     pass(1000);
-    run(4);
+    run(14);
     TEST_ASSERT_EQUAL_INT_MESSAGE(1, invokes - checks, "the model ran again");
-    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(3, connects, "connecting is not tried each second");
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(2, connects, "connecting is not tried again");
     server_up = true;
-    run(10);
+    run(40);
     TEST_ASSERT_EQUAL_UINT64(2, chunks_sent);
     TEST_ASSERT_EQUAL_INT(1, invokes - checks);
+    TEST_ASSERT_TRUE(bps_upload_idle());
+}
+
+// While the server is away the store fills; the oldest chunk gives way to the
+// newest, and the rest go once it is back.
+static void test_a_full_store_drops_the_oldest_chunk(void)
+{
+    chunk_len = 9 * RATE;
+    noisy = true; // about 880 KB a chunk: the 2 MB store holds two
+    set_up(16, false);
+    for (int i = 0; i < 3; i++) {
+        pass(1000);
+        run(10);
+    }
+    bps_upload_status us;
+    bps_upload_status_get(&us);
+    TEST_ASSERT_FALSE(us.streaming);
+    TEST_ASSERT_EQUAL_UINT32(2, us.queued);
+    TEST_ASSERT_EQUAL_UINT32(1, us.dropped);
+    TEST_ASSERT_EQUAL_UINT32(0, overruns);
+    server_up = true;
+    run(40);
+    TEST_ASSERT_EQUAL_UINT64(2, chunks_sent);
+    TEST_ASSERT_TRUE(bps_upload_idle());
+}
+
+// A store too small for a whole chunk (a board without PSRAM): chunks stream
+// as they are encoded, as before there was a store.
+static void test_a_small_store_streams_chunks(void)
+{
+    chunk_len = 9 * RATE;
+    store_bytes = 32 * 1024;
+    noisy = true;
+    set_up(16, false);
+    server_up = true;
+    pass(1000);
+    run(2);
+    TEST_ASSERT_EQUAL_INT(1, connects);
+    TEST_ASSERT_GREATER_THAN_INT(0, writes_before_end);
+    run(10);
+    TEST_ASSERT_EQUAL_UINT64(1, chunks_sent);
+    TEST_ASSERT_EQUAL_UINT32(0, overruns);
+    bps_upload_status us;
+    bps_upload_status_get(&us);
+    TEST_ASSERT_TRUE(us.streaming);
+    TEST_ASSERT_TRUE(bps_upload_idle());
 }
 
 int main(void)
@@ -432,6 +540,10 @@ int main(void)
     RUN_TEST(test_a_gate_shut_for_13_hours_starts_no_upload);
     RUN_TEST(test_a_sound_near_the_end_of_a_chunk_continues);
     RUN_TEST(test_a_long_look_back_uploads_one_chunk_per_sound);
+    RUN_TEST(test_a_chunk_goes_only_once_complete);
+    RUN_TEST(test_a_rejected_chunk_is_never_sent);
     RUN_TEST(test_a_chunk_validation_let_through_waits_for_the_server);
+    RUN_TEST(test_a_full_store_drops_the_oldest_chunk);
+    RUN_TEST(test_a_small_store_streams_chunks);
     return UNITY_END();
 }

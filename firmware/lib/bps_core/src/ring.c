@@ -10,21 +10,89 @@
  * many (more than any capture block) as gone already. */
 #define GUARD 4096
 
-uint32_t bps_ring_alloc(bps_ring *r, uint32_t sample_rate, uint32_t max_samples)
+static void *mem_alloc(const bps_ring_mem *m, size_t n) { return m->alloc ? m->alloc(n) : malloc(n); }
+
+static void mem_release(const bps_ring_mem *m, void *p)
+{
+    if (m->release)
+        m->release(p);
+    else
+        free(p);
+}
+
+/* Up to `max_samples` of blocks from `m`; returns how many. */
+static uint32_t get_blocks(const bps_ring_mem *m, int16_t **blocks, uint32_t max_samples)
+{
+    uint32_t want = max_samples / BPS_RING_BLOCK, n = 0;
+    if (want > BPS_RING_MAX_BLOCKS)
+        want = BPS_RING_MAX_BLOCKS;
+    while (n < want) {
+        int16_t *b = mem_alloc(m, BPS_RING_BLOCK * sizeof *b);
+        if (!b)
+            break;
+        blocks[n++] = b;
+    }
+    return n;
+}
+
+uint32_t bps_ring_alloc_in(bps_ring *r, uint32_t sample_rate, uint32_t max_samples,
+                           const bps_ring_mem *mem)
 {
     memset(r, 0, sizeof *r);
     r->sample_rate = sample_rate;
+    if (mem)
+        r->mem = *mem;
+    r->n_blocks = get_blocks(&r->mem, r->blocks, max_samples);
+    r->capacity = r->n_blocks * BPS_RING_BLOCK;
+    return r->capacity;
+}
+
+uint32_t bps_ring_alloc(bps_ring *r, uint32_t sample_rate, uint32_t max_samples)
+{
+    return bps_ring_alloc_in(r, sample_rate, max_samples, NULL);
+}
+
+bool bps_ring_move(bps_ring *r, uint32_t max_samples, const bps_ring_mem *mem)
+{
+    bps_ring_mem m = {NULL, NULL};
+    if (mem)
+        m = *mem;
+    int16_t *blocks[BPS_RING_MAX_BLOCKS];
+    uint32_t n = get_blocks(&m, blocks, max_samples);
     uint32_t want = max_samples / BPS_RING_BLOCK;
     if (want > BPS_RING_MAX_BLOCKS)
         want = BPS_RING_MAX_BLOCKS;
-    while (r->n_blocks < want) {
-        int16_t *b = malloc(BPS_RING_BLOCK * sizeof *b);
-        if (!b)
-            break;
-        r->blocks[r->n_blocks++] = b;
+    if (n == 0 || n < want) {
+        for (uint32_t i = 0; i < n; i++)
+            mem_release(&m, blocks[i]);
+        return false;
     }
-    r->capacity = r->n_blocks * BPS_RING_BLOCK;
-    return r->capacity;
+    uint32_t cap = n * BPS_RING_BLOCK;
+    /* The newest samples, oldest first, from the start of the new blocks. */
+    uint32_t keep = r->capacity < cap ? r->capacity : cap;
+    uint32_t pos = r->capacity ? (r->wpos + r->capacity - keep) % r->capacity : 0;
+    for (uint32_t i = 0; i < keep;) {
+        uint32_t off = pos % BPS_RING_BLOCK, k = BPS_RING_BLOCK - off;
+        uint32_t to_off = i % BPS_RING_BLOCK, room = BPS_RING_BLOCK - to_off;
+        if (k > room)
+            k = room;
+        if (k > keep - i)
+            k = keep - i;
+        memcpy(&blocks[i / BPS_RING_BLOCK][to_off], &r->blocks[pos / BPS_RING_BLOCK][off],
+               k * sizeof(int16_t));
+        i += k;
+        pos = (pos + k) % r->capacity;
+    }
+    for (uint32_t i = 0; i < r->n_blocks; i++)
+        mem_release(&r->mem, r->blocks[i]);
+    STORE(&r->seq, r->seq + 1);
+    memcpy(r->blocks, blocks, n * sizeof *blocks);
+    r->n_blocks = n;
+    r->capacity = cap;
+    r->mem = m;
+    STORE(&r->wpos, keep % cap);
+    STORE(&r->seq, r->seq + 1);
+    return true;
 }
 
 void bps_ring_timeline(bps_ring *r, const bps_timeline *tl, bool start_new, uint32_t start)

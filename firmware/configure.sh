@@ -26,7 +26,7 @@ backtitle="bps (bird positioning system) - microcontroller client"
 
 keys=(BOARD WIFI_SSID WIFI_PASSWORD SERVER_HOST SERVER_PORT CLIENT_NAME I2S_BCLK I2S_WS I2S_DATA
     MIC_CHANNEL BUTTON_PIN LED_PIN I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI DEVICES
-    LOOKBACK_MS RING_KB DEVICE_NAME CLIENT_ID OTA_MIN_BATTERY SD_MIN_MV SD_RESUME_MV)
+    LOOKBACK_MS RING_KB STORE_KB DEVICE_NAME CLIENT_ID OTA_MIN_BATTERY SD_MIN_MV SD_RESUME_MV)
 bus_keys=(I2C_SDA I2C_SCL SPI_SCK SPI_MISO SPI_MOSI)
 declare -A label=(
     [BOARD]="Board" [WIFI_SSID]="Wi-Fi network" [WIFI_PASSWORD]="Wi-Fi password"
@@ -35,7 +35,7 @@ declare -A label=(
     [MIC_CHANNEL]="Mic channel" [BUTTON_PIN]="Button pin" [LED_PIN]="Status LED"
     [I2C_SDA]="I2C SDA pin" [I2C_SCL]="I2C SCL pin" [SPI_SCK]="SPI SCK pin"
     [SPI_MISO]="SPI MISO pin" [SPI_MOSI]="SPI MOSI pin" [DEVICES]="Devices"
-    [LOOKBACK_MS]="Look-back" [RING_KB]="Ring buffer" [DEVICE_NAME]="Mic name"
+    [LOOKBACK_MS]="Look-back" [RING_KB]="Ring buffer" [STORE_KB]="Recording store" [DEVICE_NAME]="Mic name"
     [CLIENT_ID]="Client ID" [OTA_MIN_BATTERY]="Update battery"
     [SD_MIN_MV]="Card cutoff" [SD_RESUME_MV]="Card resume"
 )
@@ -80,7 +80,7 @@ use_board_defaults() {
     eval "$("${cfgpy[@]}" defaults "$BOARD")"
     I2S_BCLK=$DEF_I2S_BCLK I2S_WS=$DEF_I2S_WS I2S_DATA=$DEF_I2S_DATA
     BUTTON_PIN=$DEF_BUTTON_PIN LED_PIN=$DEF_LED_PIN
-    LOOKBACK_MS=$DEF_LOOKBACK_MS RING_KB=$DEF_RING_KB
+    LOOKBACK_MS=$DEF_LOOKBACK_MS RING_KB=$DEF_RING_KB STORE_KB=$DEF_STORE_KB
     local k def
     for k in "${bus_keys[@]}" DEVICES; do
         def=DEF_$k
@@ -246,6 +246,7 @@ edit() {
             ;;
         LOOKBACK_MS) input LOOKBACK_MS "Look-back" "How much audio from before the sound that opened the noise gate each upload starts with, in ms. With a ${RING_KB} KB ring buffer, at most $("${cfgpy[@]}" max-lookback "${RING_KB:-0}" 2>/dev/null || echo "?") ms:" ;;
         RING_KB) input RING_KB "Ring buffer" "RAM asked for recent audio, in KB (used in 16 KB blocks; 94 KB holds a second). The board takes what fits while keeping 32 KB free, and logs what it got:" ;;
+        STORE_KB) input STORE_KB "Recording store" "Memory for recordings waiting to be uploaded, in KB (PSRAM where the board has some). Each recording goes up once complete. auto (boards with PSRAM): all the PSRAM free, leaving room for the selected model; a number there is the most. Under about 900 KB (boards without PSRAM), recordings stream as they are made instead:" ;;
         DEVICE_NAME) input DEVICE_NAME "Mic name" "Reported to the server as the microphone's name:" ;;
         CLIENT_ID) input CLIENT_ID "Client ID" "UUID to use as this client's ID, or empty to derive a stable one from the chip:" ;;
         SD_MIN_MV) input SD_MIN_MV "Card cutoff" "A storage card that loses power while it writes can be ruined. When the battery gauge reads the cell under this voltage, in mV, the board closes the card and saves no audio to it until the cell recovers (3000-4000, or 0 for never; boards without a gauge, or running off the charger, use the card regardless):" ;;

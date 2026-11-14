@@ -135,7 +135,7 @@ function deviceState(c) {
   if (!c.active) return { level: "off", text: "offline" };
   if (!c.synced) return { level: "bad", text: "clock not synced" };
   const m = c.health?.mode?.mode;
-  return { level: "ok", text: m === "batch" ? "listening (batch)" : m === "low_power" ? "listening (low power)" : "listening" };
+  return { level: "ok", text: m === "batch" ? "listening (batch)" : m === "low_power" ? "listening (low power)" : m === "ultra_low_power" ? "listening (ultra low power)" : "listening" };
 }
 
 /// What needs attention on a device, worst first: [{ level: "bad" | "warn" | "info", text, tab }].

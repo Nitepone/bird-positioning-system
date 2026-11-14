@@ -45,6 +45,26 @@ extern "C" void port_unique_id(uint8_t out[8])
 
 extern "C" size_t port_free_heap(void) { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
 
+extern "C" bool port_has_psram(void) { return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0; }
+extern "C" size_t port_big_free_size(void)
+{
+    return heap_caps_get_free_size(port_has_psram() ? MALLOC_CAP_SPIRAM : MALLOC_CAP_8BIT);
+}
+extern "C" void *port_store_realloc(void *p, size_t n)
+{
+    return heap_caps_realloc(p, n, port_has_psram() ? MALLOC_CAP_SPIRAM : MALLOC_CAP_8BIT);
+}
+
+extern "C" void *port_internal_alloc(size_t n)
+{
+    return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+extern "C" void port_internal_free(void *p) { heap_caps_free(p); }
+extern "C" size_t port_internal_free_heap(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
 // The trace log's lock: a FreeRTOS mutex, only ever tried (never waited for),
 // so it neither blocks a task nor, unlike a critical section, holds off the
 // I2S interrupt. Made in port_board_init(), before anything logs.
@@ -558,6 +578,10 @@ extern "C" void port_wifi_diag(char *out, size_t cap)
 static i2s_chan_handle_t rx;
 // Set while a firmware update has capture stopped (port_ota_update()).
 static volatile bool capture_paused;
+// Held by the capture task while it hands a block to the core, and by the
+// loop while it moves the ring (port_audio_hold()).
+static SemaphoreHandle_t capture_mutex;
+static StaticSemaphore_t capture_mutex_buf;
 
 // When each DMA buffer completed, stamped in the I2S interrupt: far less
 // delayed than the capture task's wake-up. The driver hands buffers to reads
@@ -612,6 +636,7 @@ static void capture_task(void *)
                 t = (uint64_t)s;
         }
         size_t frames = got / (2 * sizeof(slot_t));
+        xSemaphoreTake(capture_mutex, portMAX_DELAY);
 #if BPS_MIC_PDM
         // Left-aligned in 32 bits, as I2S mics' samples arrive.
         static int32_t lr[2 * DMA_FRAMES];
@@ -621,6 +646,7 @@ static void capture_task(void *)
 #else
         bps_capture_frames(buf, frames, t);
 #endif
+        xSemaphoreGive(capture_mutex);
     }
 }
 
@@ -664,8 +690,19 @@ static bool init_mic(uint32_t sample_rate)
 }
 #endif
 
+extern "C" bool port_audio_hold(bool hold)
+{
+    if (!capture_mutex)
+        return false;
+    if (!hold)
+        return xSemaphoreGive(capture_mutex) == pdTRUE;
+    // A block takes well under a millisecond; much longer means something is wrong.
+    return xSemaphoreTake(capture_mutex, pdMS_TO_TICKS(20)) == pdTRUE;
+}
+
 extern "C" void port_audio_start(uint32_t sample_rate)
 {
+    capture_mutex = xSemaphoreCreateMutexStatic(&capture_mutex_buf);
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     cc.dma_desc_num = DMA_DESCS;
     cc.dma_frame_num = DMA_FRAMES;

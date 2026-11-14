@@ -48,12 +48,13 @@ const CHARGING = `<span class="badge ok">charging</span>`;
 /// yet to switch.
 function modeView(c) {
   const m = c.health?.mode, want = c.mode;
-  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : x.mode === "low_power" ? "low power" : "live";
+  const name = x => x.mode === "batch" ? `batch, every ${fmtInterval(x.interval_s)}` : x.mode === "low_power" ? "low power" : x.mode === "ultra_low_power" ? "ultra low power" : "live";
   if (!m) return { text: "live", cls: "muted", sub: "reports no mode: cannot be switched" };
   const parts = [];
   if (m.note) parts.push(m.note);
   else if (name(want) !== name(m)) parts.push(`switching to ${name(want)} at its next ${m.mode === "batch" ? "contact" : "heartbeat"}`);
-  if (m.mode === "low_power" && m.radio_on_pct != null) parts.push(`radio awake ${m.radio_on_pct.toFixed(1)}% of the time`);
+  if ((m.mode === "low_power" || m.mode === "ultra_low_power") && m.radio_on_pct != null) parts.push(`radio awake ${m.radio_on_pct.toFixed(1)}% of the time`);
+  if (m.mode === "ultra_low_power") parts.push("recordings arrive at its wakes, every 5 min");
   if (m.mode === "batch") {
     if (m.radio_on_pct != null) parts.push(`radio on ${m.radio_on_pct.toFixed(1)}% of the time`);
     if (m.next_contact_s != null && c.health) {
@@ -62,6 +63,13 @@ function modeView(c) {
     }
   }
   if (m.backlog) parts.push(`${plural(m.backlog, "recording")} (${fmtBytes(m.backlog_bytes)}) to upload`);
+  if (m.lookback_ms != null) {
+    const s = ms => `${(ms / 1000).toFixed(ms % 1000 ? 2 : 0)} s`;
+    const where = m.ring_memory === "internal" ? "internal RAM" : "PSRAM";
+    const short = m.lookback_set_ms != null && m.lookback_ms < m.lookback_set_ms;
+    parts.push(`look-back ${s(m.lookback_ms)}${short ? ` of ${s(m.lookback_set_ms)}` : ""}` +
+      (m.ring_ms != null ? ` (${s(m.ring_ms)} ring in ${where})` : ""));
+  }
   return { text: name(m), sub: parts.join("; "), cls: m.note ? "bad" : "" };
 }
 /// How far a batch device's clock moved while its radio was last off, or "".

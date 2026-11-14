@@ -304,14 +304,34 @@ without the access point's clock. In batch mode chunks are not also copied to `r
 Batch mode needs an ESP32 board (a Pico board has no card slot yet). A board starts in live mode
 and switches at its first heartbeat.
 
-**Low-power mode** (ESP32 boards) stays connected and uploads as it records, like live, but lets
-the Wi-Fi radio sleep (modem sleep) between short wakes: a burst of 8 clock measurements every
-15 s, a heartbeat every 30 s, and uploads. It turns off beacon capture, so the device follows only the
+**Low-power mode** (ESP32 boards) stays connected and uploads each recording once it is complete,
+like live, but lets the Wi-Fi radio sleep (modem sleep) between short wakes: a burst of 8 clock
+measurements every 15 s, a heartbeat every 30 s, and each upload (a burst of well under a second
+on a good link). It moves the ring buffer from PSRAM into the chip's own RAM, taking as much as
+is free there above a 32 KB reserve, up to about 1.7 s for a 1 s look-back. With less room the
+look-back is shorter (at least 0.25 s); with too little for that, the ring stays in PSRAM and the
+board tries again each minute. The heartbeat's `mode` reports `ring_memory` (`internal` or
+`psram`), `ring_ms`, `lookback_ms` (in use), `lookback_set_ms` and `internal_free_bytes`, shown
+under the device's mode on the **Devices** page, and the trace log's `power status:` line gives the
+same and why the ring was not moved. It turns off beacon capture, so the device follows only the
 server's clock, not its access point's, and it runs the processor at 80 MHz instead of 160. Until
 its clock has been measured after joining, the radio stays awake. The heartbeat's `radio_on_pct`
 is the share of time the radio was awake. With trace logging on, a `power status:` line each
 minute gives the CPU clock, the radio's power saving and listen interval, beacon capture, the
 time awake, and the battery's voltage, charge and rate.
+
+**Ultra low power** (`ultra_low_power`, for nights) goes further than low power. The radio wakes
+only once every 5 minutes for a burst of 16 clock measurements, a heartbeat, and every recording
+made since, which wait in the PSRAM store meanwhile. It also wakes early if the store is half full,
+or before a reboot or update. A sound must pass the trigger for 300 ms in a row (three 100 ms
+frames) to be recorded, instead of one frame, so short clicks are not sent. The look-back still
+counts from where the sound began. The clock fit keeps 16 minutes of measurements instead of 64 s,
+so drift is still measured across wakes. Timestamps are best effort: one taken just before a wake
+is extrapolated nearly 5 minutes from the last measurement. Recordings reach the server up to 5
+minutes late, so heartbeats carry `delivered_through`, and the server holds other devices' calls
+back for them, as for batch mode. The server counts the device as active for two missed wakes
+(10 minutes). Settings and commands reach it at its next wake. It needs a store that holds whole
+recordings (PSRAM); a board without one runs low power instead and says why.
 
 **Maintenance: reboot and trace logging.** On the **Devices** page (select a client; *Maintenance* on its Overview tab):
 
@@ -438,15 +458,27 @@ default.
 
 **How it differs from `bsp-client`.**
 
-- **Noise gate and look-back.** A 9 s chunk is 864 KB, more than most of these boards' RAM, so they
-  cannot record a chunk and then decide whether to send it. Instead, they run the noise gate on
-  the live audio and keep the last second or so in a ring buffer. When a sound passes the gate,
-  they stream a 9 s chunk that starts that **look-back** before the sound. If it is still going
-  at the end of a chunk, the next chunk follows without a gap. Silence is never sent.
+- **Noise gate, look-back and the store.** The boards run the noise gate on the live audio and
+  keep the last second or so in a ring buffer. When a sound passes the gate, they record a 9 s
+  chunk that starts that **look-back** before the sound, encoding it as FLAC into the **store**
+  as it is captured. On the XIAO boards the store takes the PSRAM that is free (`STORE_KB=auto`,
+  the default; a number there is the most it takes), keeping back 512 KB, the ring buffer's way
+  back from internal RAM, and what the selected validation model needs: about 6 MB with no model
+  or a small one, about 4 MB with `birdnet-tiny`, so 16–24 chunks (it holds at most 48). When a
+  model is chosen, the store shrinks before it loads (waiting, if it holds more than the smaller
+  size, until enough has been uploaded); when the model goes, the store grows back. The startup
+  log and each change say its size, and the heartbeat's `mode` carries `store_bytes`. Only once a chunk is complete does it go to the server, in one burst, so
+  the radio is busy for well under a second instead of the chunk's 9 s. Validation (on-device
+  model) runs while the chunk is recorded, and a chunk it rejects never leaves the board. If a
+  sound is still going at the end of a chunk, the next chunk follows without a gap. Silence is
+  never sent. Boards whose store cannot hold a chunk (no PSRAM: the Pico boards, the classic
+  ESP32) stream each chunk as it is encoded instead, as before there was a store.
 - **What gets dropped.** A sound that starts quietly and passes the gate only later than the
-  look-back loses its quiet start. There is no upload queue: while the server is unreachable,
-  audio is dropped. If Wi-Fi stalls for longer than the ring buffer holds, the lost stretch is
-  sent as silence, so the rest of the chunk keeps its exact timing.
+  look-back loses its quiet start. While the server is unreachable, chunks wait in the store and
+  go when it is back (each is tried up to 6 times); once it is full, the oldest give way to new
+  ones (`store:` in the status log counts them). The store is RAM: what is in it is lost at a
+  restart. If the board falls behind encoding for longer than the ring buffer holds, the lost
+  stretch is recorded as silence, so the rest of the chunk keeps its exact timing.
 - **Wi-Fi and sync.** A worst-case clock error includes half the fastest round trip, and a Pico
   W's Wi-Fi round trips are rarely under 4 ms. So on many networks it stays above the server's
   default 2 ms limit (**NOT synced**: identified, but left out of positioning). Its status line
@@ -470,7 +502,7 @@ default.
 | Pico W (RP2040) | 264 KB | about 1.4 s | 0.75 s |
 | Pico 2 W (RP2350) | 520 KB | about 4 s | 2.5 s |
 | ESP32 (classic) | 520 KB, about half free | about 1.5–2 s | 1 s |
-| XIAO ESP32S3 (Plus), bps XIAO board | 512 KB + 8 MB PSRAM | about 10.9 s (in PSRAM) | 2.5 s |
+| XIAO ESP32S3 (Plus), bps XIAO board | 512 KB + 8 MB PSRAM | about 10.9 s in PSRAM; in low-power mode, what fits in internal RAM, up to about 1.7 s | 1 s |
 
 The board takes what `RING_KB` asks for, as long as 32 KB of heap stays free for the network
 stack. At startup it logs what it got and the look-back it can keep. It also logs the
@@ -492,7 +524,8 @@ microphone's level on both I2S channels: a channel at about −180 dBFS is silen
 | Microcontroller never uploads | The mic level line in its log: about −180 dBFS on the channel in use means wrong `MIC_CHANNEL` or wiring |
 | SD card shows "no card" | Is it FAT32? The log says `sd: card mounted` once it is found; the board retries every 5 s |
 | Battery shows "no reading" | The gauge is powered by the battery: is one connected (one only: the 18650 holder or the LiPo connector)? |
-| "upload: the network stalled; … sent as silence" | Wi-Fi stalled for longer than the ring buffer holds: check the `Wi-Fi … dBm` in the status line, move the board or access point, or lower `LOOKBACK_MS` for more slack |
+| An upload line with "… ms lost" | The board fell behind recording for longer than the ring buffer holds (a stall of its loop, e.g. connecting to a server that does not answer): lower `LOOKBACK_MS` for more slack |
+| "store: … dropped unsent" | The server was unreachable for longer than the store holds chunks: check the `upload:` lines for why |
 | Microcontroller stays **NOT synced** | Its status line's *best round trip*: the error bound includes half of it, so above about 4 ms it cannot get under the default 2 ms. Improve the Wi-Fi path (signal, a less busy channel, no router between board and server), or raise `max_clock_offset_us` if looser positioning is acceptable |
 
 ## BirdNET

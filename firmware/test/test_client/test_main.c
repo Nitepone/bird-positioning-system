@@ -148,6 +148,28 @@ void port_led(bool on) { (void)on; }
 bool port_button(void) { return false; }
 void *port_big_alloc(size_t n) { return malloc(n); }
 void port_big_free(void *p) { free(p); }
+// 8 MB of PSRAM, less the store's buffer.
+static size_t store_size;
+void *port_store_realloc(void *p, size_t n)
+{
+    void *q = realloc(p, n);
+    if (q)
+        store_size = n;
+    return q;
+}
+size_t port_big_free_size(void) { return (8u << 20) - store_size; }
+bool port_has_psram(void) { return true; }
+void *port_internal_alloc(size_t n) { return malloc(n); }
+void port_internal_free(void *p) { free(p); }
+size_t port_internal_free_heap(void) { return 200 * 1024; }
+static int audio_holds; // the ring moved while capture was held
+static bool audio_held;
+bool port_audio_hold(bool hold)
+{
+    audio_held = hold;
+    audio_holds += hold;
+    return true;
+}
 int port_udp_open(const char *host, uint16_t port) { (void)host, (void)port; return -1; }
 int port_udp_send(int h, const void *b, size_t n) { (void)h, (void)b, (void)n; return -1; }
 int port_udp_recv(int h, void *b, size_t n) { (void)h, (void)b, (void)n; return 0; }
@@ -414,6 +436,9 @@ static void boot(bool model)
     mode.radio_on = true;
     memset(&lp, 0, sizeof lp);
     lp.level = PORT_WIFI_FULL;
+    ring_internal = false;
+    ring_refused = -1;
+    bps_upload_set_spool(false); // as live mode has it
     wifi_power = PORT_WIFI_FULL;
     cpu_low = false;
     ts.h = -1;
@@ -658,6 +683,40 @@ static void test_a_spool_pass_waits_for_a_model_to_load(void)
         loop_once(480);
     TEST_ASSERT_FALSE(bps_spool_busy());
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, count(".json"), "the stored chunk did not go up");
+}
+
+// The store takes the PSRAM free, and gives way to a model: it shrinks
+// before the model loads, by what the model needs, and grows back once the
+// model is let go.
+static void test_the_store_makes_room_for_a_model_and_takes_it_back(void)
+{
+    static const char *BIG_ARENA =
+        "{\"model_name\": \"m\", \"model_file\": \"model.tflite\", \"sample_rate\": 16000,"
+        " \"window_samples\": 48000, \"frontend\": \"logmel_db_minmax\", \"fft_length\": 1024,"
+        " \"hop_length\": 256, \"frames\": 184, \"mel_fmin_hz\": 100.0, \"mel_fmax_hz\": 8000.0,"
+        " \"layout\": \"time_freq\", \"output_kind\": \"probability\", \"bird_output_first\": 1,"
+        " \"bird_output_count\": 1, \"mel_bands\": 16, \"score_threshold\": 0.35,"
+        " \"arena_bytes\": 1048576, \"model_bytes\": 6384}";
+    boot(true);
+    bps_upload_status us;
+    bps_upload_status_get(&us);
+    uint32_t full = us.cap;
+    TEST_ASSERT_EQUAL_UINT32(((8u << 20) - BIG_RESERVE) / 4096 * 4096, full);
+    put_model();
+    put("models/m/model.json", BIG_ARENA, (uint32_t)strlen(BIG_ARENA), false);
+    for (int i = 0; i < 200 && !bps_validate_active(); i++)
+        loop_once(48);
+    TEST_ASSERT_TRUE_MESSAGE(bps_validate_active(), bps_validate_note() ? bps_validate_note() : "");
+    bps_upload_status_get(&us);
+    TEST_ASSERT_EQUAL_UINT32((full - 6384 - 1048576 - 128 * 1024) / 4096 * 4096, us.cap);
+
+    bps_validation_config none;
+    bps_validation_default(&none);
+    bps_validate_configure(&none);
+    for (int i = 0; i < 1500; i++)
+        loop_once(480); // 15 s: past the next fit
+    bps_upload_status_get(&us);
+    TEST_ASSERT_EQUAL_UINT32(full, us.cap);
 }
 
 // The once-a-boot sweep for .flac files a restart left without their .json
@@ -1069,15 +1128,15 @@ static const char *status_detail(const char *hb, char *out, size_t cap)
     return out;
 }
 
-// An offer is taken once the upload in progress is done; a failed download
-// is reported until a heartbeat is delivered, and capture goes on.
+// An offer is taken once the recording in progress is uploaded; a failed
+// download is reported until a heartbeat is delivered, and capture goes on.
 static void test_a_failed_update_is_reported_until_delivered(void)
 {
     ota_reset();
     boot(false);
-    gate_pass(); // an upload in progress
+    gate_pass(); // a recording in progress
     run_ms(100);
-    TEST_ASSERT_TRUE(bps_upload_sending());
+    TEST_ASSERT_TRUE(bps_upload_encoding());
     heartbeat_answered(ok_reply(OFFER_REPLY));
     TEST_ASSERT_TRUE(maint.rebooting);
     TEST_ASSERT_TRUE(maint.updating);
@@ -1253,6 +1312,102 @@ static void test_low_power_mode_sleeps_between_clock_bursts(void)
     ts.h = -1;
 }
 
+// Low-power mode: the ring moves to internal RAM (the capture core held off
+// meanwhile), a recording is made with the radio asleep, and the radio wakes
+// once it is complete, to upload it in one go. Back in live mode, the ring
+// returns to PSRAM.
+static void test_low_power_mode_records_asleep_and_uploads_once_complete(void)
+{
+    boot(false);
+    ts.h = 0;
+    uint32_t big = ring.capacity;
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"low_power\",\"interval_s\":300}}"));
+    hb_next_us = UINT64_MAX / 2;
+    mode.session_synced = true;
+    int holds = audio_holds;
+    run_ms(1500); // the first clock burst is over
+    TEST_ASSERT_TRUE(ring_internal);
+    TEST_ASSERT_EQUAL_INT(holds + 1, audio_holds);
+    TEST_ASSERT_FALSE(audio_held);
+    TEST_ASSERT_TRUE(ring.capacity < big);
+    TEST_ASSERT_TRUE(ring.capacity >= lookback + RATE * BPS_UPLOAD_SLACK_MS / 1000);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power);
+
+    uint64_t sent = stats.chunks_sent;
+    gate_pass();
+    run_ms(5000);
+    TEST_ASSERT_TRUE(bps_upload_encoding());
+    TEST_ASSERT_EQUAL_INT_MESSAGE(PORT_WIFI_SAVE, wifi_power, "the radio woke while recording");
+    TEST_ASSERT_EQUAL_UINT64(sent, stats.chunks_sent);
+    run_ms(5000);
+    TEST_ASSERT_EQUAL_UINT64(sent + 1, stats.chunks_sent);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stats.overruns, "audio was lost");
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power); // asleep again
+
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"live\",\"interval_s\":300}}"));
+    run_ms(20);
+    TEST_ASSERT_FALSE(ring_internal);
+    TEST_ASSERT_EQUAL_UINT32(big, ring.capacity);
+    ts.h = -1;
+}
+
+// Ultra-low-power mode: a sound must last three frames to count, and the
+// clock keeps 16 minutes of bursts. A recording made asleep waits in the
+// store, the radio asleep, until the next wake (every 5 min), and goes up
+// then; heartbeats say what has been delivered. Back in live mode, all is
+// as before.
+static void test_ultra_low_power_mode_keeps_recordings_for_its_wakes(void)
+{
+    boot(false);
+    ts.h = 0;
+    uint32_t big = ring.capacity;
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"ultra_low_power\",\"interval_s\":300}}"));
+    mode.session_synced = true;
+    run_ms(1500); // the first wake's clock burst is over
+    TEST_ASSERT_EQUAL_INT(MODE_ULTRA_LOW, mode.run);
+    TEST_ASSERT_TRUE(ring_internal);
+    TEST_ASSERT_EQUAL_UINT32(ULP_MIN_RUN, cap.min_run);
+    TEST_ASSERT_TRUE(clk.est.window_ns == ULP_CLOCK_WINDOW_NS);
+    TEST_ASSERT_TRUE(cpu_low);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power);
+    TEST_ASSERT_TRUE(hb_next_us > now_us + 250000000ull); // the next heartbeat at the next wake
+
+    uint64_t sent = stats.chunks_sent;
+    gate_pass();
+    run_ms(12000); // recorded, and kept
+    TEST_ASSERT_FALSE(bps_upload_encoding());
+    TEST_ASSERT_EQUAL_UINT64(sent, stats.chunks_sent);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(PORT_WIFI_SAVE, wifi_power, "the radio woke for the recording");
+    bps_upload_status us;
+    bps_upload_status_get(&us);
+    TEST_ASSERT_EQUAL_UINT32(1, us.queued);
+    int64_t oldest;
+    TEST_ASSERT_TRUE(bps_upload_oldest_start(&oldest));
+    char want[64];
+    snprintf(want, sizeof want, "\"delivered_through\":%lld", (long long)oldest);
+    const char *hb = heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"ultra_low_power\",\"interval_s\":300}}"));
+    TEST_ASSERT_NOT_NULL(strstr(hb, "\"mode\":\"ultra_low_power\""));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(hb, want), hb);
+    TEST_ASSERT_EQUAL_UINT64(sent, stats.chunks_sent); // a heartbeat alone is no wake
+
+    lp.next_burst_us = now_us; // the next wake
+    run_ms(1500);
+    TEST_ASSERT_EQUAL_UINT64(sent + 1, stats.chunks_sent);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stats.overruns, "audio was lost");
+    TEST_ASSERT_FALSE(lp.flush);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_SAVE, wifi_power); // asleep again
+    TEST_ASSERT_FALSE(bps_upload_oldest_start(&oldest));
+
+    heartbeat_answered(ok_reply("{\"mode\":{\"mode\":\"live\",\"interval_s\":300}}"));
+    run_ms(20);
+    TEST_ASSERT_FALSE(ring_internal);
+    TEST_ASSERT_EQUAL_UINT32(big, ring.capacity);
+    TEST_ASSERT_EQUAL_UINT32(1, cap.min_run);
+    TEST_ASSERT_TRUE(clk.est.window_ns == BPS_CLOCK_WINDOW_NS);
+    TEST_ASSERT_EQUAL_INT(PORT_WIFI_FULL, wifi_power);
+    ts.h = -1;
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1267,6 +1422,7 @@ int main(void)
     RUN_TEST(test_rejected_chunks_count_once_as_gated);
     RUN_TEST(test_stored_uploads_and_a_model_being_loaded_keep_to_their_reads);
     RUN_TEST(test_a_spool_pass_waits_for_a_model_to_load);
+    RUN_TEST(test_the_store_makes_room_for_a_model_and_takes_it_back);
     RUN_TEST(test_a_chunk_saved_during_a_pass_is_not_swept_up);
     RUN_TEST(test_registration_reports_the_build_and_ota);
     RUN_TEST(test_a_board_without_updates_ignores_an_offer);
@@ -1276,5 +1432,7 @@ int main(void)
     RUN_TEST(test_a_low_battery_defers_an_update);
     RUN_TEST(test_an_update_in_batch_mode_keeps_the_radio_on);
     RUN_TEST(test_low_power_mode_sleeps_between_clock_bursts);
+    RUN_TEST(test_low_power_mode_records_asleep_and_uploads_once_complete);
+    RUN_TEST(test_ultra_low_power_mode_keeps_recordings_for_its_wakes);
     return UNITY_END();
 }
