@@ -37,6 +37,12 @@ XIAO_S3_PLUS_PINS = XIAO_S3_PINS | {10, 11, 12, 13, 38, 39, 40, 41, 42}  # D11-D
 # LED can only be the XIAO's own.
 BPS_XIAO_PDM_CLK = 3
 BPS_XIAO_PDM_DATA = 4
+# The same board with a XIAO ESP32C5 in the socket: the same pads, other GPIOs
+# (its variant's pins_arduino.h): D0 1, D1 0, D2 25, D3 7, D4 23, D5 24, D6 11,
+# D7 12, D8 8, D9 9, D10 10. The user LED is GPIO 27.
+XIAO_C5_PINS = {0, 1, 7, 8, 9, 10, 11, 12, 23, 24, 25}
+BPS_XIAO_C5_PDM_CLK = 25
+BPS_XIAO_C5_PDM_DATA = 7
 
 # Drivers for devices on the I2C and SPI buses (firmware/lib/bps_core/src/
 # devices.c): their bus and usual I2C address. DEVICES lists a board's as
@@ -79,6 +85,7 @@ BOARDS = {
         "title": "Seeed XIAO ESP32S3 (8 MB PSRAM)",
         "short": "xiao-esp32s3",
         "family": "esp32",
+        "psram": True,
         "out_pins": XIAO_S3_PINS, "in_pins": XIAO_S3_PINS | {0}, "builtin_led": True,
         "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
                      "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "1000",
@@ -88,6 +95,7 @@ BOARDS = {
         "title": "Seeed XIAO ESP32S3 Plus (8 MB PSRAM)",
         "short": "xiao-esp32s3-plus",
         "family": "esp32",
+        "psram": True,
         "out_pins": XIAO_S3_PLUS_PINS, "in_pins": XIAO_S3_PLUS_PINS | {0}, "builtin_led": True,
         "defaults": {"I2S_BCLK": "7", "I2S_WS": "8", "I2S_DATA": "9", "LED_PIN": "builtin",
                      "BUTTON_PIN": "0", "RING_KB": "1024", "LOOKBACK_MS": "1000",
@@ -97,6 +105,7 @@ BOARDS = {
         "title": "bps XIAO board (XIAO ESP32S3, PDM mic)",
         "short": "bps-xiao",
         "family": "esp32",
+        "psram": True,
         "mic": "pdm",
         # The mic's pins are fixed by the board (see `complete`).
         # The mic's and buses' pins are wired on the board (see `complete`): I2C
@@ -109,6 +118,23 @@ BOARDS = {
         "defaults": {"LED_PIN": "builtin", "BUTTON_PIN": "0", "RING_KB": "1024",
                      "LOOKBACK_MS": "1000", "STORE_KB": "auto", "DEVICE_NAME": "IM73D122",
                      "DEVICES": "max17048@0x36 sd@2"},
+    },
+    "bps_xiao_c5": {
+        "title": "bps XIAO board (XIAO ESP32C5, PDM mic)",
+        "short": "bps-xiao-c5",
+        "family": "esp32",
+        "mic": "pdm",
+        "psram": True,
+        # As bps_xiao, through the C5's pins: I2C on D4/D5, SPI on D8-D10, the
+        # microSD card's chip select on D1 (GPIO 0). Its BOOT button is not on
+        # a pin the firmware can read, so there is none.
+        "fixed": {"I2S_BCLK": str(BPS_XIAO_C5_PDM_CLK), "I2S_DATA": str(BPS_XIAO_C5_PDM_DATA),
+                  "I2S_WS": "none", "I2C_SDA": "23", "I2C_SCL": "24",
+                  "SPI_SCK": "8", "SPI_MISO": "9", "SPI_MOSI": "10"},
+        "out_pins": XIAO_C5_PINS, "in_pins": XIAO_C5_PINS, "builtin_led": True,
+        "defaults": {"LED_PIN": "builtin", "BUTTON_PIN": "none", "RING_KB": "1024",
+                     "LOOKBACK_MS": "1000", "STORE_KB": "auto", "DEVICE_NAME": "IM73D122",
+                     "DEVICES": "max17048@0x36 sd@0"},
     },
 }
 
@@ -337,8 +363,8 @@ def validate(cfg):
         errors.append(f"LOOKBACK_MS must be 0-{max_lookback_ms(int(ring))} "
                       f"(the {ring} KB ring buffer holds {ring_ms(int(ring))} ms)")
     store = cfg.get("STORE_KB", "")
-    if store == "auto" and "ESP32S3" not in BOARDS.get(cfg.get("BOARD", ""), {}).get("title", "ESP32S3"):
-        errors.append("STORE_KB=auto needs a board with PSRAM (the XIAO ESP32S3 boards); "
+    if store == "auto" and not BOARDS.get(cfg.get("BOARD", ""), {"psram": True}).get("psram"):
+        errors.append("STORE_KB=auto needs a board with PSRAM (the XIAO ESP32S3 and C5 boards); "
                       "give a size in KB")
     elif store and store != "auto" and (not store.isdigit() or not 16 <= int(store) <= 8192):
         errors.append("STORE_KB must be auto or 16-8192 (memory for recordings waiting to be "

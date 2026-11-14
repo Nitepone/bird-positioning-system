@@ -619,6 +619,15 @@ static void capture_task(void *)
     static slot_t buf[2 * DMA_FRAMES]; // exactly one DMA buffer
     uint32_t reads = 0;
     for (;;) {
+        // Paused (a firmware update): no read starts, so capture_stop()'s
+        // i2s_channel_disable() gets the channel once the read in progress
+        // ends. Reading on, this task (above the loop's priority) took the
+        // channel back at once, and on a single core (the ESP32-C5) the
+        // disable waited for ever.
+        if (capture_paused) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         size_t got = 0;
         if (i2s_channel_read(rx, buf, sizeof buf, &got, portMAX_DELAY) != ESP_OK) {
             vTaskDelay(1); // the channel is stopped (a firmware update): rest
