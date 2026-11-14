@@ -138,30 +138,30 @@ function deviceState(c) {
   return { level: "ok", text: m === "batch" ? "listening (batch)" : m === "low_power" ? "listening (low power)" : m === "ultra_low_power" ? "listening (ultra low power)" : "listening" };
 }
 
-/// What needs attention on a device, worst first: [{ level: "bad" | "warn" | "info", text, tab }].
-/// `tab` names the part of the device page that shows more.
+/// What needs attention on a device, worst first: [{ level: "bad" | "warn" | "info", text, short, tab }].
+/// `short` fits under the device's name in the list; `tab` names the part of the device page that shows more.
 function deviceIssues(c) {
-  const out = [], h = c.health, add = (level, text, tab) => out.push({ level, text, tab });
-  if (c.api_compat === "incompatible") add("bad", `Its API version (${c.api_version}) is refused by this server`, "overview");
-  if (c.active && !c.synced) add("bad", "Its clock is not synced: its recordings cannot be placed in time", "clock");
+  const out = [], h = c.health, add = (level, text, short, tab) => out.push({ level, text, short, tab });
+  if (c.api_compat === "incompatible") add("bad", `Its API version (${c.api_version}) is refused by this server`, "API refused", "overview");
+  if (c.active && !c.synced) add("bad", "Its clock is not synced: its recordings cannot be placed in time", "clock not synced", "clock");
   const b = h?.battery;
-  if (c.active && b && b.percent < BATTERY_LOW_PCT && b.charging !== true) add("bad", `Battery at ${Math.round(b.percent)}%`, "overview");
+  if (c.active && b && b.percent < BATTERY_LOW_PCT && b.charging !== true) add("bad", `Battery at ${Math.round(b.percent)}%`, "battery low", "overview");
   const fw = c.firmware?.last;
   if (fw && (fw.result === "failed" || fw.result === "rolled_back"))
-    add("bad", `Firmware update ${fw.result === "failed" ? "failed" : "was rolled back"}`, "firmware");
+    add("bad", `Firmware update ${fw.result === "failed" ? "failed" : "was rolled back"}`, fw.result === "failed" ? "update failed" : "update rolled back", "firmware");
   const s = h?.storage;
-  if (s && s.present && s.free_bytes != null && s.free_bytes < STORAGE_LOW_BYTES) add("warn", `Storage card nearly full (${fmtBytes(s.free_bytes)} free)`, "overview");
-  if (s && s.errors) add("warn", `${plural(s.errors, "storage card write error")}`, "overview");
-  if (s && s.paused) add("warn", "Storage card closed while the battery is low: recordings are not kept", "overview");
+  if (s && s.present && s.free_bytes != null && s.free_bytes < STORAGE_LOW_BYTES) add("warn", `Storage card nearly full (${fmtBytes(s.free_bytes)} free)`, "card nearly full", "overview");
+  if (s && s.errors) add("warn", `${plural(s.errors, "storage card write error")}`, "card write errors", "overview");
+  if (s && s.paused) add("warn", "Storage card closed while the battery is low: recordings are not kept", "card closed", "overview");
   const missing = (h?.devices || []).filter(d => !d.present).map(d => d.kind);
-  if (c.active && missing.length) add("warn", `Not found: ${missing.join(", ")}`, "overview");
-  if (h?.mode?.note) add("warn", h.mode.note, "overview");
+  if (c.active && missing.length) add("warn", `Not found: ${missing.join(", ")}`, `no ${missing.join(", ")}`, "overview");
+  if (h?.mode?.note) add("warn", h.mode.note, "mode not as set", "overview");
   if (["watchdog", "brownout", "panic"].includes(c.last_reboot?.reason))
-    add("warn", `Last start was a ${c.last_reboot.reason === "panic" ? "crash" : c.last_reboot.reason}`, "overview");
-  if (c.api_compat === "legacy") add("warn", "Old firmware: it does not report an API version", "firmware");
-  if (c.api_compat === "client_newer") add("warn", "It speaks a newer API than this server", "firmware");
-  if (c.firmware?.offering) add("info", "A firmware update is on offer", "firmware");
-  if (c.positioning_requested) add("info", "It is asking to have its position set", "setup");
+    add("warn", `Last start was a ${c.last_reboot.reason === "panic" ? "crash" : c.last_reboot.reason}`, c.last_reboot.reason === "panic" ? "crashed" : c.last_reboot.reason, "overview");
+  if (c.api_compat === "legacy") add("warn", "Old firmware: it does not report an API version", "old firmware", "firmware");
+  if (c.api_compat === "client_newer") add("warn", "It speaks a newer API than this server", "newer API", "firmware");
+  if (c.firmware?.offering) add("info", "A firmware update is on offer", "update on offer", "firmware");
+  if (c.positioning_requested) add("info", "It is asking to have its position set", "asks for position", "setup");
   const order = { bad: 0, warn: 1, info: 2 };
   return out.sort((a, b) => order[a.level] - order[b.level]);
 }

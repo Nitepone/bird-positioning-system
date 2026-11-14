@@ -157,13 +157,13 @@ function renderDevices() {
     const st = deviceState(c), bat = batteryView(c), issues = deviceIssues(c).filter(i => i.level !== "info");
     const worst = issues[0]?.level;
     const second = !c.active ? `offline, last heard ${fmtAgo(c.last_seen)}`
-      : issues.length ? esc(issues[0].text) + (issues.length > 1 ? ` (+${issues.length - 1})` : "")
+      : issues.length ? esc(issues[0].short) + (issues.length > 1 ? ` (+${issues.length - 1})` : "")
       : esc(st.text) + (c.clock_error_ns != null ? `, clock within ${(c.clock_error_ns / 1e6).toFixed(1)} ms` : "");
     return `<li><a class="item ${c.active ? "" : "off"} ${c.id === devId ? "current" : ""}" href="${deviceLink(c.id, devTab === "overview" ? "" : devTab)}">
       <div class="line"><span class="dot ${worst === "bad" ? "bad" : worst === "warn" && c.active ? "warn" : st.level}" title="${esc(st.text)}"></span>
         <span class="grow"><b>${esc(label(c.id))}</b></span>
         ${bat && c.health?.battery ? `<span class="num ${bat.cls}" title="Battery${bat.charging ? ", charging" : ""}">${esc(bat.text)}${bat.charging ? " +" : ""}</span>` : ""}</div>
-      <div class="sub"><span class="grow ${worst && c.active ? worst : ""}">${second}</span></div></a></li>`;
+      <div class="sub"><span class="grow ${worst && c.active ? worst : ""}"${c.active && issues.length ? ` title="${esc(issues.map(i => i.text).join("\n"))}"` : ""}>${second}</span></div></a></li>`;
   }).join("") || `<li class="empty">No devices.</li>`);
   $("dev-hidden-box").hidden = !hidden.length;
   setText("dev-hidden-text", devPrefs.showOld ? `${plural(hidden.length, "device")} offline for more than a day.` : `${plural(hidden.length, "device")} offline for more than a day ${hidden.length === 1 ? "is" : "are"} not listed.`);

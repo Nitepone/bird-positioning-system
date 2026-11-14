@@ -48,11 +48,17 @@ function cssVar(name) { return getComputedStyle(document.documentElement).getPro
 
 // ---- small DOM helpers ----
 
+let pressedAt = null;  // what a pointer is pressing, until it lets go
+document.addEventListener("pointerdown", e => { pressedAt = e.target; }, true);
+for (const k of ["pointerup", "pointercancel"]) document.addEventListener(k, () => { pressedAt = null; }, true);
 /// Sets an element's HTML only when it differs, so what the user is pointing at, has open or is
 /// typing into is left alone between refreshes. True if it changed.
+/// Held back while a mouse button or finger is down inside the element: rebuilding it between
+/// press and release would lose the click.
 function setHtml(el, html) {
   if (typeof el === "string") el = $(el);
   if (!el || el.__html === html) return false;
+  if (pressedAt && el.contains(pressedAt)) return false;
   el.innerHTML = html;
   el.__html = html;
   return true;
