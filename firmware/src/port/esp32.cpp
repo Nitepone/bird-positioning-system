@@ -14,6 +14,7 @@
 #include <driver/i2s_pdm.h>
 #include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 #include <esp_private/wifi.h>
@@ -607,16 +608,97 @@ static bool IRAM_ATTR on_recv_q_ovf(i2s_chan_handle_t, i2s_event_data_t *, void 
     return false;
 }
 
-#if BPS_MIC_PDM
+#if BPS_MIC_PDM && !SOC_I2S_SUPPORTS_PDM2PCM
+// No PDM-to-PCM filter (the ESP32-C5): the raw bits, filtered and decimated
+// in software (pdm.h). The mic's clock is the driver's raw sample rate, and
+// each frame is two 16-bit words, the same 16 bits in each (one slot, mono).
+// A buffer holds the bits of PDM_PER_BUF samples: half DMA_FRAMES, as a
+// DMA buffer is at most 4092 bytes.
+#define BPS_PDM_SOFT 1
+extern "C" {
+#include "pdm.h"
+}
+typedef uint16_t slot_t;
+#define PDM_PER_BUF (DMA_FRAMES / 2)
+#define PDM_FRAMES_PER_BUF (PDM_PER_BUF * BPS_PDM_DECIM / 16) /* 16 bits a frame */
+#define SLOTS_PER_BUF (2 * PDM_FRAMES_PER_BUF)
+/* Allocated when capture starts (after Wi-Fi): 20 KB, internal RAM if it fits. */
+static bps_pdm *pdm;
+static uint32_t pdm_rate; /* the PCM sample rate */
+/* How the bits sit in the words, as pdm_calibrate() found: bit 0, the
+ * earliest bit is the word's bottom (else its top); bit 1, a frame's second
+ * word is taken (else its first). */
+static int pdm_order;
+
+/* `frames` frames (two words each) to bytes, the earliest bit of each byte
+ * its top. */
+static void pdm_bytes(const slot_t *buf, size_t frames, int order, uint8_t *out)
+{
+    for (size_t i = 0; i < frames; i++) {
+        uint16_t w = buf[2 * i + ((order & 2) ? 1 : 0)];
+        if (order & 1) {
+            out[2 * i] = pdm->rev[w & 0xff];
+            out[2 * i + 1] = pdm->rev[w >> 8];
+        } else {
+            out[2 * i] = (uint8_t)(w >> 8);
+            out[2 * i + 1] = (uint8_t)w;
+        }
+    }
+}
+#elif BPS_MIC_PDM
 // The PDM-to-PCM filter gives 16-bit samples.
 typedef int16_t slot_t;
+#define SLOTS_PER_BUF (2 * DMA_FRAMES)
 #else
 typedef int32_t slot_t;
+#define SLOTS_PER_BUF (2 * DMA_FRAMES)
+#endif
+
+#if BPS_PDM_SOFT
+// One buffer of raw bits to 32-bit samples in both slots, as the core takes
+// them; the filter's delay is taken off the buffer's time. Each minute the
+// log says how fast bits came and how many were ones (about half, for a
+// working microphone).
+static size_t pdm_to_frames(const slot_t *buf, size_t words, uint64_t *t, int32_t *lr)
+{
+    static uint8_t bytes[2 * PDM_FRAMES_PER_BUF];
+    static int16_t pcm[DMA_FRAMES];
+    static uint64_t since_us, bytes_in, ones_at, busy_us;
+    size_t frames = words / 2;
+    pdm_bytes(buf, frames, pdm_order, bytes);
+    int64_t t0 = esp_timer_get_time();
+    size_t n = bps_pdm_process(pdm, bytes, 2 * frames, pcm);
+    busy_us += (uint64_t)(esp_timer_get_time() - t0);
+    for (size_t i = 0; i < n; i++)
+        lr[2 * i] = lr[2 * i + 1] = (int32_t)((uint32_t)(uint16_t)pcm[i] << 16);
+    *t -= (uint64_t)lround(BPS_PDM_DELAY_BITS * 1e6 / (pdm_rate * (double)BPS_PDM_DECIM));
+    if (!since_us) {
+        since_us = *t;
+        ones_at = pdm->ones;
+        return n;
+    }
+    bytes_in += 2 * words;
+    uint64_t us = *t - since_us;
+    if (us >= 60000000) {
+        port_log("audio: raw PDM %lu bytes/s (%lu expected), %lu%% ones; filtered in software "
+                 "(tables in %s), %lu.%lu%% of the CPU",
+                 (unsigned long)(bytes_in * 1000000 / us),
+                 (unsigned long)(pdm_rate * BPS_PDM_DECIM / 4),
+                 (unsigned long)((pdm->ones - ones_at) * 100ull / (bytes_in * 4)),
+                 esp_ptr_internal(pdm) ? "internal RAM" : "PSRAM",
+                 (unsigned long)(busy_us * 100 / us), (unsigned long)(busy_us * 1000 / us % 10));
+        since_us = *t;
+        bytes_in = 0;
+        busy_us = 0;
+        ones_at = pdm->ones;
+    }
+    return n;
+}
 #endif
 
 static void capture_task(void *)
 {
-    static slot_t buf[2 * DMA_FRAMES]; // exactly one DMA buffer
+    static slot_t buf[SLOTS_PER_BUF]; // exactly one DMA buffer
     uint32_t reads = 0;
     for (;;) {
         // Paused (a firmware update): no read starts, so capture_stop()'s
@@ -644,22 +726,130 @@ static void capture_task(void *)
             if (__atomic_load_n(&isr_done, __ATOMIC_ACQUIRE) - k < STAMPS && (uint64_t)s <= t)
                 t = (uint64_t)s;
         }
-        size_t frames = got / (2 * sizeof(slot_t));
         xSemaphoreTake(capture_mutex, portMAX_DELAY);
-#if BPS_MIC_PDM
+#if BPS_PDM_SOFT
+        static int32_t lr[2 * DMA_FRAMES];
+        size_t frames = pdm_to_frames(buf, got / sizeof(slot_t), &t, lr);
+        bps_capture_frames(lr, frames, t);
+#elif BPS_MIC_PDM
+        size_t frames = got / (2 * sizeof(slot_t));
         // Left-aligned in 32 bits, as I2S mics' samples arrive.
         static int32_t lr[2 * DMA_FRAMES];
         for (size_t i = 0; i < 2 * frames; i++)
             lr[i] = (int32_t)((uint32_t)(uint16_t)buf[i] << 16);
         bps_capture_frames(lr, frames, t);
 #else
+        size_t frames = got / (2 * sizeof(slot_t));
         bps_capture_frames(buf, frames, t);
 #endif
         xSemaphoreGive(capture_mutex);
     }
 }
 
-#if BPS_MIC_PDM
+#if BPS_PDM_SOFT
+// A PDM mic without the PDM-to-PCM filter (the ESP32-C5): raw bits at 64
+// times the sample rate (3.072 MHz), from the slot the mic drives (its select
+// pin: low is left). In raw mode the driver's sample rate is the PDM clock.
+static bool init_mic(uint32_t sample_rate)
+{
+    if (!pdm)
+        pdm = (bps_pdm *)heap_caps_malloc(sizeof *pdm, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!pdm)
+        pdm = (bps_pdm *)heap_caps_malloc(sizeof *pdm, MALLOC_CAP_SPIRAM);
+    if (!pdm) {
+        port_log("audio: no memory for the PDM filter");
+        return false;
+    }
+    bps_pdm_init(pdm, sample_rate);
+    pdm_rate = sample_rate;
+    port_log("audio: PDM filtered in software (%s); %lu KB of internal RAM free",
+             esp_ptr_internal(pdm) ? "tables in internal RAM" : "tables in PSRAM",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    i2s_pdm_rx_config_t pc = {};
+    pc.clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(sample_rate * BPS_PDM_DECIM);
+    pc.slot_cfg = I2S_PDM_RX_SLOT_RAW_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    pc.slot_cfg.slot_mask = BPS_MIC_CHANNEL ? I2S_PDM_SLOT_RIGHT : I2S_PDM_SLOT_LEFT;
+    pc.gpio_cfg.clk = (gpio_num_t)BPS_I2S_BCLK;
+    pc.gpio_cfg.din = (gpio_num_t)BPS_I2S_DATA;
+    esp_err_t e = i2s_channel_init_pdm_rx_mode(rx, &pc);
+    if (e != ESP_OK)
+        port_log("audio: raw PDM mode: %s", esp_err_to_name(e));
+    return e == ESP_OK;
+}
+// Before the capture task starts: half a second of raw frames, to log how
+// fast they come, how many frames' two words agree (all of them, if each
+// frame carries the one slot twice), and the bit order: the same bits
+// filtered each way, the wrong ways folding the stream's ultrasonic noise
+// into the band, so the quietest wins. The interrupt's buffer count starts
+// afresh after.
+static void pdm_calibrate(uint32_t sample_rate)
+{
+    static uint8_t scratch[4096];
+    static uint8_t bytes[sizeof scratch / 2];
+    static int16_t pcm[sizeof scratch / 16];
+    const uint32_t want = sample_rate * BPS_PDM_DECIM / 4; // bytes/s, two words a frame
+    const size_t raw_len = want / 2;
+    uint8_t *raw = (uint8_t *)heap_caps_malloc(raw_len, MALLOC_CAP_SPIRAM);
+    if (!raw)
+        return;
+    size_t have = 0, got = 0;
+    int64_t t0 = 0;
+    int64_t start = esp_timer_get_time();
+    while (have < raw_len && esp_timer_get_time() - start < 3000000) {
+        if (i2s_channel_read(rx, scratch, sizeof scratch, &got, pdMS_TO_TICKS(500)) != ESP_OK)
+            continue;
+        if (esp_timer_get_time() - start < 200000) // the queue filling up
+            continue;
+        if (!t0)
+            t0 = esp_timer_get_time();
+        size_t k = got < raw_len - have ? got : raw_len - have;
+        memcpy(raw + have, scratch, k);
+        have += k;
+    }
+    uint32_t per_s = t0 ? (uint32_t)((uint64_t)have * 1000000 / (uint64_t)(esp_timer_get_time() - t0)) : 0;
+    const uint16_t *w = (const uint16_t *)raw;
+    size_t frames_all = have / 4, same = 0;
+    for (size_t i = 0; i < frames_all; i++)
+        same += w[2 * i] == w[2 * i + 1];
+    char line[200];
+    size_t len = 0;
+    double level[4];
+    for (int order = 0; order < 4; order++) {
+        bps_pdm_reset(pdm);
+        double sum = 0, sum2 = 0;
+        size_t n_all = 0;
+        for (size_t off = 0; off + sizeof scratch <= have; off += sizeof scratch) {
+            pdm_bytes((const slot_t *)(raw + off), sizeof scratch / 4, order, bytes);
+            size_t n = bps_pdm_process(pdm, bytes, sizeof bytes, pcm);
+            for (size_t i = 0; i < n; i++, n_all++) {
+                if (n_all < 200)
+                    continue; // the filter filling up
+                sum += pcm[i];
+                sum2 += (double)pcm[i] * pcm[i];
+            }
+        }
+        double m = n_all > 200 ? (double)(n_all - 200) : 1.0;
+        double var = sum2 / m - (sum / m) * (sum / m);
+        level[order] = 10.0 * log10((var > 1e-3 ? var : 1e-3) / (32768.0 * 32768.0));
+        len += snprintf(line + len, sizeof line - len, " %s %s word: %.1f dBFS;",
+                        (order & 1) ? "LSB" : "MSB", (order & 2) ? "second" : "first", level[order]);
+    }
+    heap_caps_free(raw);
+    pdm_order = 0;
+    for (int order = 1; order < 4; order++)
+        if (level[order] < level[pdm_order] - 0.5)
+            pdm_order = order;
+    bps_pdm_reset(pdm);
+    port_log("audio: raw PDM %lu bytes/s (%lu expected), %lu%% of frames' two words alike", (unsigned long)per_s,
+             (unsigned long)want, (unsigned long)(frames_all ? same * 100 / frames_all : 0));
+    port_log("audio: raw PDM bit order (level of each):%s keeping %s first, %s word", line,
+             (pdm_order & 1) ? "LSB" : "MSB", (pdm_order & 2) ? "second" : "first");
+    i2s_channel_disable(rx);
+    __atomic_store_n(&isr_done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&isr_dropped, 0, __ATOMIC_RELEASE);
+    i2s_channel_enable(rx);
+}
+#elif BPS_MIC_PDM
 // A PDM mic (the bps XIAO board's IM73D122) on I2S0, the only port with a
 // PDM-to-PCM filter. Its clock is 64 times the sample rate (3.072 MHz),
 // divided from the same 160 MHz PLL as the I2S clocks below. Both slots are
@@ -714,7 +904,11 @@ extern "C" void port_audio_start(uint32_t sample_rate)
     capture_mutex = xSemaphoreCreateMutexStatic(&capture_mutex_buf);
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     cc.dma_desc_num = DMA_DESCS;
+#if BPS_PDM_SOFT
+    cc.dma_frame_num = PDM_FRAMES_PER_BUF;
+#else
     cc.dma_frame_num = DMA_FRAMES;
+#endif
     if (i2s_new_channel(&cc, nullptr, &rx) != ESP_OK) {
         port_log("audio: cannot create the I2S channel");
         return;
@@ -728,6 +922,9 @@ extern "C" void port_audio_start(uint32_t sample_rate)
         port_log("audio: I2S failed to start");
         return;
     }
+#if BPS_PDM_SOFT
+    pdm_calibrate(sample_rate);
+#endif
     // On core 0, with Wi-Fi, not core 1 with Arduino's loop() (priority 1):
     // there, every minute or two, the loop kept the core for 40-500 ms while
     // this task was ready (scheduler running, not in a critical section, the
